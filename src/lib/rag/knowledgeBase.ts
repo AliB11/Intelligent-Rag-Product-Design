@@ -45,7 +45,7 @@ export function embed(text: string): number[] {
       h = Math.imul(h, 16777619);
     }
     const idx = (h >>> 0) % EMBEDDING_DIM;
-    vec[idx] += 1 + Math.log(1 + tokens.filter((t) => t === token).length) * 0;
+    vec[idx] += 1 + Math.log(1 + tokens.filter((t) => t === token).length);
   });
   const norm = Math.sqrt(vec.reduce((a, b) => a + b * b, 0)) || 1;
   return vec.map((v) => v / norm);

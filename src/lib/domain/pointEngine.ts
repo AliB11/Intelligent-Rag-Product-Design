@@ -264,8 +264,6 @@ export function evaluateMode(mode: ModeSpec): {
   installmentToIncome: number;
   customers: number;
 } {
-  const perCustomerDepositRial = mode.depositVolumeRial / Math.max(1, mode.customers || 1);
-  void perCustomerDepositRial;
   const averageBalanceRial = weightedAverageBalance({
     depositVolumeRial: mode.depositVolumeRial,
     sleepMonths: mode.sleepMonths,

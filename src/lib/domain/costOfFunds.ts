@@ -70,7 +70,7 @@ export function costOfFunds(input: CostOfFundsInput): CostOfFundsResult {
     adjustedDepositRate,
     availableFraction,
     statutoryReserveDrag: (input.depositRate * rr) / availableFraction,
-    liquidityDrag: (fundingComponent * lr) / availableFraction,
+    liquidityDrag: (adjustedDepositRate * lr) / availableFraction,
     opexComponent: opex,
     expectedLoss: el,
     expectedLossComponent: el,

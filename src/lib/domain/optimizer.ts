@@ -495,9 +495,6 @@ export function assembleProduct(
 ): ProductSpec {
   const totalDeposits = modes.reduce((a, m) => a + m.depositVolumeRial, 0) || 1;
   const totalLoans = modes.reduce((a, m) => a + m.loanBookRial, 0);
-  const blend = <T extends number>(pick: (m: ModeSpec) => number): number =>
-    modes.reduce((a, m) => a + (m.depositVolumeRial / totalDeposits) * pick(m), 0);
-  void blend;
   return {
     code,
     titleFa,
@@ -1127,7 +1124,6 @@ export async function optimizeProduct(
         };
       }
       current = { product: refined, score, metrics: confirm.metrics };
-      directiveResult.appliedFa.forEach((x) => void x);
     }
     // apply directives for the next iteration
     const directed = assembleProduct(

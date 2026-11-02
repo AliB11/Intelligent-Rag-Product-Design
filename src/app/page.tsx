@@ -111,11 +111,19 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    loadRuns();
-    fetch("/api/benchmarks")
-      .then((r) => r.json())
-      .then((d) => setKbInfo(d.totals))
-      .catch(() => setKbInfo(null));
+    void (async () => {
+      await loadRuns();
+      try {
+        const res = await fetch("/api/benchmarks", { cache: "no-store" });
+        const data = await res.json();
+        setKbInfo(data.totals as {
+          benchmarks: number;
+          kbDocuments: number;
+        } | null);
+      } catch {
+        setKbInfo(null);
+      }
+    })();
   }, [loadRuns]);
 
   const submit = useCallback(

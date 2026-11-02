@@ -4,10 +4,16 @@ import { sql } from "drizzle-orm";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
+  const started = Date.now();
+  let dbOk = false;
   try {
     await db.execute(sql`select 1`);
-    return Response.json({ ok: true });
+    dbOk = true;
   } catch {
-    return Response.json({ ok: false }, { status: 500 });
+    /* database unavailable — report degraded but stay up */
   }
+  return Response.json(
+    { ok: dbOk, db: dbOk, dbLatencyMs: Date.now() - started },
+    { status: dbOk ? 200 : 500 },
+  );
 }
