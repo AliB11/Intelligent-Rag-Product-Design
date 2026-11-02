@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# Intelligent Banking Product Generator & ALM Digital Twin Simulator
+#
+#   docker compose up --build          -> app on http://localhost:3000
+#   docker compose --profile tools run db-push
+#
+# The application image is built from the repository root Dockerfile and
+# contains the whole stack: Next.js delivery layer, deterministic financial
+# engine, LangGraph-style agent StateGraph, RAG vector store and the
+# Drizzle/PostgreSQL persistence layer.
+# ---------------------------------------------------------------------------
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: alm-twin-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-app_db}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-app_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alm-twin-app
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-app_db}
+      ALM_HORIZON_MONTHS: ${ALM_HORIZON_MONTHS:-60}
+      MONTE_CARLO_RUNS: ${MONTE_CARLO_RUNS:-1000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-3000}:3000"
+
+  # One-shot schema synchronisation: docker compose run --rm db-push
+  db-push:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["tools"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-app_db}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["npx", "drizzle-kit", "push", "--force"]
+
+volumes:
+  pgdata:

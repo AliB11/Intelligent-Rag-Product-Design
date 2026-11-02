@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NEXT_TELEMETRY_DISABLED: "1"
+  DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/app_db
+
+jobs:
+  quality:
+    name: Lint & types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Next.js route typegen
+        run: npx next typegen
+
+      - name: TypeScript (no emit)
+        run: npm run typecheck
+
+  verification:
+    name: Financial-engine verification suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Run verification suite (unit layer + integration tests)
+        run: node scripts/verify.mjs --fast
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## Financial-engine verification suite"
+            echo ""
+            echo '```'
+            echo "Deterministic unit layer + 20-Hemmat multi-mode matrix"
+            echo "+ physician / dental closed-loop B2B2C ecosystem"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Production build
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app_db
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/app_db
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Push Drizzle schema
+        run: npx drizzle-kit push --force
+
+      - name: Build
+        run: npm run build
+
+      - name: Start server and smoke-test
+        run: |
+          npm run start &
+          for i in $(seq 1 40); do
+            curl -sf http://127.0.0.1:3000/api/health && break || sleep 2
+          done
+          BASE_URL=http://127.0.0.1:3000 node scripts/smoke.mjs
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    needs: [quality, verification]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: alm-digital-twin:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

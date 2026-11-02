@@ -1,0 +1,1 @@
+# Keep the static asset directory tracked so the Docker build can COPY it.
