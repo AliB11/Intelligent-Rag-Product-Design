@@ -23,15 +23,18 @@
 import {
   ALM_HORIZON_MONTHS,
   BILLION_TOMAN_RIAL,
-  DEFAULT_LAMBDAS,
+  CB_REWARD_RATE,
   HURDLE_RATE,
+  MAX_MONTE_CARLO_RUNS,
+  MAX_OPTIMIZER_CANDIDATES,
   MC_RUNS,
   MC_SCREEN_RUNS,
   REGULATORY,
   TREASURY_RATE,
   TOMAN_RIAL,
+  contractRateCeiling,
 } from "./constants";
-import { clamp, createRng, pmt, seedFromString, type Rng } from "./financial";
+import { clamp, createRng, pmt, sampleDirichlet, seedFromString, type Rng } from "./financial";
 import { costOfFunds, expectedLossOf } from "./costOfFunds";
 import {
   bankProductNpv,
@@ -40,6 +43,7 @@ import {
   weightedAverageBalance,
 } from "./pointEngine";
 import { evaluateProduct, runAlmSimulation } from "./almSimulator";
+import { PERSONAS } from "./guildValueChain";
 import type {
   AlmMetrics,
   AlmResult,
@@ -57,7 +61,7 @@ export interface ArchetypeBlueprint {
   nameFa: string;
   nameEn: string;
   contracts: ContractType[];
-  /** Share of the target resource pool this segment can realistically absorb. */
+  /** Relative segment capacity; normalized over the selected archetypes when their sum is below 100%. */
   capacityShare: number;
   statutoryReserve: [number, number];
   depositRate: [number, number];
@@ -140,7 +144,7 @@ export const BLUEPRINTS: Record<ModeArchetype, ArchetypeBlueprint> = {
     archetype: "merchant-pos-accelerator",
     nameFa: "شتاب‌دهنده پذیرندگان POS و درگاه پرداخت",
     nameEn: "POS / IPG merchant accelerator",
-    contracts: ["qarz-hasaneh", "joalah", "kharid-deyn"],
+    contracts: ["qarz-hasaneh", "joalah", "kharid-deyn", "bnpl"],
     capacityShare: 0.22,
     statutoryReserve: [0.02, 0.02],
     depositRate: [0.005, 0.02],
@@ -229,6 +233,7 @@ export interface SolveOptions {
   persona?: PersonaSpec | null;
   forcedArchetypes?: ModeArchetype[];
   gammaFloor?: number;
+  signal?: AbortSignal;
   onProgress?: (event: OptimizerProgress) => void;
 }
 
@@ -263,46 +268,55 @@ export interface OptimizerIteration {
   directivesAppliedFa: string[];
 }
 
-const LAMBDAS = DEFAULT_LAMBDAS;
-
 function lerp(range: [number, number], u: number) {
   return range[0] + (range[1] - range[0]) * clamp(u, 0, 1);
 }
 
-/** Stage B — LP water-filling of the resource weights under capacity limits. */
-export function allocateWeights(
-  archetypes: ModeArchetype[],
-  shares: number[],
-): number[] {
-  const caps = archetypes.map((a) => BLUEPRINTS[a].capacityShare);
-  const remaining = [...shares];
+/** Stage B — deterministic water-filling of relative segment capacities. */
+export function allocateWeights(archetypes: ModeArchetype[], shares: number[]): number[] {
+  if (!archetypes.length) return [];
+  const priorities: number[] = archetypes.map((_, i) => Math.max(0, Number.isFinite(shares[i]) ? shares[i] : 0));
+  const allZero = priorities.reduce((all, value) => all && value === 0, true);
+  if (allZero) priorities.fill(1);
+  const rawCaps = archetypes.map((a) => Math.max(0, BLUEPRINTS[a].capacityShare));
+  const rawCapacity = rawCaps.reduce((total, value) => total + value, 0);
+  const caps = rawCapacity > 0 && rawCapacity < 1
+    ? rawCaps.map((value) => value / rawCapacity)
+    : rawCaps;
   const out = new Array<number>(archetypes.length).fill(0);
-  let left = 1;
-  let guard = 0;
-  while (left > 1e-9 && guard < 50) {
-    guard += 1;
-    const totalRemaining = remaining.reduce((a, b) => a + Math.max(b, 0), 0);
-    if (totalRemaining <= 0) break;
-    let allocatedThisRound = 0;
-    for (let i = 0; i < archetypes.length; i += 1) {
-      if (remaining[i] <= 0) continue;
+  const active = new Set(archetypes.map((_, i) => i).filter((i) => caps[i] > 0));
+  let remaining = 1;
+
+  while (remaining > 1e-12 && active.size > 0) {
+    const activePriority = [...active].reduce((total, i) => total + priorities[i], 0);
+    let allocated = 0;
+    const saturated: number[] = [];
+    for (const i of active) {
+      const share = activePriority > 0 ? priorities[i] / activePriority : 1 / active.size;
       const headroom = Math.max(0, caps[i] - out[i]);
-      const want = (remaining[i] / totalRemaining) * left;
-      const give = Math.min(headroom, want);
+      const give = Math.min(headroom, remaining * share);
       out[i] += give;
-      allocatedThisRound += give;
+      allocated += give;
+      if (headroom - give <= 1e-12) saturated.push(i);
     }
-    left -= allocatedThisRound;
-    if (allocatedThisRound <= 1e-12) {
-      // every segment saturated -> spread the residual proportionally anyway
-      for (let i = 0; i < archetypes.length; i += 1) {
-        out[i] += (remaining[i] / totalRemaining) * left;
-      }
-      left = 0;
-    }
+    remaining -= allocated;
+    saturated.forEach((i) => active.delete(i));
+    if (allocated <= 1e-12) break;
   }
-  const sum = out.reduce((a, b) => a + b, 0);
-  return sum > 0 ? out.map((w) => w / sum) : out;
+
+  // The relative-capacity normalization guarantees sufficient capacity; retain
+  // a final numerical correction so the invariant sum(w)=1 is exact.
+  if (remaining > 1e-9) {
+    const available = archetypes.map((_, i) => i).filter((i) => caps[i] > out[i] + 1e-12);
+    const recipients = available.length ? available : archetypes.map((_, i) => i);
+    const priorityTotal = recipients.reduce((total, i) => total + priorities[i], 0);
+    recipients.forEach((i) => {
+      const share = priorityTotal > 0 ? priorities[i] / priorityTotal : 1 / recipients.length;
+      out[i] += remaining * share;
+    });
+  }
+  const total = out.reduce((a, b) => a + b, 0);
+  return total > 0 ? out.map((weight) => weight / total) : archetypes.map(() => 1 / archetypes.length);
 }
 
 export interface ModeSeed {
@@ -312,11 +326,8 @@ export interface ModeSeed {
 }
 
 function randomUnitVector(rng: Rng, length: number, dirichletAlpha = 2.2): number[] {
-  const draws = Array.from({ length }, () =>
-    Math.pow(-Math.log(Math.max(1e-9, rng())), 1 / dirichletAlpha),
-  );
-  const total = draws.reduce((a, b) => a + b, 0) || 1;
-  return draws.map((d) => d / total);
+  if (length <= 0) return [];
+  return sampleDirichlet(rng, new Array<number>(length).fill(dirichletAlpha));
 }
 
 /** Stage C — build a fully derived, regulation-checked ModeSpec. */
@@ -329,12 +340,17 @@ export function buildMode(
   persona: PersonaSpec | null,
   index: number,
   gammaFloor = 0,
+  blockRelease: ModeSpec["blockRelease"] = blueprint.blockRelease,
 ): ModeSpec {
   const depositVolumeRial = Math.max(0, weight) * targetDepositsRial;
-  const statutoryReserve = lerp(blueprint.statutoryReserve, params.rr ?? 0.5);
-  const depositRate = lerp(blueprint.depositRate, params.rd ?? 0.5);
-  const pd = lerp(blueprint.pd, params.pd ?? 0.4);
-  const lgd = lerp(blueprint.lgd, params.lgd ?? 0.4);
+  const statutoryReserve = params.rrExact !== undefined
+    ? clamp(params.rrExact, 0, 0.5)
+    : lerp(blueprint.statutoryReserve, params.rr ?? 0.5);
+  const depositRate = params.rdExact !== undefined
+    ? clamp(params.rdExact, 0, 0.5)
+    : lerp(blueprint.depositRate, params.rd ?? 0.5);
+  const pd = params.pdExact !== undefined ? clamp(params.pdExact, 0, 1) : lerp(blueprint.pd, params.pd ?? 0.4);
+  const lgd = params.lgdExact !== undefined ? clamp(params.lgdExact, 0, 1) : lerp(blueprint.lgd, params.lgd ?? 0.4);
   const el = expectedLossOf(pd, lgd);
 
   const cof = costOfFunds({
@@ -345,41 +361,46 @@ export function buildMode(
     expectedLoss: el,
   });
 
-  let loanRate = lerp(blueprint.loanRate, params.rl ?? 0.6);
-  const rateCeiling =
-    contract === "qarz-hasaneh"
-      ? REGULATORY.qarzHasanehMaxCommission
-      : contract === "morabaha" || contract === "mudaraba"
-        ? REGULATORY.morabahaMaxRate
-        : REGULATORY.absoluteRateCeiling;
-  loanRate = clamp(loanRate, 0, rateCeiling);
+  const rateCeiling = contractRateCeiling(contract);
+  const loanRate = params.rlExact !== undefined
+    ? clamp(params.rlExact, 0, rateCeiling)
+    : clamp(lerp(blueprint.loanRate, params.rl ?? 0.6), 0, rateCeiling);
 
   // τ_d may be supplied exactly (post-staggering) so the value survives the
   // rebuild instead of being clamped back into the blueprint range.
-  const sleepMonths =
-    params.tdExact !== undefined
-      ? Math.round(clamp(params.tdExact, 1, 24))
-      : Math.round(lerp(blueprint.sleepMonths, params.td ?? 0.5));
-  const tenorMonths = Math.round(lerp(blueprint.tenorMonths, params.tl ?? 0.5));
-  const waitingMonths = Math.round(lerp(blueprint.waitingMonths, params.omega ?? 0.4));
-  const loanMultiplier = lerp(blueprint.loanMultiplier, params.alpha ?? 0.5);
-  const blockedRatio = lerp(blueprint.blockedRatio, params.beta ?? 0.4);
-  const closedLoopCeiling = Math.max(
-    blueprint.closedLoopRetention[1],
-    Math.min(gammaFloor, blueprint.closedLoopRetention[1]),
-  );
-  const closedLoopRetention = clamp(
-    Math.max(
-      lerp(blueprint.closedLoopRetention, params.gamma ?? 0.5),
-      Math.min(gammaFloor, blueprint.closedLoopRetention[1]),
-    ),
-    0,
-    closedLoopCeiling,
-  );
-  const withdrawalFractionMean = lerp(blueprint.withdrawalFraction, params.delta ?? 0.5);
-  const feeIncomeRate = lerp(blueprint.feeIncomeRate, params.fee ?? 0.4);
-  const capToman = lerp(blueprint.capToman, params.cap ?? 0.5);
-  const adoptionScore = lerp(blueprint.adoption, params.adoption ?? 0.6);
+  const sleepMonths = Math.round(params.tdExact !== undefined
+    ? clamp(params.tdExact, 1, 24)
+    : lerp(blueprint.sleepMonths, params.td ?? 0.5));
+  const tenorMonths = Math.round(params.tlExact !== undefined
+    ? clamp(params.tlExact, 1, 72)
+    : lerp(blueprint.tenorMonths, params.tl ?? 0.5));
+  const waitingMonths = Math.round(params.omegaExact !== undefined
+    ? clamp(params.omegaExact, 0, 12)
+    : lerp(blueprint.waitingMonths, params.omega ?? 0.4));
+  const loanMultiplier = params.alphaExact !== undefined
+    ? clamp(params.alphaExact, 0, 3)
+    : lerp(blueprint.loanMultiplier, params.alpha ?? 0.5);
+  const blockedRatio = params.betaExact !== undefined
+    ? clamp(params.betaExact, 0, 0.65)
+    : lerp(blueprint.blockedRatio, params.beta ?? 0.4);
+  const rawGamma = params.gammaExact !== undefined
+    ? params.gammaExact
+    : lerp(blueprint.closedLoopRetention, params.gamma ?? 0.5);
+  const closedLoopRetention = clamp(Math.max(rawGamma, gammaFloor), 0, 0.98);
+  const withdrawalFractionMean = params.deltaExact !== undefined
+    ? clamp(params.deltaExact, 0.01, 0.95)
+    : lerp(blueprint.withdrawalFraction, params.delta ?? 0.5);
+  const feeIncomeRate = contract === "qarz-hasaneh"
+    ? 0
+    : params.feeExact !== undefined
+      ? clamp(params.feeExact, 0, 0.1)
+      : lerp(blueprint.feeIncomeRate, params.fee ?? 0.4);
+  const capToman = params.capExact !== undefined
+    ? clamp(params.capExact, 1e6, 5e9)
+    : lerp(blueprint.capToman, params.cap ?? 0.5);
+  const adoptionScore = params.adoptionExact !== undefined
+    ? clamp(params.adoptionExact, 0, 1)
+    : lerp(blueprint.adoption, params.adoption ?? 0.6);
 
   const avgDepositPerCustomerRial = blueprint.avgDepositPerCustomerToman * TOMAN_RIAL;
   const customers = Math.max(
@@ -404,7 +425,7 @@ export function buildMode(
 
   const affordability = installmentAffordability(
     capToman * TOMAN_RIAL,
-    loanRate,
+    contract === "qarz-hasaneh" ? 0 : loanRate,
     tenorMonths,
     personaIncomeToman,
     REGULATORY.installmentToIncomeCeiling,
@@ -432,15 +453,18 @@ export function buildMode(
     blockedRatio,
     closedLoopRetention,
     statutoryReserve,
+    liquidityDeduction: blueprint.liquidityDeduction,
     costOfFunds: cof.costOfFunds,
+    annuity: contract !== "qarz-hasaneh",
+    upfrontCommissionRate: contract === "qarz-hasaneh" ? loanRate : 0,
     hurdleRate: HURDLE_RATE,
     treasuryRate: TREASURY_RATE,
-    blockRelease: blueprint.blockRelease,
+    blockRelease,
   });
 
   const avgTicketToman = loanBookRial / TOMAN_RIAL / Math.max(1, customers);
   const installmentToman = pmt(
-    loanRate / 12,
+    (contract === "qarz-hasaneh" ? 0 : loanRate) / 12,
     Math.max(1, tenorMonths),
     (loanBookRial / Math.max(1, customers)),
   ) / TOMAN_RIAL;
@@ -472,12 +496,12 @@ export function buildMode(
     capToman,
     avgTicketToman,
     adoptionScore,
-    blockRelease: blueprint.blockRelease,
+    blockRelease,
     cohortRampMonths: clamp(Math.round(sleepMonths * 0.8) + 2, 2, 14),
     personaIncomeToman,
     costOfFunds: cof.costOfFunds,
     expectedLoss: el,
-    freeResourcesRial: depositVolumeRial * (1 - statutoryReserve + blueprint.liquidityDeduction),
+    freeResourcesRial: depositVolumeRial * Math.max(0, 1 - statutoryReserve - blueprint.liquidityDeduction),
     loanBookRial,
     monthlyInstallmentToman: installmentToman,
     installmentToIncome: installmentToman / Math.max(1, personaIncomeToman),
@@ -495,9 +519,6 @@ export function assembleProduct(
 ): ProductSpec {
   const totalDeposits = modes.reduce((a, m) => a + m.depositVolumeRial, 0) || 1;
   const totalLoans = modes.reduce((a, m) => a + m.loanBookRial, 0);
-  const blend = <T extends number>(pick: (m: ModeSpec) => number): number =>
-    modes.reduce((a, m) => a + (m.depositVolumeRial / totalDeposits) * pick(m), 0);
-  void blend;
   return {
     code,
     titleFa,
@@ -518,57 +539,71 @@ export function assembleProduct(
       modes.reduce((a, m) => a + m.weight * m.closedLoopRetention, 0) /
       (modes.reduce((a, m) => a + m.weight, 0) || 1),
     totalLoanBookRial: totalLoans,
-    structuralLoanToDeposit: totalLoans / (totalDeposits * (1 - 0.06)),
+    structuralLoanToDeposit:
+      totalLoans /
+      Math.max(1, modes.reduce((total, mode) =>
+        total + mode.depositVolumeRial * Math.max(0, 1 - mode.statutoryReserve - mode.liquidityDeduction), 0)),
     hurdleRate: HURDLE_RATE,
     treasuryRate: TREASURY_RATE,
-    cbRewardRate: REGULATORY.qarzHasanehMaxCommission > 0 ? 0.01 : 0.01,
+    cbRewardRate: CB_REWARD_RATE,
   };
 }
 
-/** Composite objective function of the inverse optimiser. */
+/** Apply the stricter of the user-requested risk limits and modeled regulatory floors/caps. */
+export function effectiveRiskLimits(
+  request: Pick<ProductGenerationRequest, "ldrCeiling" | "lcrFloor">,
+): { ldrCeiling: number; lcrFloor: number } {
+  return {
+    ldrCeiling: Math.min(request.ldrCeiling, REGULATORY.ldrCeiling),
+    lcrFloor: Math.max(request.lcrFloor, REGULATORY.lcrFloor),
+  };
+}
+
+/** Composite objective function using the weights and effective risk limits. */
 export function objectiveScore(
-  product: ProductSpec,
   metrics: AlmMetrics,
   request: ProductGenerationRequest,
 ): { score: number; parts: Record<string, number> } {
-  const ldrExcess = product.modes.length
-    ? Math.max(
-        0,
-        metrics.meanLdr - REGULATORY.ldrWarning,
-      ) ** 2
-    : 0;
-  const irrPart = LAMBDAS.lambda1Irr * clamp(metrics.irrBankAnnual, -1, 2);
-  const adoptionPart = LAMBDAS.lambda2Adoption * metrics.adoptionScore;
-  const ldrPart = -LAMBDAS.lambda3LdrPenalty * ldrExcess * 12;
-  const overturnPart = -LAMBDAS.lambda4Overturning * metrics.overturningShock * 6;
+  const lambdas = request.lambdas;
+  const limits = effectiveRiskLimits(request);
+  const ldrExcess = Math.max(0, metrics.meanLdr - Math.min(limits.ldrCeiling, REGULATORY.ldrWarning)) ** 2;
+  const irrPart = lambdas.lambda1Irr * clamp(metrics.irrBankAnnual, -1, 2);
+  const adoptionPart = lambdas.lambda2Adoption * clamp(metrics.adoptionScore, 0, 1);
+  const ldrPart = -lambdas.lambda3LdrPenalty * ldrExcess * 12;
+  const overturnPart = -lambdas.lambda4Overturning * clamp(metrics.overturningShock, 0, 1) * 6;
   const drainPart = -0.08 * clamp(metrics.netLiquidityDrainRatio, 0, 5);
   const nimPart = 0.05 * clamp(metrics.nim, -0.5, 0.6);
-  const shortfall = Math.max(0, request.targetIrr - metrics.irrBankAnnual);
-  const targetPenalty = -0.55 * shortfall;
+  const irrShortfall = Math.max(0, request.targetIrr - metrics.irrBankAnnual);
+  const roiShortfall = Math.max(0, request.targetRoi - metrics.roi) / Math.max(0.1, request.targetRoi);
+  const roeShortfall = Math.max(0, request.targetRoe - metrics.roe) / Math.max(0.05, request.targetRoe);
+  const nimShortfall = Math.max(0, request.targetNim - metrics.nim) / Math.max(0.02, request.targetNim);
+  const targetPenalty =
+    -0.55 * irrShortfall -
+    0.10 * clamp(roiShortfall, 0, 5) -
+    0.10 * clamp(roeShortfall, 0, 5) -
+    0.10 * clamp(nimShortfall, 0, 5);
   const breachPenalty =
-    -1.6 * Math.max(0, metrics.p95Ldr - REGULATORY.ldrCeiling) * 8 -
-    1.4 * Math.max(0, REGULATORY.lcrFloor - metrics.p5Lcr);
+    -1.6 * Math.max(0, metrics.p95Ldr - limits.ldrCeiling) * 8 -
+    1.4 * Math.max(0, limits.lcrFloor - metrics.p5Lcr) -
+    1.2 * Math.max(0, metrics.overturningShock - request.maxOverturningShock) * 6;
+  const parts = {
+    irrPart,
+    adoptionPart,
+    ldrPart,
+    overturnPart,
+    drainPart,
+    nimPart,
+    targetPenalty,
+    breachPenalty,
+    ldrExcess,
+    irrShortfall,
+    roiShortfall,
+    roeShortfall,
+    nimShortfall,
+  };
   return {
-    score:
-      irrPart +
-      adoptionPart +
-      ldrPart +
-      overturnPart +
-      drainPart +
-      nimPart +
-      targetPenalty +
-      breachPenalty,
-    parts: {
-      irrPart,
-      adoptionPart,
-      ldrPart,
-      overturnPart,
-      drainPart,
-      nimPart,
-      targetPenalty,
-      breachPenalty,
-      ldrExcess,
-    },
+    score: irrPart + adoptionPart + ldrPart + overturnPart + drainPart + nimPart + targetPenalty + breachPenalty,
+    parts,
   };
 }
 
@@ -578,33 +613,34 @@ export function feasibilityCheck(
   request: ProductGenerationRequest,
 ): CriticFinding[] {
   const findings: CriticFinding[] = [];
-  if (metrics.p95Ldr > request.ldrCeiling) {
+  const limits = effectiveRiskLimits(request);
+  if (metrics.p95Ldr > limits.ldrCeiling) {
     findings.push({
       id: "ldr-p95-breach",
       severity: "blocker",
       metric: "p95 LDR",
       observed: metrics.p95Ldr,
-      limit: request.ldrCeiling,
-      messageFa: `نسبت خالص تسهیلات به سپرده در صدک ۹۵ برابر ${(metrics.p95Ldr * 100).toFixed(1)}٪ است و از سقف ${(request.ldrCeiling * 100).toFixed(0)}٪ عبور کرده است.`,
-      messageEn: `p95 net LDR ${(metrics.p95Ldr * 100).toFixed(1)}% exceeds the ${request.ldrCeiling} solvency ceiling.`,
+      limit: limits.ldrCeiling,
+      messageFa: `نسبت خالص تسهیلات به سپرده در صدک ۹۵ برابر ${(metrics.p95Ldr * 100).toFixed(1)}٪ است و از سقف مؤثر ${(limits.ldrCeiling * 100).toFixed(0)}٪ (سخت‌گیرانه‌ترِ درخواست و سقف مدل) عبور کرده است.`,
+      messageEn: `p95 net LDR ${(metrics.p95Ldr * 100).toFixed(1)}% exceeds the effective ${limits.ldrCeiling} ceiling (stricter of the request and modeled regulatory cap).`,
       directive: {
-        field: "blockedRatio",
-        action: "increase",
-        magnitude: 0.07 * Math.min(4, 1 + (metrics.p95Ldr - request.ldrCeiling) * 12),
+        field: "loanMultiplier",
+        action: "decrease",
+        magnitude: 0.07 * Math.min(4, 1 + (metrics.p95Ldr - limits.ldrCeiling) * 12),
         rationaleFa:
-          "افزایش مسدودی هوشمند (β) و افزایش ماندگاری حلقه بسته (γ) و تمدید صف انتظار (ω) برای کاهش همزمان دارایی و حمایت از مخرج نسبت.",
+          "کاهش ضریب تسهیلات (α)، افزایش ماندگاری حلقه بسته (γ) و کاهش برداشت آزاد (δ)؛ افزایش مسدودی می‌تواند مخرج سپرده قابل‌استفاده را کوچک و LDR را بدتر کند.",
       },
     });
   }
-  if (metrics.p5Lcr < request.lcrFloor) {
+  if (metrics.p5Lcr < limits.lcrFloor) {
     findings.push({
       id: "lcr-floor-breach",
       severity: "blocker",
       metric: "p5 LCR",
       observed: metrics.p5Lcr,
-      limit: request.lcrFloor,
-      messageFa: `نسبت پوشش نقدینگی در صدک ۵ به ${(metrics.p5Lcr).toFixed(2)} رسیده و کف ${(request.lcrFloor).toFixed(2)} را نقض کرده است.`,
-      messageEn: `p5 LCR ${metrics.p5Lcr.toFixed(2)} breaches the ${request.lcrFloor} floor.`,
+      limit: limits.lcrFloor,
+      messageFa: `نسبت پوشش نقدینگی در صدک ۵ به ${metrics.p5Lcr.toFixed(2)} رسیده و کف مؤثر ${limits.lcrFloor.toFixed(2)} (سخت‌گیرانه‌ترِ درخواست و کف مدل) را نقض کرده است.`,
+      messageEn: `p5 LCR ${metrics.p5Lcr.toFixed(2)} breaches the effective ${limits.lcrFloor.toFixed(2)} floor (stricter of the request and modeled regulatory floor).`,
       directive: {
         field: "loanMultiplier",
         action: "decrease",
@@ -650,7 +686,75 @@ export function feasibilityCheck(
       },
     });
   }
+  const addTargetWarning = (
+    id: string,
+    metric: string,
+    observed: number,
+    limit: number,
+    messageFa: string,
+    messageEn: string,
+  ) => {
+    if (observed >= limit) return;
+    findings.push({
+      id,
+      severity: "warning",
+      metric,
+      observed,
+      limit,
+      messageFa,
+      messageEn,
+      directive: {
+        field: "*",
+        action: "hold",
+        magnitude: 0,
+        rationaleFa: "این شاخص هدف عملکردی است؛ پیش از هر تعدیل، حساسیت آن با مدل و داده‌های معتبر بررسی شود.",
+      },
+    });
+  };
+  addTargetWarning(
+    "roi-target-gap",
+    "ROI",
+    metrics.roi,
+    request.targetRoi,
+    `بازده تجمعی سرمایه ${(metrics.roi * 100).toFixed(1)}٪ و کمتر از هدف ${(request.targetRoi * 100).toFixed(1)}٪ است.`,
+    `ROI ${(metrics.roi * 100).toFixed(1)}% is below the requested ${(request.targetRoi * 100).toFixed(1)}% objective.`,
+  );
+  addTargetWarning(
+    "roe-target-gap",
+    "ROE",
+    metrics.roe,
+    request.targetRoe,
+    `بازده سالانه سرمایه ${(metrics.roe * 100).toFixed(1)}٪ و کمتر از هدف ${(request.targetRoe * 100).toFixed(1)}٪ است.`,
+    `ROE ${(metrics.roe * 100).toFixed(1)}% is below the requested ${(request.targetRoe * 100).toFixed(1)}% objective.`,
+  );
+  addTargetWarning(
+    "nim-target-gap",
+    "NIM",
+    metrics.nim,
+    request.targetNim,
+    `حاشیه سود خالص ${(metrics.nim * 100).toFixed(2)}٪ و کمتر از هدف ${(request.targetNim * 100).toFixed(2)}٪ است.`,
+    `NIM ${(metrics.nim * 100).toFixed(2)}% is below the requested ${(request.targetNim * 100).toFixed(2)}% objective.`,
+  );
+
   product.modes.forEach((mode, i) => {
+    const rateCeiling = contractRateCeiling(mode.contract);
+    if (mode.loanRate > rateCeiling + 1e-9) {
+      findings.push({
+        id: `contract-rate-cap-${i}`,
+        severity: "blocker",
+        metric: "Contract rate cap",
+        observed: mode.loanRate,
+        limit: rateCeiling,
+        messageFa: `نرخ قراردادی طرح «${mode.nameFa}» از سقف محافظه‌کارانه ${(rateCeiling * 100).toFixed(1)}٪ عبور کرده است.`,
+        messageEn: `Mode ${mode.nameEn} exceeds the conservative ${ (rateCeiling * 100).toFixed(1) }% contract-rate cap.`,
+        directive: {
+          field: "loanRate",
+          action: "decrease",
+          magnitude: 0.01,
+          rationaleFa: "نرخ را به سقف قراردادی محافظه‌کارانه محدود کنید و مبنای حقوقی را با منبع رسمی تأیید کنید.",
+        },
+      });
+    }
     if (mode.installmentToIncome > REGULATORY.installmentToIncomeCeiling) {
       findings.push({
         id: `affordability-${i}`,
@@ -671,7 +775,7 @@ export function feasibilityCheck(
     if (mode.npvBankRial < 0) {
       findings.push({
         id: `npv-negative-${i}`,
-        severity: "warning",
+        severity: "blocker",
         metric: "NPV_bank",
         observed: mode.npvBankRial,
         limit: 0,
@@ -689,100 +793,129 @@ export function feasibilityCheck(
   return findings;
 }
 
-/** Apply the critic-auditor mathematical adjustment directives. */
+/** Apply deterministic, directionally correct critic-auditor adjustments. */
 export function applyDirectives(
   modes: ModeSpec[],
   findings: CriticFinding[],
-  rng: Rng,
 ): { modes: ModeSpec[]; appliedFa: string[] } {
   const appliedFa: string[] = [];
-  const next = modes.map((m) => ({ ...m }));
-  const has = (id: string) => findings.some((f) => f.id === id || f.id.startsWith(id));
+  const next = modes.map((mode) => ({ ...mode }));
+  const has = (id: string) => findings.some((finding) => finding.id === id || finding.id.startsWith(id));
+  const magnitude = (id: string) => findings
+    .filter((finding) => finding.id === id || finding.id.startsWith(id))
+    .reduce((largest, finding) => Math.max(largest, finding.directive.magnitude), 0);
 
-  if (has("ldr-p95-breach") || has("lcr-floor-breach")) {
-    next.forEach((m, i) => {
-      const bp = BLUEPRINTS[m.archetype];
-      m.blockedRatio = clamp(m.blockedRatio + 0.07, bp.blockedRatio[0], 0.55);
-      m.closedLoopRetention = clamp(
-        m.closedLoopRetention + 0.06,
-        bp.closedLoopRetention[0],
+  const ldrBreach = has("ldr-p95-breach");
+  const lcrBreach = has("lcr-floor-breach");
+  if (ldrBreach || lcrBreach) {
+    const alphaReduction = Math.min(
+      0.5,
+      (ldrBreach ? Math.max(0.1, 0.1 + magnitude("ldr-p95-breach") * 0.7) : 0) +
+      (lcrBreach ? Math.max(0.12, 0.12 + magnitude("lcr-floor-breach") * 0.5) : 0),
+    );
+    next.forEach((mode) => {
+      mode.loanMultiplier = clamp(mode.loanMultiplier - alphaReduction, 0.05, 3);
+      mode.closedLoopRetention = clamp(
+        mode.closedLoopRetention + (ldrBreach ? 0.04 : 0) + (lcrBreach ? 0.05 : 0),
+        0,
         0.95,
       );
-      m.waitingMonths = clamp(m.waitingMonths + 1, bp.waitingMonths[0], 8);
-      m.loanMultiplier = clamp(m.loanMultiplier - 0.08, bp.loanMultiplier[0] * 0.75, bp.loanMultiplier[1]);
-      if (i % 2 === 0) m.withdrawalFractionMean = clamp(m.withdrawalFractionMean + 0.02, 0.05, 0.8);
+      mode.waitingMonths = clamp(mode.waitingMonths + 1, 0, 12);
+      mode.withdrawalFractionMean = clamp(
+        mode.withdrawalFractionMean - (ldrBreach ? 0.025 : 0) - (lcrBreach ? 0.025 : 0),
+        0.01,
+        0.95,
+      );
+      // Blocked balances are deducted from usable deposits. Raising beta can
+      // therefore worsen LDR even while it reduces runoff; lower it only when
+      // the binding issue is LDR, and offset the extra run-off with lower delta.
+      if (ldrBreach && !lcrBreach) {
+        mode.blockedRatio = clamp(mode.blockedRatio - 0.025, 0, 0.65);
+      }
     });
     appliedFa.push(
-      "افزایش مسدودی پلکانی β، ارتقای ماندگاری حلقه بسته γ، تمدید صف انتظار ω و کاهش ضریب تسهیلات α در همه طرح‌ها",
+      "کاهش مستقیم ضریب تسهیلات α، افزایش منابع حلقه‌بسته γ و صف انتظار ω، کاهش برداشت آزاد δ" +
+      (ldrBreach && !lcrBreach ? " و آزادسازی بخشی از مانده مسدودی برای تقویت مخرج LDR" : ""),
     );
   }
 
   if (has("overturning-risk")) {
     const base = Math.round(next[0]?.sleepMonths ?? 4);
-    next.forEach((m, i) => {
-      const bp = BLUEPRINTS[m.archetype];
-      m.sleepMonths = clamp(base + i * 2 + (i % 2 === 0 ? 1 : 0), bp.sleepMonths[0], bp.sleepMonths[1] + 4);
-      m.cohortRampMonths = clamp(m.cohortRampMonths + 2, 2, 16);
-      m.blockRelease = i % 2 === 0 ? "midpoint" : "linear";
+    next.forEach((mode, i) => {
+      const bp = BLUEPRINTS[mode.archetype];
+      mode.sleepMonths = clamp(
+        base + i * 2 + (i % 2 === 0 ? 1 : 0),
+        bp.sleepMonths[0],
+        bp.sleepMonths[1] + 4,
+      );
+      mode.cohortRampMonths = clamp(mode.cohortRampMonths + 3, 2, 24);
+      mode.closedLoopRetention = clamp(mode.closedLoopRetention + 0.04, 0, 0.95);
+      mode.withdrawalFractionMean = clamp(mode.withdrawalFractionMean - 0.04, 0.01, 0.95);
+      mode.blockRelease = i % 2 === 0 ? "midpoint" : "linear";
     });
     appliedFa.push(
-      "پلکانی‌سازی دوره خواب سپرده (τ_d) بین طرح‌ها و تغییر الگوی آزادسازی مسدودی به آزادسازی میانی/خطی",
+      "پلکانی‌سازی دوره خواب τ_d و رمپ جذب، کاهش برداشت آزاد δ و ارتقای ماندگاری حلقه بسته γ برای مهار واژگونی",
     );
   }
 
   if (has("irr-shortfall")) {
-    next.forEach((m) => {
-      const bp = BLUEPRINTS[m.archetype];
-      const ceiling =
-        m.contract === "qarz-hasaneh"
-          ? REGULATORY.qarzHasanehMaxCommission
-          : m.contract === "morabaha" || m.contract === "mudaraba"
-            ? REGULATORY.morabahaMaxRate
-            : REGULATORY.absoluteRateCeiling;
-      m.loanRate = clamp(m.loanRate + 0.008, 0, ceiling);
-      m.feeIncomeRate = clamp(m.feeIncomeRate + 0.0015, bp.feeIncomeRate[0], bp.feeIncomeRate[1] * 1.35);
-      m.closedLoopRetention = clamp(m.closedLoopRetention + 0.05, bp.closedLoopRetention[0], 0.95);
-      if (m.archetype === "investment-deposit") {
-        m.depositRate = clamp(m.depositRate - 0.004, 0.05, 0.205);
+    next.forEach((mode) => {
+      const bp = BLUEPRINTS[mode.archetype];
+      const ceiling = contractRateCeiling(mode.contract);
+      mode.loanRate = clamp(mode.loanRate + 0.008, 0, ceiling);
+      mode.feeIncomeRate = clamp(mode.feeIncomeRate + 0.0015, bp.feeIncomeRate[0], bp.feeIncomeRate[1] * 1.35);
+      mode.closedLoopRetention = clamp(mode.closedLoopRetention + 0.05, 0, 0.95);
+      if (mode.archetype === "investment-deposit") {
+        mode.depositRate = clamp(mode.depositRate - 0.004, 0.05, 0.205);
       }
     });
     appliedFa.push(
-      "افزایش نرخ سود/کارمزد تا سقف مصوب، ارتقای درآمد غیرمشاع (کارمزد پذیرندگان و انتشار) و بهبود بازگشت منابع حلقه بسته",
+      "افزایش نرخ سود/کارمزد تا سقف قراردادی، ارتقای درآمد غیرمشاع و بهبود بازگشت منابع حلقه بسته",
     );
   }
 
   findings
-    .filter((f) => f.id.startsWith("affordability"))
-    .forEach((f) => {
-      const idx = Number(f.id.split("-").pop());
-      const m = next[idx];
-      if (!m) return;
-      const bp = BLUEPRINTS[m.archetype];
-      m.tenorMonths = clamp(m.tenorMonths + 6, bp.tenorMonths[0], 72);
-      m.capToman = clamp(m.capToman * 0.88, bp.capToman[0] * 0.6, bp.capToman[1]);
+    .filter((finding) => finding.id.startsWith("affordability"))
+    .forEach((finding) => {
+      const idx = Number(finding.id.split("-").pop());
+      const mode = next[idx];
+      if (!mode) return;
+      const bp = BLUEPRINTS[mode.archetype];
+      mode.tenorMonths = clamp(mode.tenorMonths + 6, bp.tenorMonths[0], 72);
+      mode.capToman = clamp(mode.capToman * 0.88, bp.capToman[0] * 0.6, bp.capToman[1]);
       appliedFa.push(
-        `تمدید سررسید و کاهش سقف فردی طرح «${m.nameFa}» برای رعایت نسبت قسط به درآمد ≤ ۴۰٪`,
+        `تمدید سررسید و کاهش سقف فردی طرح «${mode.nameFa}» برای رعایت نسبت قسط به درآمد ≤ ۴۰٪`,
       );
     });
 
   findings
-    .filter((f) => f.id.startsWith("npv-negative"))
-    .forEach((f) => {
-      const idx = Number(f.id.split("-").pop());
-      const m = next[idx];
-      if (!m) return;
-      m.loanMultiplier = clamp(m.loanMultiplier * 0.94, 0.3, BLUEPRINTS[m.archetype].loanMultiplier[1]);
+    .filter((finding) => finding.id.startsWith("npv-negative"))
+    .forEach((finding) => {
+      const idx = Number(finding.id.split("-").pop());
+      const mode = next[idx];
+      if (!mode) return;
+      mode.loanRate = clamp(mode.loanRate + 0.008, 0, contractRateCeiling(mode.contract));
+      mode.loanMultiplier = clamp(mode.loanMultiplier * 0.94, 0.05, 3);
+      appliedFa.push(`بازتنظیم نرخ مجاز و ضریب تسهیلات طرح «${mode.nameFa}» برای رفع NPV منفی`);
     });
 
-  // stochastic micro-jitter to escape local optima
-  next.forEach((m) => {
-    m.blockedRatio = clamp(m.blockedRatio + (rng() - 0.5) * 0.01, 0, 0.55);
-    m.closedLoopRetention = clamp(
-      m.closedLoopRetention + (rng() - 0.5) * 0.012,
-      0,
-      0.95,
-    );
-  });
+  findings
+    .filter((finding) => finding.id.startsWith("contract-rate-cap"))
+    .forEach((finding) => {
+      const idx = Number(finding.id.split("-").pop());
+      const mode = next[idx];
+      if (!mode) return;
+      mode.loanRate = Math.min(mode.loanRate, contractRateCeiling(mode.contract));
+      appliedFa.push(`محدودکردن نرخ قراردادی «${mode.nameFa}» به سقف مجاز مدل`);
+    });
+
+  if (findings.some((finding) => finding.severity === "blocker") && appliedFa.length === 0) {
+    next.forEach((mode) => {
+      mode.loanMultiplier = clamp(mode.loanMultiplier * 0.9, 0.05, 3);
+      mode.closedLoopRetention = clamp(mode.closedLoopRetention + 0.03, 0, 0.95);
+    });
+    appliedFa.push("اعمال محافظه‌کاری پشتیبان: کاهش ضریب تسهیلات و افزایش ماندگاری منابع برای بازآزمایی");
+  }
 
   return { modes: next, appliedFa };
 }
@@ -804,26 +937,26 @@ export function recomputeDerived(
       m.weight,
       totalDeposits,
       {
-        rr: inverseLerp(BLUEPRINTS[m.archetype].statutoryReserve, m.statutoryReserve),
-        rd: inverseLerp(BLUEPRINTS[m.archetype].depositRate, m.depositRate),
-        pd: inverseLerp(BLUEPRINTS[m.archetype].pd, m.pd),
-        lgd: inverseLerp(BLUEPRINTS[m.archetype].lgd, m.lgd),
-        rl: inverseLerp(BLUEPRINTS[m.archetype].loanRate, m.loanRate),
-        td: inverseLerp(BLUEPRINTS[m.archetype].sleepMonths, m.sleepMonths),
+        rrExact: m.statutoryReserve,
+        rdExact: m.depositRate,
+        pdExact: m.pd,
+        lgdExact: m.lgd,
+        rlExact: m.loanRate,
         tdExact: m.sleepMonths,
-        tl: inverseLerp(BLUEPRINTS[m.archetype].tenorMonths, m.tenorMonths),
-        omega: inverseLerp(BLUEPRINTS[m.archetype].waitingMonths, m.waitingMonths),
-        alpha: inverseLerp(BLUEPRINTS[m.archetype].loanMultiplier, m.loanMultiplier),
-        beta: inverseLerp(BLUEPRINTS[m.archetype].blockedRatio, m.blockedRatio),
-        gamma: inverseLerp(BLUEPRINTS[m.archetype].closedLoopRetention, m.closedLoopRetention),
-        delta: inverseLerp(BLUEPRINTS[m.archetype].withdrawalFraction, m.withdrawalFractionMean),
-        fee: inverseLerp(BLUEPRINTS[m.archetype].feeIncomeRate, m.feeIncomeRate),
-        cap: inverseLerp(BLUEPRINTS[m.archetype].capToman, m.capToman),
-        adoption: inverseLerp(BLUEPRINTS[m.archetype].adoption, m.adoptionScore),
+        tlExact: m.tenorMonths,
+        omegaExact: m.waitingMonths,
+        alphaExact: m.loanMultiplier,
+        betaExact: m.blockedRatio,
+        gammaExact: m.closedLoopRetention,
+        deltaExact: m.withdrawalFractionMean,
+        feeExact: m.feeIncomeRate,
+        capExact: m.capToman,
+        adoptionExact: m.adoptionScore,
       },
       persona,
       i,
       gammaFloor,
+      m.blockRelease,
     ),
   );
 }
@@ -868,6 +1001,15 @@ export function enforceStagger(modes: ModeSpec[]): ModeSpec[] {
   return modes.map((m, i) => ({ ...m, sleepMonths: assigned[i] }));
 }
 
+function shuffle<T>(items: T[], rng: Rng): T[] {
+  const out = [...items];
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rng() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
 function pickArchetypes(
   request: ProductGenerationRequest,
   rng: Rng,
@@ -880,25 +1022,31 @@ function pickArchetypes(
     "investment-deposit",
     "supply-chain-gam",
   ];
-  if (forced && forced.length >= 2) {
-    const extra = pool.filter((p) => !forced.includes(p));
-    const need = Math.max(0, request.modeCount - forced.length);
-    const chosen = [...forced];
-    for (let i = 0; i < need && extra.length; i += 1) {
-      chosen.push(extra.splice(Math.floor(rng() * extra.length), 1)[0]);
-    }
-    return chosen.slice(0, Math.max(3, request.modeCount));
+  const count = clamp(Math.round(request.modeCount), 1, pool.length);
+  const uniqueForced = [...new Set(forced ?? [])].filter((item) => pool.includes(item));
+  if (uniqueForced.length) {
+    const chosen = uniqueForced.slice(0, count);
+    const extra = shuffle(pool.filter((item) => !chosen.includes(item)), rng);
+    while (chosen.length < count && extra.length) chosen.push(extra.shift()!);
+    return chosen;
   }
-  const shuffled = [...pool].sort(() => rng() - 0.5);
-  const count = clamp(request.modeCount, 3, 5);
-  // Retail QH + merchant accelerator are structurally mandatory for a
-  // staggered Iranian average-balance matrix.
+
+  if (count === 1) {
+    const contractMatches = request.preferredContracts.length
+      ? pool.filter((archetype) => BLUEPRINTS[archetype].contracts.some((contract) =>
+          request.preferredContracts.includes(contract),
+        ))
+      : [];
+    const candidates = contractMatches.length ? contractMatches : pool;
+    return [candidates[Math.floor(rng() * candidates.length)]];
+  }
+
+  // Retail QH and merchant channels are default anchors for a multi-mode
+  // average-balance structure; higher requested counts add distinct segments.
   const chosen: ModeArchetype[] = ["retail-qarz-average", "merchant-pos-accelerator"];
-  shuffled
-    .filter((a) => !chosen.includes(a))
-    .slice(0, count - chosen.length)
-    .forEach((a) => chosen.push(a));
-  return chosen.slice(0, count);
+  const extras = shuffle(pool.filter((item) => !chosen.includes(item)), rng);
+  while (chosen.length < count && extras.length) chosen.push(extras.shift()!);
+  return chosen;
 }
 
 function pickContract(bp: ArchetypeBlueprint, request: ProductGenerationRequest, rng: Rng): ContractType {
@@ -1008,6 +1156,14 @@ function refine(
 /** Yields to the event loop so progress can be streamed over SSE. */
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    const error = new Error("Optimization cancelled by the caller");
+    error.name = "AbortError";
+    throw error;
+  }
+}
+
 /** The full hybrid inverse solve with the critic self-correction loop. */
 export async function optimizeProduct(
   request: ProductGenerationRequest,
@@ -1019,11 +1175,20 @@ export async function optimizeProduct(
       ? seedFromString(options.seed + request.prompt)
       : options.seed ?? seedFromString(request.prompt || "default-seed");
   const rng = createRng(seedValue);
-  const candidateCount = options.candidates ?? 42;
-  const horizon = options.horizonMonths ?? ALM_HORIZON_MONTHS;
-  const maxIterations = options.maxIterations ?? REGULATORY.maxCriticIterations;
+  const candidateCount = clamp(Math.round(options.candidates ?? 42), 1, MAX_OPTIMIZER_CANDIDATES);
+  const horizon = clamp(Math.round(options.horizonMonths ?? ALM_HORIZON_MONTHS), 6, 120);
+  const requestedRuns = options.runs ?? MC_RUNS;
+  if (!Number.isSafeInteger(requestedRuns) || requestedRuns < 1 || requestedRuns > MAX_MONTE_CARLO_RUNS) {
+    throw new RangeError(`Optimizer runs must be an integer between 1 and ${MAX_MONTE_CARLO_RUNS}; received ${requestedRuns}`);
+  }
+  const maxIterations = clamp(
+    Math.round(options.maxIterations ?? REGULATORY.maxCriticIterations),
+    1,
+    REGULATORY.maxCriticIterations,
+  );
   const persona = options.persona ?? null;
   const gammaFloor = options.gammaFloor ?? 0;
+  const riskLimits = effectiveRiskLimits(request);
 
   options.onProgress?.({
     stage: "optimizer:start",
@@ -1034,6 +1199,7 @@ export async function optimizeProduct(
   // ---- Stage A/B/C screening -------------------------------------------------
   const screened: { product: ProductSpec; score: number; metrics: AlmMetrics }[] = [];
   for (let c = 0; c < candidateCount; c += 1) {
+    throwIfAborted(options.signal);
     const archetypes =
       c < 6
         ? pickArchetypes(request, createRng(seedValue + c * 977), options.forcedArchetypes)
@@ -1045,10 +1211,13 @@ export async function optimizeProduct(
       persona,
       gammaFloor,
     );
-    const metrics = evaluateProduct(candidate, seedValue + c, horizon);
-    const { score } = objectiveScore(candidate, metrics, request);
+    const metrics = evaluateProduct(candidate, seedValue + c, horizon, riskLimits);
+    const { score } = objectiveScore(metrics, request);
     screened.push({ product: candidate, score, metrics });
-    if (c % 4 === 0) await tick();
+    if (c % 4 === 0) {
+      await tick();
+      throwIfAborted(options.signal);
+    }
     if (c % 12 === 0) {
       options.onProgress?.({
         stage: "optimizer:screen",
@@ -1064,6 +1233,7 @@ export async function optimizeProduct(
   const iterations: OptimizerIteration[] = [];
   let current = incumbent;
   for (let it = 1; it <= maxIterations; it += 1) {
+    throwIfAborted(options.signal);
     const refined =
       it === 1 ? current.product : refine(current.product, request, rng, persona, gammaFloor);
     const applied =
@@ -1073,15 +1243,17 @@ export async function optimizeProduct(
 
     const alm = runAlmSimulation({
       product: refined,
-      runs: it === maxIterations ? (options.runs ?? MC_RUNS) : Math.max(8, options.screenRuns ?? MC_SCREEN_RUNS),
+      runs: requestedRuns,
       seed: seedValue + it * 104729,
       horizonMonths: horizon,
+      limits: riskLimits,
+      signal: options.signal,
     });
-    const { score } = objectiveScore(refined, alm.metrics, request);
+    const { score } = objectiveScore(alm.metrics, request);
     const findings = feasibilityCheck(refined, alm.metrics, request);
     const feasible = findings.filter((f) => f.severity === "blocker").length === 0;
 
-    const directiveResult = applyDirectives(refined.modes, findings, rng);
+    const directiveResult = applyDirectives(refined.modes, findings);
     iterations.push({
       iteration: it,
       score,
@@ -1106,28 +1278,16 @@ export async function optimizeProduct(
       current = { product: refined, score, metrics: alm.metrics };
     }
     if (feasible) {
-      // confirm with the full Monte Carlo run
-      const confirm = runAlmSimulation({
+      return {
         product: refined,
-        runs: options.runs ?? MC_RUNS,
-        seed: seedValue + 7,
-        horizonMonths: horizon,
-      });
-      const confirmFindings = feasibilityCheck(refined, confirm.metrics, request);
-      if (confirmFindings.filter((f) => f.severity === "blocker").length === 0) {
-        return {
-          product: refined,
-          alm: confirm,
-          metrics: confirm.metrics,
-          score: objectiveScore(refined, confirm.metrics, request).score,
-          feasible: true,
-          iterations,
-          candidatesScreened: candidateCount,
-          elapsedMs: Date.now() - started,
-        };
-      }
-      current = { product: refined, score, metrics: confirm.metrics };
-      directiveResult.appliedFa.forEach((x) => void x);
+        alm,
+        metrics: alm.metrics,
+        score,
+        feasible: true,
+        iterations,
+        candidatesScreened: candidateCount,
+        elapsedMs: Date.now() - started,
+      };
     }
     // apply directives for the next iteration
     const directed = assembleProduct(
@@ -1137,25 +1297,28 @@ export async function optimizeProduct(
       refined.titleFa,
       refined.titleEn,
     );
-    const directedMetrics = evaluateProduct(directed, seedValue + it, horizon);
-    const directedScore = objectiveScore(directed, directedMetrics, request).score;
+    const directedMetrics = evaluateProduct(directed, seedValue + it, horizon, riskLimits);
+    const directedScore = objectiveScore(directedMetrics, request).score;
     if (directedScore >= current.score) {
       current = { product: directed, score: directedScore, metrics: directedMetrics };
     }
   }
 
+  throwIfAborted(options.signal);
   const finalAlm = runAlmSimulation({
     product: current.product,
-    runs: options.runs ?? MC_RUNS,
+    runs: requestedRuns,
     seed: seedValue + 99,
     horizonMonths: horizon,
+    limits: riskLimits,
+    signal: options.signal,
   });
   const findings = feasibilityCheck(current.product, finalAlm.metrics, request);
   return {
     product: current.product,
     alm: finalAlm,
     metrics: finalAlm.metrics,
-    score: objectiveScore(current.product, finalAlm.metrics, request).score,
+    score: objectiveScore(finalAlm.metrics, request).score,
     feasible: findings.filter((f) => f.severity === "blocker").length === 0,
     iterations,
     candidatesScreened: candidateCount,
@@ -1226,6 +1389,7 @@ export function sensitivitySweep(
   ];
 
   const seedValue = typeof seed === "string" ? seedFromString(seed) : seed;
+  const riskLimits = effectiveRiskLimits(request);
   return dims.map((dim) => {
     const irr: number[] = [];
     const ldr: number[] = [];
@@ -1233,7 +1397,12 @@ export function sensitivitySweep(
     const overturning: number[] = [];
     const adoption: number[] = [];
     dim.deltas.forEach((d) => {
-      const modes = product.modes.map((m) => dim.apply(m, d));
+      const persona = PERSONAS.find((item) => item.key === request.personaKey) ?? null;
+      const modes = recomputeDerived(
+        product.modes.map((m) => dim.apply(m, d)),
+        persona,
+        0,
+      );
       const variant = assembleProduct(
         modes,
         product.targetDepositsRial,
@@ -1245,7 +1414,8 @@ export function sensitivitySweep(
         product: variant,
         runs: 40,
         seed: seedValue + Math.round(d * 100),
-        horizonMonths: ALM_HORIZON_MONTHS,
+        horizonMonths: request.horizonMonths,
+        limits: riskLimits,
       }).metrics;
       irr.push(metrics.irrBankAnnual);
       ldr.push(metrics.p95Ldr);

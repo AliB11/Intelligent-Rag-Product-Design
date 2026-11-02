@@ -14,6 +14,7 @@ import {
   rialToHemmat,
 } from "../domain/constants";
 import { ARCHETYPE_LABEL_FA, CONTRACT_LABEL_FA } from "../domain/guildValueChain";
+import { effectiveRiskLimits } from "../domain/optimizer";
 import { searchBenchmarks } from "../rag/benchmarks";
 import type { AlmResult, BenchmarkScheme, ModeSpec, ProductSpec, RegulatoryConstraint } from "../domain/types";
 import type { AccountingEntry, AgentState, ComplianceDraftItem } from "./state";
@@ -145,6 +146,9 @@ export function buildComplianceDraft(state: AgentState): ComplianceDraftItem[] {
   const metrics = state.alm?.metrics;
   if (!product || !metrics) return [];
   const items: ComplianceDraftItem[] = [];
+  const riskLimits = state.request
+    ? effectiveRiskLimits(state.request)
+    : { ldrCeiling: REGULATORY.ldrCeiling, lcrFloor: REGULATORY.lcrFloor };
 
   product.modes.forEach((m) => {
     const ceiling =
@@ -179,15 +183,15 @@ export function buildComplianceDraft(state: AgentState): ComplianceDraftItem[] {
   items.push({
     code: "SOLV-LDR",
     titleFa: "قاعده انحلال‌پذیری LDR",
-    requirementFa: `صدک ۹۵ نسبت خالص تسهیلات به سپرده ${formatPercent(metrics.p95Ldr, 2)} در برابر سقف ${formatPercent(REGULATORY.ldrCeiling)}.`,
-    statusFa: metrics.p95Ldr <= REGULATORY.ldrCeiling ? "مطابق" : "نقض — نیازمند بازطراحی",
+    requirementFa: `صدک ۹۵ نسبت خالص تسهیلات به سپرده ${formatPercent(metrics.p95Ldr, 2)} در برابر سقف مؤثر ${formatPercent(riskLimits.ldrCeiling)} (سخت‌گیرانه‌ترِ درخواست و سقف مدل).`,
+    statusFa: metrics.p95Ldr <= riskLimits.ldrCeiling ? "مطابق حد مدل‌شده" : "نقض — نیازمند بازطراحی",
     severity: "mandatory",
   });
   items.push({
     code: "SOLV-LCR",
     titleFa: "کفایت پوشش نقدینگی LCR",
-    requirementFa: `صدک ۵ نسبت پوشش نقدینگی ${formatNumberFa(metrics.p5Lcr, 2)} در برابر کف ${REGULATORY.lcrFloor}.`,
-    statusFa: metrics.p5Lcr >= REGULATORY.lcrFloor ? "مطابق" : "نقض — نیازمند بازطراحی",
+    requirementFa: `صدک ۵ نسبت پوشش نقدینگی ${formatNumberFa(metrics.p5Lcr, 2)} در برابر کف مؤثر ${formatNumberFa(riskLimits.lcrFloor, 2)} (سخت‌گیرانه‌ترِ درخواست و کف مدل).`,
+    statusFa: metrics.p5Lcr >= riskLimits.lcrFloor ? "مطابق حد مدل‌شده" : "نقض — نیازمند بازطراحی",
     severity: "mandatory",
   });
   items.push({
@@ -238,6 +242,12 @@ export function buildExecutiveReportFa(state: AgentState): string {
   const product = state.product;
   const m = state.alm?.metrics;
   if (!req || !product || !m) return "";
+  const riskLimits = effectiveRiskLimits(req);
+  const blockerCount = state.findings.filter((finding) => finding.severity === "blocker").length;
+  const warningCount = state.findings.filter((finding) => finding.severity === "warning").length;
+  const validationLine = state.validationStatus === "not_validated"
+    ? `**وضعیت اعتبارسنجی مدل: غیرقابل‌تأیید** — پس از ${state.iterations.length} گام اصلاح، ${blockerCount} قید سخت هنوز نقض می‌شود. این خروجی نباید منطبق یا آماده تصویب تلقی شود.`
+    : `**وضعیت اعتبارسنجی مدل: قیود سخت پاس شدند** — ${warningCount} هشدار عملکردی باقی مانده است. این نتیجه تأیید رسمی ناظر یا مجوز عرضه نیست.`;
 
   const modeLines = product.modes
     .map((mode, i) => {
@@ -281,7 +291,9 @@ export function buildExecutiveReportFa(state: AgentState): string {
   return [
     `# پیشنهاد مدیریتی محصول بانکی «${product.titleFa}»`,
     "",
-    `**کد محصول:** ${product.code} | **تاریخ تولید:** ${new Date().toLocaleDateString("fa-IR")} | **افق شبیه‌سازی:** ${product.modes.length ? state.alm?.horizonMonths ?? 60 : 60} ماه | **اجرای مونت‌کارلو:** ${formatNumberFa(state.alm?.monteCarloRuns ?? 0, 0)} مسیر`,
+    `**کد محصول:** ${product.code} | **تاریخ تولید:** ${new Date().toLocaleDateString("fa-IR")} | **افق شبیه‌سازی:** ${state.alm?.horizonMonths ?? 60} ماه | **اجرای مونت‌کارلو:** ${formatNumberFa(state.alm?.monteCarloRuns ?? 0, 0)} مسیر`,
+    "",
+    validationLine,
     "",
     "## ۱) خلاصه مدیریتی",
     `درخواست راهبردی کاربر به تابع هدف و قیود صوری با هدف جذب **${fmtHemmat(req.targetDepositsHemmat)} همت** (${fmtBT(req.targetDepositsRial)} میلیارد تومان) منبع و نرخ بازده داخلی هدف **${formatPercent(req.targetIrr, 1)}** ترجمه شد. حل‌کننده معکوس MILP/MINLP یک ماتریس **${product.modes.length}-طرحی پلکانی** با عنوان «${product.titleFa}» سنتز کرد و دوقلوی دیجیتال ALM آن را در ${state.alm?.horizonMonths ?? 60} ماه و ${formatNumberFa(state.alm?.monteCarloRuns ?? 0, 0)} مسیر مونت‌کارلو آزمون تنش کرد.`,
@@ -292,8 +304,8 @@ export function buildExecutiveReportFa(state: AgentState): string {
     `| ROI تجمیعی ۵ ساله | ${formatPercent(m.roi, 1)} | ≥ ${formatPercent(req.targetRoi, 0)} | ${m.roi >= req.targetRoi ? "✓" : "✗"} |`,
     `| ROE سالانه | ${formatPercent(m.roe, 2)} | ≥ ${formatPercent(req.targetRoe, 1)} | ${m.roe >= req.targetRoe ? "✓" : "✗"} |`,
     `| NIM (مشاع + غیرمشاع) | ${formatPercent(m.nim, 2)} | ≥ ${formatPercent(req.targetNim, 1)} | ${m.nim >= req.targetNim ? "✓" : "✗"} |`,
-    `| p95 نسبت تسهیلات به سپرده | ${formatPercent(m.p95Ldr, 2)} | ≤ ${formatPercent(REGULATORY.ldrCeiling)} | ${m.p95Ldr <= REGULATORY.ldrCeiling ? "✓" : "✗"} |`,
-    `| p5 نسبت پوشش نقدینگی | ${formatNumberFa(m.p5Lcr, 2)} | ≥ ${REGULATORY.lcrFloor} | ${m.p5Lcr >= REGULATORY.lcrFloor ? "✓" : "✗"} |`,
+    `| p95 نسبت تسهیلات به سپرده | ${formatPercent(m.p95Ldr, 2)} | ≤ ${formatPercent(riskLimits.ldrCeiling)} (حد مؤثر) | ${m.p95Ldr <= riskLimits.ldrCeiling ? "✓" : "✗"} |`,
+    `| p5 نسبت پوشش نقدینگی | ${formatNumberFa(m.p5Lcr, 2)} | ≥ ${formatNumberFa(riskLimits.lcrFloor, 2)} (حد مؤثر) | ${m.p5Lcr >= riskLimits.lcrFloor ? "✓" : "✗"} |`,
     `| شوک واژگونی منابع (p95) | ${formatPercent(m.overturningShock, 2)} | ≤ ${formatPercent(req.maxOverturningShock, 2)} | ${m.overturningShock <= req.maxOverturningShock ? "✓" : "✗"} |`,
     `| خالص خروج نقدینگی | ${formatPercent(m.netLiquidityDrainRatio, 2)} | نزدیک صفر | ${m.netLiquidityDrainRatio <= 0.05 ? "✓" : "△"} |`,
     "",
@@ -346,7 +358,7 @@ export function buildExecutiveReportFa(state: AgentState): string {
     `- بازبینی فصلی نرخ‌ها در صورت تغییر مصوبات شورای پول و اعتبار و به‌روزرسانی پایگاه دانش RAG.`,
     `- اجرای آزمون تحمل سناریوی «هجوم شدید» پیش از عرضه عمومی محصول.`,
     "",
-    `**جمع‌بندی:** ${state.findings.filter((f) => f.severity === "blocker").length === 0 ? "ساختار سنتزشده تمامی قیود انحصاری بانک مرکزی و حدود تحمل ریسک درخواست‌شده را ارضا می‌کند و آماده تصویب در کمیته محصولات است." : "ساختار پس از " + state.iterations.length + " گام خوداصلاحی به مرز انطباق رسیده است؛ موارد باقیمانده در بخش انطباق درج شده و نیازمند تصمیم مدیریتی است."}`,
+    `**جمع‌بندی:** ${state.validationStatus === "not_validated" ? `غیرقابل‌تأیید: پس از ${state.iterations.length} گام خوداصلاحی، ${blockerCount} قید سخت حل‌نشده باقی مانده است؛ این ساختار را منطبق یا آماده تصویب تلقی نکنید.` : `قیود سختِ مدل‌شده پاس شدند${warningCount ? `، اما ${warningCount} هشدار عملکردی باقی است` : ""}. نتیجه شبیه‌سازی به‌تنهایی تأیید رسمی یا مجوز عرضه نیست.`}`,
   ]
     .filter((line) => line !== undefined)
     .join("\n");
@@ -357,10 +369,18 @@ export function buildExecutiveReportEn(state: AgentState): string {
   const product = state.product;
   const m = state.alm?.metrics;
   if (!req || !product || !m) return "";
+  const riskLimits = effectiveRiskLimits(req);
+  const blockerCount = state.findings.filter((finding) => finding.severity === "blocker").length;
+  const warningCount = state.findings.filter((finding) => finding.severity === "warning").length;
+  const validationLine = state.validationStatus === "not_validated"
+    ? `**Model validation: NOT VALIDATED** — ${blockerCount} hard constraint(s) remain after ${state.iterations.length} correction attempt(s). Do not treat this result as compliant or ready for approval.`
+    : `**Model validation: HARD CONSTRAINTS PASSED** — ${warningCount} soft performance warning(s) remain. This is not regulatory approval or authorization to launch.`;
   return [
     `# Executive product specification — ${product.titleEn} (${product.code})`,
     "",
     `Target resources: ${(req.targetDepositsRial / HEMMAT_RIAL).toFixed(2)} Hemmat (${(req.targetDepositsRial / 1e9).toFixed(0)} B Rial) | Horizon: ${state.alm?.horizonMonths ?? 60} months | Monte Carlo runs: ${state.alm?.monteCarloRuns ?? 0}`,
+    "",
+    validationLine,
     "",
     `| Metric | Value | Target | Status |`,
     `| --- | --- | --- | --- |`,
@@ -368,8 +388,8 @@ export function buildExecutiveReportEn(state: AgentState): string {
     `| ROI (cumulative) | ${(m.roi * 100).toFixed(1)}% | >= ${(req.targetRoi * 100).toFixed(0)}% | ${m.roi >= req.targetRoi ? "PASS" : "FAIL"} |`,
     `| ROE (annual) | ${(m.roe * 100).toFixed(2)}% | >= ${(req.targetRoe * 100).toFixed(1)}% | ${m.roe >= req.targetRoe ? "PASS" : "FAIL"} |`,
     `| NIM | ${(m.nim * 100).toFixed(2)}% | >= ${(req.targetNim * 100).toFixed(1)}% | ${m.nim >= req.targetNim ? "PASS" : "FAIL"} |`,
-    `| p95 net LDR | ${(m.p95Ldr * 100).toFixed(2)}% | <= ${(req.ldrCeiling * 100).toFixed(0)}% | ${m.p95Ldr <= req.ldrCeiling ? "PASS" : "FAIL"} |`,
-    `| p5 LCR | ${m.p5Lcr.toFixed(2)} | >= ${req.lcrFloor.toFixed(2)} | ${m.p5Lcr >= req.lcrFloor ? "PASS" : "FAIL"} |`,
+    `| p95 net LDR | ${(m.p95Ldr * 100).toFixed(2)}% | <= ${(riskLimits.ldrCeiling * 100).toFixed(0)}% effective | ${m.p95Ldr <= riskLimits.ldrCeiling ? "PASS" : "FAIL"} |`,
+    `| p5 LCR | ${m.p5Lcr.toFixed(2)} | >= ${riskLimits.lcrFloor.toFixed(2)} effective | ${m.p5Lcr >= riskLimits.lcrFloor ? "PASS" : "FAIL"} |`,
     `| Overturning shock (p95) | ${(m.overturningShock * 100).toFixed(2)}% | <= ${(req.maxOverturningShock * 100).toFixed(2)}% | ${m.overturningShock <= req.maxOverturningShock ? "PASS" : "FAIL"} |`,
     `| Net liquidity drain | ${(m.netLiquidityDrainRatio * 100).toFixed(2)}% | ~0 | ${m.netLiquidityDrainRatio <= 0.05 ? "PASS" : "WATCH"} |`,
     "",
@@ -386,6 +406,9 @@ export function buildExecutiveReportEn(state: AgentState): string {
       (it) =>
         `- Iteration ${it.iteration}: score ${it.score.toFixed(3)}, IRR ${(it.irrAnnual * 100).toFixed(2)}%, p95 LDR ${(it.p95Ldr * 100).toFixed(2)}%, p5 LCR ${it.p5Lcr.toFixed(2)}, overturning ${(it.overturningShock * 100).toFixed(2)}% ${it.feasible ? "[FEASIBLE]" : ""}`,
     ),
+    "",
+    "## Final validation",
+    validationLine,
     "",
     "## Compliance draft",
     ...state.complianceDraft.map((c) => `- [${c.code}] ${c.requirementFa}`),

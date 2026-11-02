@@ -6,19 +6,29 @@
  * to the client through Server-Sent Events by the API layer.
  */
 
-import { MC_RUNS, REGULATORY } from "../domain/constants";
-import { parseIntent } from "../domain/intentParser";
+import {
+  MAX_MONTE_CARLO_RUNS,
+  MAX_OPTIMIZER_CANDIDATES,
+  MAX_PROMPT_LENGTH,
+  MC_RUNS,
+  MC_SCREEN_RUNS,
+  MIN_OPTIMIZER_CANDIDATES,
+  REGULATORY,
+} from "../domain/constants";
+import { parseIntent, type IntentOverrides } from "../domain/intentParser";
 import {
   applyDirectives,
   assembleProduct,
+  effectiveRiskLimits,
   enforceStagger,
   feasibilityCheck,
   optimizeProduct,
+  objectiveScore,
   recomputeDerived,
   sensitivitySweep,
 } from "../domain/optimizer";
-import { runAlmSimulation } from "../domain/almSimulator";
-import { createRng, seedFromString } from "../domain/financial";
+import { runAlmSimulationAsync } from "../domain/almSimulator";
+import { seedFromString } from "../domain/financial";
 import {
   buildGuildEcosystem,
   personaByKey,
@@ -50,6 +60,8 @@ export interface PipelineOptions {
   maxIterations?: number;
   withSensitivity?: boolean;
   seed?: string;
+  intentOverrides?: IntentOverrides;
+  signal?: AbortSignal;
 }
 
 export interface PipelineResult {
@@ -58,8 +70,8 @@ export interface PipelineResult {
 }
 
 /** Node 1 — parse natural-language intent into a typed objective function. */
-function intentAnalyzerNode(state: AgentState, emit: Emit) {
-  const { request, warnings } = parseIntent(state.prompt);
+function intentAnalyzerNode(state: AgentState, emit: Emit, options: PipelineOptions) {
+  const { request, warnings } = parseIntent(state.prompt, options.intentOverrides);
   state.request = request;
   state.warnings = warnings;
   emit({
@@ -195,12 +207,14 @@ async function mathematicalSynthesizerNode(
     const solve = await optimizeProduct(req, {
       candidates: options.candidates ?? 26,
       maxIterations: 1,
-      runs: 220,
+      runs: Math.min(options.runs ?? MC_RUNS, MC_SCREEN_RUNS),
       screenRuns: 60,
-      seed: state.prompt,
+      seed: options.seed ?? state.prompt,
       horizonMonths: req.horizonMonths,
       persona: state.persona,
-      forcedArchetypes: state.ecosystem?.recommendedModes.slice(0, req.modeCount),
+      signal: options.signal,
+      forcedArchetypes:
+        req.modeCount > 1 ? state.ecosystem?.recommendedModes.slice(0, req.modeCount) : undefined,
       gammaFloor: state.ecosystem ? state.ecosystem.gammaTarget : 0,
       onProgress: (p) =>
         emit({
@@ -213,7 +227,7 @@ async function mathematicalSynthesizerNode(
     });
     state.product = solve.product;
     state.alm = solve.alm;
-    state.iterations = solve.iterations;
+    state.iterations = [];
     emit({
       node: "mathematical_synthesizer",
       stage: "synth:done",
@@ -236,9 +250,8 @@ async function mathematicalSynthesizerNode(
   }
 
   // self-correction pass driven by the critic's mathematical directive
-  const rng = createRng(seedFromString(state.prompt + state.iteration));
   const findings = state.findings;
-  const { modes, appliedFa } = applyDirectives(state.product.modes, findings, rng);
+  const { modes, appliedFa } = applyDirectives(state.product.modes, findings);
   const nextProduct: ProductSpec = assembleProduct(
     recomputeDerived(enforceStagger(modes), state.persona, state.ecosystem?.gammaTarget ?? 0),
     state.product.targetDepositsRial,
@@ -247,6 +260,13 @@ async function mathematicalSynthesizerNode(
     state.product.titleEn,
   );
   state.product = nextProduct;
+  const previousIteration = state.iterations.findIndex((item) => item.iteration === state.iteration - 1);
+  if (previousIteration >= 0) {
+    state.iterations[previousIteration] = {
+      ...state.iterations[previousIteration],
+      directivesAppliedFa: appliedFa,
+    };
+  }
   emit({
     node: "mathematical_synthesizer",
     stage: "synth:directed",
@@ -263,29 +283,32 @@ async function mathematicalSynthesizerNode(
 }
 
 /** Node 5 — Monte Carlo ALM digital twin stress test. */
-function almStressTesterNode(state: AgentState, emit: Emit, options: PipelineOptions) {
+async function almStressTesterNode(state: AgentState, emit: Emit, options: PipelineOptions): Promise<void> {
   const req = state.request;
   const product = state.product;
   if (!req || !product) return;
-  const limit = options.maxIterations ?? REGULATORY.maxCriticIterations;
-  const runs = state.iteration >= limit ? MC_RUNS : state.iteration === 1 ? 220 : 400;
+  const runs = options.runs ?? MC_RUNS;
+  const riskLimits = effectiveRiskLimits(req);
 
-  const alm = runAlmSimulation({
+  const alm = await runAlmSimulationAsync({
     product,
     runs,
-    seed: seedFromString(state.prompt) + state.iteration * 7919,
+    seed: seedFromString(options.seed ?? state.prompt) + state.iteration * 7919,
     horizonMonths: req.horizonMonths,
+    limits: riskLimits,
+    signal: options.signal,
   });
   state.alm = alm;
   const m = alm.metrics;
   emit({
     node: "alm_stress_tester",
     stage: "alm:done",
-    level: runs >= MC_RUNS ? "ok" : "info",
+    level: "ok",
     titleFa: `شبیه‌سازی مونت‌کارلو ${runs} مسیره × ${alm.horizonMonths} ماه — IRR ${(m.irrBankAnnual * 100).toFixed(2)}٪ | p95 LDR ${(m.p95Ldr * 100).toFixed(2)}٪ | p5 LCR ${m.p5Lcr.toFixed(2)} | واژگونی ${(m.overturningShock * 100).toFixed(2)}٪`,
     titleEn: `${runs}-path × ${alm.horizonMonths}-month Monte Carlo — IRR ${(m.irrBankAnnual * 100).toFixed(2)}% | p95 LDR ${(m.p95Ldr * 100).toFixed(2)}% | p5 LCR ${m.p5Lcr.toFixed(2)} | overturning ${(m.overturningShock * 100).toFixed(2)}%`,
     metrics: {
       irrBankAnnual: m.irrBankAnnual,
+      irrValidPathShare: m.irrValidPathShare,
       roi: m.roi,
       roe: m.roe,
       nim: m.nim,
@@ -302,17 +325,22 @@ function almStressTesterNode(state: AgentState, emit: Emit, options: PipelineOpt
     },
   });
 
-  const severe = runAlmSimulation({
+  const severe = await runAlmSimulationAsync({
     product,
     runs: 160,
-    seed: seedFromString(state.prompt) + 555,
+    seed: seedFromString(options.seed ?? state.prompt) + 555,
     horizonMonths: req.horizonMonths,
     scenario: "severe-run",
+    limits: riskLimits,
+    signal: options.signal,
   });
   emit({
     node: "alm_stress_tester",
     stage: "alm:severe",
-    level: severe.metrics.p95Ldr <= REGULATORY.ldrCeiling ? "ok" : "warn",
+    level:
+      severe.metrics.p95Ldr <= riskLimits.ldrCeiling && severe.metrics.p5Lcr >= riskLimits.lcrFloor
+        ? "ok"
+        : "warn",
     titleFa: `سناریوی هجوم شدید: p95 LDR ${(severe.metrics.p95Ldr * 100).toFixed(2)}٪ | p5 LCR ${severe.metrics.p5Lcr.toFixed(2)} | شوک واژگونی ${(severe.metrics.overturningShock * 100).toFixed(2)}٪`,
     titleEn: `Severe run scenario: p95 LDR ${(severe.metrics.p95Ldr * 100).toFixed(2)}% | p5 LCR ${severe.metrics.p5Lcr.toFixed(2)} | overturning ${(severe.metrics.overturningShock * 100).toFixed(2)}%`,
     metrics: {
@@ -324,7 +352,7 @@ function almStressTesterNode(state: AgentState, emit: Emit, options: PipelineOpt
 }
 
 /** Node 6 — critic auditor with mathematical adjustment directives. */
-function criticAuditorNode(state: AgentState, emit: Emit) {
+function criticAuditorNode(state: AgentState, emit: Emit, options: PipelineOptions) {
   const req = state.request;
   const product = state.product;
   const alm = state.alm;
@@ -332,30 +360,34 @@ function criticAuditorNode(state: AgentState, emit: Emit) {
   const findings = feasibilityCheck(product, alm.metrics, req);
   state.findings = findings;
   const blockers = findings.filter((f) => f.severity === "blocker");
-  state.iterations = [
-    ...state.iterations,
-    {
-      iteration: state.iteration,
-      score: 0,
-      irrAnnual: alm.metrics.irrBankAnnual,
-      p95Ldr: alm.metrics.p95Ldr,
-      p5Lcr: alm.metrics.p5Lcr,
-      overturningShock: alm.metrics.overturningShock,
-      netDrainRatio: alm.metrics.netLiquidityDrainRatio,
-      feasible: blockers.length === 0,
-      findings,
-      directivesAppliedFa: findings.map((f) => f.directive.rationaleFa),
-    },
-  ];
+  const iterationRecord = {
+    iteration: state.iteration,
+    score: objectiveScore(alm.metrics, req).score,
+    irrAnnual: alm.metrics.irrBankAnnual,
+    p95Ldr: alm.metrics.p95Ldr,
+    p5Lcr: alm.metrics.p5Lcr,
+    overturningShock: alm.metrics.overturningShock,
+    netDrainRatio: alm.metrics.netLiquidityDrainRatio,
+    feasible: blockers.length === 0,
+    findings,
+    directivesAppliedFa: [] as string[],
+  };
+  const existingIndex = state.iterations.findIndex((item) => item.iteration === state.iteration);
+  if (existingIndex >= 0) state.iterations[existingIndex] = iterationRecord;
+  else state.iterations.push(iterationRecord);
 
   if (!blockers.length) {
     emit({
       node: "critic_auditor",
       stage: "critic:pass",
       level: "ok",
-      titleFa: "ممیزی پذیرفته شد: تمامی قیود انحلال‌پذیری، پوشش نقدینگی، بازده هدف و تحمل ریسک واژگونی ارضا شدند.",
-      titleEn: "Audit passed: solvency, liquidity coverage, target return and overturning tolerance all satisfied.",
-      metrics: { blockers: 0, warnings: findings.length },
+      titleFa: findings.some((f) => f.severity === "warning")
+        ? "قیود سخت ریسک و بازده هدف IRR برقرار است؛ هشدارهای اهداف نرم عملکردی در گزارش مشخص شده‌اند."
+        : "ممیزی پذیرفته شد: قیود سخت کفایت نقدینگی، توان بازپرداخت و بازده هدف ارضا شدند.",
+      titleEn: findings.some((f) => f.severity === "warning")
+        ? "Hard risk and IRR constraints pass; soft performance-target warnings are retained in the report."
+        : "Audit passed: hard liquidity, affordability and target-return constraints are satisfied.",
+      metrics: { blockers: 0, warnings: findings.filter((f) => f.severity === "warning").length },
     });
     return;
   }
@@ -372,12 +404,17 @@ function criticAuditorNode(state: AgentState, emit: Emit) {
       metrics: { observed: f.observed, limit: f.limit },
     }),
   );
+  const limit = options.maxIterations ?? REGULATORY.maxCriticIterations;
   emit({
     node: "critic_auditor",
-    stage: "critic:loop",
-    level: "info",
-    titleFa: `بازگشت شرطی به گره سنتزکننده ریاضی (گام خوداصلاحی ${state.iteration + 1} از ${REGULATORY.maxCriticIterations})`,
-    titleEn: `Conditional routing back to the mathematical synthesiser (self-correction ${state.iteration + 1}/${REGULATORY.maxCriticIterations})`,
+    stage: state.iteration < limit ? "critic:loop" : "critic:limit",
+    level: state.iteration < limit ? "info" : "warn",
+    titleFa: state.iteration < limit
+      ? `بازگشت به گره سنتز ریاضی برای خوداصلاحی ${state.iteration + 1} از ${limit}`
+      : `پس از ${limit} تلاش، ${blockers.length} قید سخت همچنان نقض می‌شود؛ گزارش با وضعیت غیرقابل‌تأیید صادر خواهد شد.`,
+    titleEn: state.iteration < limit
+      ? `Routing back to mathematical synthesis for correction ${state.iteration + 1} of ${limit}`
+      : `${blockers.length} hard constraints remain after ${limit} attempts; the report will retain an unverified status.`,
   });
 }
 
@@ -385,24 +422,18 @@ function criticAuditorNode(state: AgentState, emit: Emit) {
 function executiveReportNode(state: AgentState, emit: Emit, options: PipelineOptions) {
   if (!state.request || !state.product || !state.alm) return;
 
-  // Final confirmation with the full Monte Carlo population (1,000 paths).
-  if (state.alm.monteCarloRuns < MC_RUNS) {
-    emit({
-      node: "executive_report_generator",
-      stage: "report:confirm",
-      level: "info",
-      titleFa: `اجرای تأییدی نهایی با ${MC_RUNS} مسیر مونت‌کارلو پیش از صدور گزارش`,
-      titleEn: `Running final confirmation with ${MC_RUNS} Monte Carlo paths before issuing the report`,
-    });
-    state.alm = runAlmSimulation({
-      product: state.product,
-      runs: MC_RUNS,
-      seed: seedFromString(state.prompt) + 31337,
-      horizonMonths: state.request.horizonMonths,
-    });
-    state.findings = feasibilityCheck(state.product, state.alm.metrics, state.request);
+  // Never replace a requested final simulation with a lower-fidelity fallback.
+  // A count mismatch is a pipeline failure; reports are issued only from the
+  // exact requested Monte Carlo evaluation.
+  const requestedRuns = options.runs ?? MC_RUNS;
+  if (state.alm.monteCarloRuns !== requestedRuns) {
+    throw new Error(
+      `Refusing to issue a report: final ALM used ${state.alm.monteCarloRuns} runs, but ${requestedRuns} were requested`,
+    );
   }
 
+  const remainingBlockers = state.findings.filter((finding) => finding.severity === "blocker").length;
+  state.validationStatus = remainingBlockers === 0 ? "constraints_passed" : "not_validated";
   state.accountingEntries = buildAccountingEntries(state);
   state.complianceDraft = buildComplianceDraft(state);
   state.benchmarks = compareWithBenchmarks(state);
@@ -410,7 +441,7 @@ function executiveReportNode(state: AgentState, emit: Emit, options: PipelineOpt
   state.reportEn = buildExecutiveReportEn(state);
 
   if (options.withSensitivity !== false) {
-    const sweep = sensitivitySweep(state.product, state.request, seedFromString(state.prompt));
+    const sweep = sensitivitySweep(state.product, state.request, seedFromString(options.seed ?? state.prompt));
     const frame: SensitivityFrame = {
       dims: sweep.map((s) => s.label),
       deltas: sweep.map((s) => s.deltas),
@@ -433,9 +464,14 @@ function executiveReportNode(state: AgentState, emit: Emit, options: PipelineOpt
   emit({
     node: "executive_report_generator",
     stage: "report:done",
-    level: "ok",
-    titleFa: `گزارش مدیریتی فارسی، ${state.accountingEntries.length} سند حسابداری و ${state.complianceDraft.length} بند پیش‌نویس انطباق تولید شد`,
-    titleEn: `Persian executive report, ${state.accountingEntries.length} accounting entries and ${state.complianceDraft.length} compliance clauses generated`,
+    level: remainingBlockers ? "warn" : "ok",
+    titleFa: remainingBlockers
+      ? `گزارش با ${remainingBlockers} قید سختِ نقض‌شده صادر شد؛ این سناریو تأییدپذیر نیست.`
+      : `گزارش مدیریتی، ${state.accountingEntries.length} سند حسابداری و ${state.complianceDraft.length} بند پیش‌نویس انطباق تولید شد.`,
+    titleEn: remainingBlockers
+      ? `Report issued with ${remainingBlockers} unresolved hard-constraint breach(es); this scenario is not validated.`
+      : `Management report, ${state.accountingEntries.length} accounting entries and ${state.complianceDraft.length} compliance clauses generated.`,
+    metrics: { remainingBlockers, warnings: state.findings.filter((finding) => finding.severity === "warning").length },
   });
   state.status = "complete";
 }
@@ -443,12 +479,12 @@ function executiveReportNode(state: AgentState, emit: Emit, options: PipelineOpt
 export function buildPipelineGraph(options: PipelineOptions): StateGraph {
   const graph = new StateGraph();
   graph
-    .addNode("intent_analyzer", intentAnalyzerNode)
+    .addNode("intent_analyzer", (s, e) => intentAnalyzerNode(s, e, options))
     .addNode("regulatory_rag", regulatoryRagNode)
     .addNode("guild_persona", guildPersonaNode)
     .addNode("mathematical_synthesizer", (s, e) => mathematicalSynthesizerNode(s, e, options))
     .addNode("alm_stress_tester", (s, e) => almStressTesterNode(s, e, options))
-    .addNode("critic_auditor", criticAuditorNode)
+    .addNode("critic_auditor", (s, e) => criticAuditorNode(s, e, options))
     .addNode("executive_report_generator", (s, e) => executiveReportNode(s, e, options));
 
   graph.addConditionalEdge("intent_analyzer", () => "regulatory_rag");
@@ -476,6 +512,46 @@ export interface RunPipelineInput {
   options?: PipelineOptions;
 }
 
+function validatePipelineInput(prompt: string, options: PipelineOptions): void {
+  if (typeof prompt !== "string" || !prompt.trim()) {
+    throw new TypeError("A non-empty strategic prompt is required");
+  }
+  if (prompt.length > MAX_PROMPT_LENGTH) {
+    throw new RangeError(`Prompt exceeds the ${MAX_PROMPT_LENGTH}-character limit`);
+  }
+  const runs = options.runs ?? MC_RUNS;
+  if (!Number.isSafeInteger(runs) || runs < 1 || runs > MAX_MONTE_CARLO_RUNS) {
+    throw new RangeError(`Requested Monte Carlo runs must be an integer between 1 and ${MAX_MONTE_CARLO_RUNS}; received ${runs}`);
+  }
+  const candidates = options.candidates ?? 26;
+  if (!Number.isSafeInteger(candidates) || candidates < MIN_OPTIMIZER_CANDIDATES || candidates > MAX_OPTIMIZER_CANDIDATES) {
+    throw new RangeError(`Candidate count must be an integer between ${MIN_OPTIMIZER_CANDIDATES} and ${MAX_OPTIMIZER_CANDIDATES}; received ${candidates}`);
+  }
+  const iterations = options.maxIterations ?? REGULATORY.maxCriticIterations;
+  if (!Number.isSafeInteger(iterations) || iterations < 1 || iterations > REGULATORY.maxCriticIterations) {
+    throw new RangeError(`Critic iterations must be an integer between 1 and ${REGULATORY.maxCriticIterations}; received ${iterations}`);
+  }
+  if (options.seed !== undefined && (typeof options.seed !== "string" || options.seed.length > 128)) {
+    throw new RangeError("Seed must be a string of at most 128 characters");
+  }
+  const overrideRanges: Record<keyof IntentOverrides, readonly [number, number]> = {
+    targetDepositsHemmat: [0.01, 1_000],
+    targetIrr: [0.01, 1],
+    ldrCeiling: [0.4, 0.95],
+    lcrFloor: [1, 2],
+    maxOverturningShock: [0.01, 0.25],
+  };
+  for (const [key, value] of Object.entries(options.intentOverrides ?? {})) {
+    const range = overrideRanges[key as keyof IntentOverrides];
+    if (!range || typeof value !== "number" || !Number.isFinite(value) || value < range[0] || value > range[1]) {
+      throw new RangeError(`Invalid intent override ${key}: ${String(value)}`);
+    }
+  }
+  if (options.withSensitivity !== undefined && typeof options.withSensitivity !== "boolean") {
+    throw new TypeError("withSensitivity must be a boolean");
+  }
+}
+
 /** Runs the full five-stage inverse goal-seeking pipeline. */
 export async function runPipeline({
   prompt,
@@ -486,17 +562,22 @@ export async function runPipeline({
   const emit = makeEmitter(state, (event) => onEvent?.(event));
   const graph = buildPipelineGraph(options);
   try {
-    await graph.invoke(state, emit);
+    validatePipelineInput(prompt, options);
+    await graph.invoke(state, emit, 24, options.signal);
   } catch (error) {
     state.status = "failed";
-    state.error = error instanceof Error ? error.message : String(error);
-    emit({
-      node: "graph",
-      stage: "graph:error",
-      level: "error",
-      titleFa: `خطا در اجرای خط لوله: ${state.error}`,
-      titleEn: `Pipeline failure: ${state.error}`,
-    });
+    state.error = options.signal?.aborted || (error instanceof Error && error.name === "AbortError")
+      ? "Run cancelled"
+      : error instanceof Error ? error.message : String(error);
+    if (state.error !== "Run cancelled") {
+      emit({
+        node: "graph",
+        stage: "graph:error",
+        level: "error",
+        titleFa: `خطا در اجرای خط لوله: ${state.error}`,
+        titleEn: `Pipeline failure: ${state.error}`,
+      });
+    }
   }
   state.elapsedMs = Date.now() - state.startedAt;
   return { state, events: state.trace };

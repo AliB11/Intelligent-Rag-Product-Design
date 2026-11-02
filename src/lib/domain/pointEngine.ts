@@ -7,9 +7,9 @@
  *   B̄_m = (1 / N_d) * Σ_{t=1..N_d} B_{m,t} * kappa_source ,  N_d = 30 * tau_d,m
  *   L_m = alpha_m * B̄_m  (capped by L_max,m)
  *
- *   NPV_bank,m = Σ_{t=1..tau_d}  B̄_m (1-RR_m)(r_treasury - CoF_m) / (1+r_h/12)^t
+ *   NPV_bank,m = Σ_{t=1..tau_d}  B̄_m (1-RR_m-LR_m)(r_treasury - CoF_m) / (1+r_h/12)^t
  *                - L_m (1 - gamma_m - beta_m)
- *                + Σ_{k=1..tau_l} [ PMT(r_l/12, tau_l, L_m) - Release_k(beta_m B̄_m) ]
+ *                + Σ_{k=1..tau_l} [ PMT(r_l/12, tau_l, L_m) - Release_k(beta_m L_m) ]
  *                                   / (1+r_h/12)^(tau_d + omega_m + k)
  */
 
@@ -47,11 +47,25 @@ export function dailyBalanceProfile(input: AverageBalanceInput): number[] {
   return profile;
 }
 
-/** Weighted daily average balance B̄_m. */
+/** Weighted daily average balance B̄_m, computed analytically without a daily array. */
 export function weightedAverageBalance(input: AverageBalanceInput): number {
-  const profile = dailyBalanceProfile(input);
-  const total = profile.reduce((acc, b) => acc + b, 0);
-  return profile.length ? total / profile.length : 0;
+  const deposit = input.depositVolumeRial;
+  if (!Number.isFinite(deposit)) throw new RangeError("Deposit volume must be finite");
+  const sleepMonths = Number.isFinite(input.sleepMonths) ? Math.max(0, input.sleepMonths) : 0;
+  const days = Math.max(1, Math.round(sleepMonths * DAYS_PER_MONTH));
+  const rampMonths = Number.isFinite(input.rampMonths)
+    ? Math.max(0, input.rampMonths!)
+    : Math.min(3, sleepMonths);
+  const rampDays = Math.max(1, Math.round(rampMonths * DAYS_PER_MONTH));
+  const kappa = input.sourceKappa ?? 1;
+  const residual = input.residualFraction ?? 1;
+  if (!Number.isFinite(kappa) || !Number.isFinite(residual) || kappa < 0 || residual < 0) {
+    throw new RangeError("Average-balance multipliers must be finite and non-negative");
+  }
+  const rampTotal = rampDays <= days
+    ? days - (rampDays - 1) / 2
+    : (days * (days + 1)) / (2 * rampDays);
+  return deposit * kappa * residual * (rampTotal / days);
 }
 
 export interface LoanEntitlementInput {
@@ -71,12 +85,13 @@ export function loanEntitlement(input: LoanEntitlementInput): {
 } {
   const raw = Math.max(0, input.loanMultiplier) * input.averageBalanceRial;
   const perCustomerCap = Math.max(0, input.capRial);
-  const aggregateCap = perCustomerCap * Math.max(1, input.customers);
+  const customers = Number.isFinite(input.customers) ? Math.max(0, Math.floor(input.customers)) : 0;
+  const aggregateCap = perCustomerCap * customers;
   const capped = Math.min(raw, aggregateCap);
   return {
     entitlementRial: raw,
     cappedRial: capped,
-    cappedPerCustomerRial: Math.min(perCustomerCap, capped),
+    cappedPerCustomerRial: customers > 0 ? Math.min(perCustomerCap, capped / customers) : 0,
     capBinding: raw > aggregateCap + 1,
   };
 }
@@ -87,7 +102,7 @@ export function blockedReleaseSchedule(
   blockedAmountRial: number,
   installments: number,
 ): number[] {
-  const n = Math.max(1, Math.round(installments));
+  const n = Number.isFinite(installments) ? clamp(Math.round(installments), 1, 1_000) : 1;
   const out = new Array<number>(n).fill(0);
   if (blockedAmountRial <= 0) return out;
   if (schedule === "linear") {
@@ -115,7 +130,11 @@ export interface BankNpvInput {
   blockedRatio: number;
   closedLoopRetention: number;
   statutoryReserve: number;
+  liquidityDeduction?: number;
   costOfFunds: number;
+  /** Qarz-ol-Hasanah repays principal equally and earns a one-off commission. */
+  annuity?: boolean;
+  upfrontCommissionRate?: number;
   hurdleRate?: number;
   treasuryRate?: number;
   blockRelease?: BlockReleaseSchedule;
@@ -126,6 +145,7 @@ export interface BankNpvResult {
   treasurySpreadLegRial: number;
   liquidityDrainLegRial: number;
   installmentLegRial: number;
+  upfrontCommissionLegRial: number;
   monthlyInstallmentRial: number;
   actuariallyEquivalent: boolean;
 }
@@ -137,9 +157,11 @@ export function bankProductNpv(input: BankNpvInput): BankNpvResult {
   const discount = (t: number) => Math.pow(1 + monthlyHurdle, t);
 
   const sleep = Math.max(1, Math.round(input.sleepMonths));
+  const tenor = Math.max(1, Math.round(input.tenorMonths));
+  const availableFraction = Math.max(0, 1 - input.statutoryReserve - (input.liquidityDeduction ?? 0));
   const spreadPerMonth =
     input.averageBalanceRial *
-    (1 - input.statutoryReserve) *
+    availableFraction *
     (treasury - input.costOfFunds);
 
   let treasurySpreadLeg = 0;
@@ -152,31 +174,34 @@ export function bankProductNpv(input: BankNpvInput): BankNpvResult {
     (1 - input.closedLoopRetention - input.blockedRatio);
   const liquidityDrainLeg = -Math.max(0, drain);
 
-  const monthlyInstallment = pmt(
-    input.loanRate / 12,
-    Math.max(1, input.tenorMonths),
-    input.loanAmountRial,
-  );
+  const monthlyInstallment = input.annuity === false
+    ? input.loanAmountRial / tenor
+    : pmt(input.loanRate / 12, tenor, input.loanAmountRial);
   const releases = blockedReleaseSchedule(
     input.blockRelease ?? "linear",
-    input.blockedRatio * input.averageBalanceRial,
-    input.tenorMonths,
+    input.blockedRatio * input.loanAmountRial,
+    tenor,
   );
 
   let installmentLeg = 0;
-  const tenor = Math.max(1, Math.round(input.tenorMonths));
+  const forbearance = Number.isFinite(input.waitingMonths) ? Math.max(0, input.waitingMonths) : 0;
   for (let k = 1; k <= tenor; k += 1) {
     const release = releases[k - 1] ?? 0;
-    const t = sleep + input.waitingMonths + k;
+    const t = sleep + forbearance + k;
     installmentLeg += (monthlyInstallment - release) / discount(t);
   }
 
-  const npv = treasurySpreadLeg + liquidityDrainLeg + installmentLeg;
+  const upfrontCommissionLeg = input.annuity === false
+    ? (input.loanAmountRial * (input.upfrontCommissionRate ?? input.loanRate)) /
+      discount(sleep + forbearance)
+    : 0;
+  const npv = treasurySpreadLeg + liquidityDrainLeg + installmentLeg + upfrontCommissionLeg;
   return {
     npvBankRial: npv,
     treasurySpreadLegRial: treasurySpreadLeg,
     liquidityDrainLegRial: liquidityDrainLeg,
     installmentLegRial: installmentLeg,
+    upfrontCommissionLegRial: upfrontCommissionLeg,
     monthlyInstallmentRial: monthlyInstallment,
     actuariallyEquivalent: npv >= 0,
   };
@@ -289,12 +314,15 @@ export function evaluateMode(mode: ModeSpec): {
     blockedRatio: mode.blockedRatio,
     closedLoopRetention: mode.closedLoopRetention,
     statutoryReserve: mode.statutoryReserve,
+    liquidityDeduction: mode.liquidityDeduction,
     costOfFunds: mode.costOfFunds,
+    annuity: mode.contract !== "qarz-hasaneh",
+    upfrontCommissionRate: mode.contract === "qarz-hasaneh" ? mode.loanRate : 0,
     blockRelease: mode.blockRelease,
   });
   const affordability = installmentAffordability(
     loanBookRial / Math.max(1, mode.customers),
-    mode.loanRate,
+    mode.contract === "qarz-hasaneh" ? 0 : mode.loanRate,
     mode.tenorMonths,
     mode.personaIncomeToman,
   );

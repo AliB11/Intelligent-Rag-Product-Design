@@ -23,14 +23,22 @@ import {
 import { irr, npv, pmt, percentile, createRng, sampleBeta } from "../domain/financial";
 import {
   allocateWeights,
+  applyDirectives,
   assembleProduct,
   BLUEPRINTS,
   buildMode,
+  feasibilityCheck,
+  recomputeDerived,
+  sensitivitySweep,
 } from "../domain/optimizer";
-import { runAlmSimulation } from "../domain/almSimulator";
+import { parseIntent } from "../domain/intentParser";
+import { runAlmSimulation, runAlmSimulationAsync } from "../domain/almSimulator";
 import { runPipeline } from "../agents/graph";
+import { createInitialState, makeEmitter, StateGraph } from "../agents/state";
 import {
   HEMMAT_RIAL,
+  MAX_MONTE_CARLO_RUNS,
+  MC_RUNS,
   REGULATORY,
   STATUTORY_RESERVE,
   OPEX_RATIO_DEFAULT,
@@ -82,6 +90,34 @@ const near = (a: number, b: number, tol = 1e-9) => Math.abs(a - b) <= tol;
 function unitAssertions(): Assertion[] {
   const out: Assertion[] = [];
 
+  const parsedIntent = parseIntent("محصول ۵٫۵ همتی با سقف LDR برابر ۸۲٪ و کف LCR برابر ۱٫۱۵").request;
+  out.push(
+    assert(
+      "U-INTENT-01",
+      "استخراج رقم فارسی، مقدار اعشاری همت و حدود ناهم‌مقیاس LDR/LCR",
+      "Persian numeral normalization parses decimal Hemmat, percentage LDR and ratio LCR inputs",
+      "5.5 Hemmat / 0.82 LDR / 1.15 LCR",
+      `${parsedIntent.targetDepositsHemmat.toFixed(1)} Hemmat / ${parsedIntent.ldrCeiling.toFixed(2)} LDR / ${parsedIntent.lcrFloor.toFixed(2)} LCR`,
+      near(parsedIntent.targetDepositsHemmat, 5.5, 1e-9) &&
+        near(parsedIntent.ldrCeiling, 0.82, 1e-9) &&
+        near(parsedIntent.lcrFloor, 1.15, 1e-9),
+    ),
+  );
+  const overriddenIntent = parseIntent("۲۰ همت با IRR هدف ۲۶٪", {
+    targetDepositsHemmat: 12,
+    targetIrr: 0.3,
+  }).request;
+  out.push(
+    assert(
+      "U-INTENT-02",
+      "کنترل‌های صریح آهنگساز بر مقادیر متن طبیعی اولویت دارند",
+      "Explicit composer overrides take precedence over conflicting prompt values",
+      "12 Hemmat / 30% IRR",
+      `${overriddenIntent.targetDepositsHemmat.toFixed(0)} Hemmat / ${(overriddenIntent.targetIrr * 100).toFixed(0)}% IRR`,
+      near(overriddenIntent.targetDepositsHemmat, 12, 1e-9) && near(overriddenIntent.targetIrr, 0.3, 1e-9),
+    ),
+  );
+
   const cof = costOfFunds({
     depositRate: 0.18,
     statutoryReserve: 0.15,
@@ -91,7 +127,7 @@ function unitAssertions(): Assertion[] {
     lgd: 0.35,
   });
   const expected =
-    (0.18 - 0.15 * 0.01) / (1 - 0.15 + 0.01) + 0.035 + 0.03 * 0.35;
+    (0.18 - 0.15 * 0.01) / (1 - 0.15 - 0.01) + 0.035 + 0.03 * 0.35;
   out.push(
     assert(
       "U-COF-01",
@@ -402,6 +438,25 @@ export async function runTestCase1(fast = false): Promise<TestCaseResult> {
       state.status,
       state.status === "complete" && state.reportFa.length > 800,
     ),
+    assert(
+      "T1-K",
+      "اجرای نهایی ALM دقیقاً از تعداد مسیرهای درخواستی استفاده می‌کند",
+      "Final ALM uses exactly the requested Monte Carlo path count",
+      String(fast ? 220 : MC_RUNS),
+      String(state.alm?.monteCarloRuns ?? 0),
+      state.alm?.monteCarloRuns === (fast ? 220 : MC_RUNS),
+    ),
+    assert(
+      "T1-L",
+      "گزارش نهایی وضعیت اعتبارسنجی را صریح و منطبق با موانع اعلام می‌کند",
+      "Final report explicitly matches validation status to unresolved blockers",
+      "not_validated iff blockers remain; otherwise constraints_passed",
+      `${state.validationStatus} / ${state.findings.filter((finding) => finding.severity === "blocker").length} blockers`,
+      state.validationStatus === (state.findings.some((finding) => finding.severity === "blocker") ? "not_validated" : "constraints_passed") &&
+        (state.validationStatus === "not_validated"
+          ? state.reportFa.includes("غیرقابل‌تأیید")
+          : state.reportFa.includes("قیود سخت پاس شدند")),
+    ),
   );
 
   return {
@@ -525,6 +580,14 @@ export async function runTestCase2(fast = false): Promise<TestCaseResult> {
       `${state.accountingEntries.length} / ${state.complianceDraft.length}`,
       state.accountingEntries.length >= 8 && state.complianceDraft.length >= 6,
     ),
+    assert(
+      "T2-I",
+      "مسیرهای مونت‌کارلو در محصول صنفی نیز دقیقاً برابر درخواست است",
+      "The guild product also uses exactly its requested Monte Carlo paths",
+      String(fast ? 220 : 400),
+      String(state.alm?.monteCarloRuns ?? 0),
+      state.alm?.monteCarloRuns === (fast ? 220 : 400),
+    ),
   );
 
   return {
@@ -578,6 +641,235 @@ export function runDeterminismCase(): TestCaseResult {
   };
 }
 
+/** Verify cancellation and the StateGraph execution-step budget. */
+export async function runStateGraphCase(): Promise<TestCaseResult> {
+  const started = Date.now();
+  const state = createInitialState("state graph regression");
+  let executed = 0;
+  const loopingGraph = new StateGraph();
+  loopingGraph
+    .addNode("intent_analyzer", () => { executed += 1; })
+    .addConditionalEdge("intent_analyzer", () => "intent_analyzer");
+  let budgetRejected = false;
+  try {
+    await loopingGraph.invoke(state, makeEmitter(state), 1);
+  } catch (error) {
+    budgetRejected = error instanceof Error && error.message.includes("execution budget");
+  }
+
+  const controller = new AbortController();
+  controller.abort();
+  const cancelledGraph = new StateGraph();
+  cancelledGraph.addNode("intent_analyzer", () => { executed += 1; });
+  let cancellationRejected = false;
+  try {
+    await cancelledGraph.invoke(state, makeEmitter(state), 24, controller.signal);
+  } catch (error) {
+    cancellationRejected = error instanceof Error && error.name === "AbortError";
+  }
+
+  const almController = new AbortController();
+  const pendingAlm = runAlmSimulationAsync({
+    product: buildReferenceProduct(),
+    runs: 256,
+    seed: 1234,
+    signal: almController.signal,
+  });
+  const abortTimer = setTimeout(() => almController.abort(), 0);
+  let almCancellationRejected = false;
+  try {
+    await pendingAlm;
+  } catch (error) {
+    almCancellationRejected = error instanceof Error && error.name === "AbortError";
+  } finally {
+    clearTimeout(abortTimer);
+  }
+
+  const assertions = [
+    assert(
+      "G-01",
+      "بودجه گام‌های StateGraph از حلقه بی‌پایان جلوگیری می‌کند",
+      "StateGraph step budget prevents an unbounded routing loop",
+      "throws after one executed node",
+      `${budgetRejected ? "rejected" : "not rejected"}; nodes executed=${executed}`,
+      budgetRejected && executed === 1,
+    ),
+    assert(
+      "G-02",
+      "سیگنال لغوِ ازپیش‌فعال‌شده پیش از اجرای گره تشخیص داده می‌شود",
+      "A pre-aborted signal prevents the next graph node from executing",
+      "AbortError; node count unchanged",
+      `${cancellationRejected ? "AbortError" : "not rejected"}; nodes executed=${executed}`,
+      cancellationRejected && executed === 1,
+    ),
+    assert(
+      "G-03",
+      "شبیه‌سازی ALM میان دسته‌های مونت‌کارلو به لغو پاسخ می‌دهد",
+      "Chunked Monte Carlo ALM responds to an AbortSignal while running",
+      "AbortError before all 256 paths complete",
+      almCancellationRejected ? "AbortError" : "completed without cancellation",
+      almCancellationRejected,
+    ),
+  ];
+
+  return {
+    id: "TC-GRAPH",
+    titleFa: "آزمون بودجه اجرا و لغو StateGraph",
+    titleEn: "StateGraph execution-budget and cancellation checks",
+    assertions,
+    passed: assertions.every((item) => item.passed),
+    durationMs: Date.now() - started,
+    summary: { nodesExecuted: executed },
+  };
+}
+
+/** Regression test for directional critic corrections and exact MC execution. */
+export function runCorrectionCase(): TestCaseResult {
+  const started = Date.now();
+  const product = buildReferenceProduct();
+  const request = parseIntent(
+    "محصول میانگین حساب ۵ همتی با سقف LDR برابر ۸۵٪ و کف LCR برابر ۱٫۰۵",
+  ).request;
+  const baseline = runAlmSimulation({ product, runs: 60, seed: 8675309 });
+  const ldrRequest = {
+    ...request,
+    ldrCeiling: Math.max(0.01, Math.min(REGULATORY.ldrCeiling, baseline.metrics.p95Ldr * 0.9)),
+  };
+  const ldrFinding = feasibilityCheck(product, baseline.metrics, ldrRequest)
+    .find((finding) => finding.id === "ldr-p95-breach");
+  const ldrCorrection = applyDirectives(product.modes, ldrFinding ? [ldrFinding] : []);
+  const ldrProduct = assembleProduct(
+    recomputeDerived(ldrCorrection.modes, null),
+    product.targetDepositsRial,
+    product.code,
+    product.titleFa,
+    product.titleEn,
+  );
+  const correctedLdr = runAlmSimulation({ product: ldrProduct, runs: 60, seed: 8675309 });
+
+  const lcrBaseProduct = assembleProduct(
+    recomputeDerived(product.modes.map((mode) => ({
+      ...mode,
+      loanMultiplier: 3,
+      blockedRatio: 0,
+    })), null),
+    product.targetDepositsRial,
+    product.code,
+    product.titleFa,
+    product.titleEn,
+  );
+  const lcrBaseline = runAlmSimulation({ product: lcrBaseProduct, runs: 60, seed: 8675309 });
+  const lcrRequest = {
+    ...request,
+    lcrFloor: Math.max(REGULATORY.lcrFloor, lcrBaseline.metrics.p5Lcr + 0.1),
+  };
+  const lcrFinding = feasibilityCheck(lcrBaseProduct, lcrBaseline.metrics, lcrRequest)
+    .find((finding) => finding.id === "lcr-floor-breach");
+  const lcrCorrection = applyDirectives(lcrBaseProduct.modes, lcrFinding ? [lcrFinding] : []);
+  const lcrProduct = assembleProduct(
+    recomputeDerived(lcrCorrection.modes, null),
+    lcrBaseProduct.targetDepositsRial,
+    lcrBaseProduct.code,
+    lcrBaseProduct.titleFa,
+    lcrBaseProduct.titleEn,
+  );
+  const correctedLcr = runAlmSimulation({ product: lcrProduct, runs: 60, seed: 8675309 });
+
+  const weighted = (modes: typeof product.modes, field: "loanMultiplier" | "blockedRatio" | "closedLoopRetention" | "withdrawalFractionMean") =>
+    modes.reduce((total, mode) => total + mode[field] * mode.weight, 0);
+  const sensitivityA = sensitivitySweep(product, request, 111);
+  const sensitivityReplay = sensitivitySweep(product, request, 111);
+  const sensitivityB = sensitivitySweep(product, request, 222);
+  const flattenSensitivity = (sweep: ReturnType<typeof sensitivitySweep>) => sweep.flatMap((dimension) => dimension.irr);
+  const sensitivityValuesA = flattenSensitivity(sensitivityA);
+  const sensitivityValuesReplay = flattenSensitivity(sensitivityReplay);
+  const sensitivityValuesB = flattenSensitivity(sensitivityB);
+  const sameSensitivitySeed = sensitivityValuesA.every((value, index) => value === sensitivityValuesReplay[index]);
+  const differentSensitivitySeed = sensitivityValuesA.some((value, index) => value !== sensitivityValuesB[index]);
+  let invalidRunRejected = false;
+  try {
+    runAlmSimulation({ product, runs: MAX_MONTE_CARLO_RUNS + 1, seed: 1 });
+  } catch (error) {
+    invalidRunRejected = error instanceof RangeError;
+  }
+
+  const assertions = [
+    assert(
+      "C-01",
+      "قید LDR با دستور کاهشی مؤثر روی ضریب تسهیلات و مخرج قابل‌استفاده اصلاح می‌شود",
+      "An LDR blocker declares a directional correction that improves simulated p95 LDR",
+      "directive says decrease alpha; alpha and beta decrease; p95 LDR decreases",
+      `${ldrFinding?.directive.action ?? "missing"} ${String(ldrFinding?.directive.field ?? "field")}; ${weighted(ldrCorrection.modes, "loanMultiplier").toFixed(3)} alpha / ${weighted(ldrCorrection.modes, "blockedRatio").toFixed(3)} beta / ${baseline.metrics.p95Ldr.toFixed(4)} -> ${correctedLdr.metrics.p95Ldr.toFixed(4)}`,
+      !!ldrFinding &&
+        ldrFinding.directive.field === "loanMultiplier" &&
+        ldrFinding.directive.action === "decrease" &&
+        weighted(ldrCorrection.modes, "loanMultiplier") < weighted(product.modes, "loanMultiplier") &&
+        weighted(ldrCorrection.modes, "blockedRatio") < weighted(product.modes, "blockedRatio") &&
+        correctedLdr.metrics.p95Ldr < baseline.metrics.p95Ldr,
+    ),
+    assert(
+      "C-02",
+      "قید LCR با کاهش ضریب تسهیلات واقعاً بازآزمایی و بهبود می‌یابد",
+      "An LCR blocker reduces lending and improves simulated p5 LCR on a same-seed rerun",
+      "directive says decrease alpha; alpha decreases; p5 LCR increases",
+      `${lcrFinding?.directive.action ?? "missing"} ${String(lcrFinding?.directive.field ?? "field")}; ${weighted(lcrCorrection.modes, "loanMultiplier").toFixed(3)} alpha / ${lcrBaseline.metrics.p5Lcr.toFixed(3)} -> ${correctedLcr.metrics.p5Lcr.toFixed(3)}`,
+      !!lcrFinding &&
+        lcrFinding.directive.field === "loanMultiplier" &&
+        lcrFinding.directive.action === "decrease" &&
+        weighted(lcrCorrection.modes, "loanMultiplier") < weighted(lcrBaseProduct.modes, "loanMultiplier") &&
+        correctedLcr.metrics.p5Lcr > lcrBaseline.metrics.p5Lcr,
+    ),
+    assert(
+      "C-03",
+      "ارزیابی اصلاحی تعداد مسیر درخواستی را حفظ می‌کند",
+      "Correction reruns preserve the exact requested path count",
+      "60 paths on primary, stressed and both correction evaluations",
+      `${baseline.monteCarloRuns}/${lcrBaseline.monteCarloRuns}/${correctedLdr.monteCarloRuns}/${correctedLcr.monteCarloRuns}`,
+      baseline.monteCarloRuns === 60 && lcrBaseline.monteCarloRuns === 60 && correctedLdr.monteCarloRuns === 60 && correctedLcr.monteCarloRuns === 60,
+    ),
+    assert(
+      "C-04",
+      "تعداد مسیر نامعتبر به‌جای کاهش خاموش رد می‌شود",
+      "Unsupported run counts are rejected rather than silently clamped",
+      `RangeError above ${MAX_MONTE_CARLO_RUNS}`,
+      invalidRunRejected ? "RangeError" : "not rejected",
+      invalidRunRejected,
+    ),
+    assert(
+      "C-05",
+      "هر قید سختِ شناخته‌شده مسیر اصلاحی ثبت‌شده دارد",
+      "Both exercised blockers record a non-empty corrective action",
+      "non-empty directives",
+      `${ldrCorrection.appliedFa.length}/${lcrCorrection.appliedFa.length}`,
+      ldrCorrection.appliedFa.length > 0 && lcrCorrection.appliedFa.length > 0,
+    ),
+    assert(
+      "C-06",
+      "حساسیت‌سنجی از بذر صریح استفاده می‌کند و با بذر ثابت بازتولیدپذیر است",
+      "Sensitivity sweeps use the supplied seed and replay deterministically",
+      "same seed produces identical results; another seed changes at least one value",
+      `same=${sameSensitivitySeed}; different=${differentSensitivitySeed}`,
+      sameSensitivitySeed && differentSensitivitySeed,
+    ),
+  ];
+
+  return {
+    id: "TC-CORRECTION",
+    titleFa: "آزمون اصلاح واقعی LDR/LCR و حفظ دقت مونت‌کارلو",
+    titleEn: "Regression — directional LDR/LCR self-correction and exact Monte Carlo runs",
+    assertions,
+    passed: assertions.every((item) => item.passed),
+    durationMs: Date.now() - started,
+    summary: {
+      baselineLdr: Number(baseline.metrics.p95Ldr.toFixed(4)),
+      correctedLdr: Number(correctedLdr.metrics.p95Ldr.toFixed(4)),
+      baselineLcr: Number(lcrBaseline.metrics.p5Lcr.toFixed(3)),
+      correctedLcr: Number(correctedLcr.metrics.p5Lcr.toFixed(3)),
+      runs: baseline.monteCarloRuns,
+    },
+  };
+}
+
 /** Small deterministic reference product used by the unit/determinism case. */
 export function buildReferenceProduct() {
   const opt = { buildMode, BLUEPRINTS, assembleProduct };
@@ -625,7 +917,8 @@ export function buildReferenceProduct() {
 
 export async function runVerificationSuite(fast = false): Promise<VerificationSuiteResult> {
   const started = Date.now();
-  const cases: TestCaseResult[] = [runDeterminismCase()];
+  const cases: TestCaseResult[] = [runDeterminismCase(), runCorrectionCase()];
+  cases.push(await runStateGraphCase());
   cases.push(await runTestCase1(fast));
   cases.push(await runTestCase2(fast));
   const all = cases.flatMap((c) => c.assertions);

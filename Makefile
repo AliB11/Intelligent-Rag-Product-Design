@@ -40,7 +40,7 @@ verify-fast: ## Verification suite with reduced Monte Carlo paths
 	node scripts/verify.mjs --fast
 
 db-push: ## Synchronise the Drizzle schema with PostgreSQL
-	npx drizzle-kit push --force
+	npx drizzle-kit push
 
 db-studio: ## Open Drizzle Studio
 	npx drizzle-kit studio
@@ -53,8 +53,9 @@ ci: lint typegen typecheck build verify-fast ## Everything the CI pipeline runs
 docker-build: ## Build the production image
 	docker compose build
 
-docker-up: ## Start postgres + app
+docker-up: ## Start postgres + app, then synchronise the additive Drizzle schema
 	docker compose up --build -d
+	docker compose --profile tools run --rm db-push
 
 docker-down: ## Stop the stack and remove volumes
 	docker compose down -v

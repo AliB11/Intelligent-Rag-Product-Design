@@ -31,7 +31,7 @@ If your change lets an LLM produce a number, it will be rejected.
 ```bash
 npm ci
 cp .env.example .env          # then set DATABASE_URL
-npx drizzle-kit push --force  # create kb_documents / benchmarks / generation_runs
+npm run db:push              # review and synchronise schema changes
 npm run dev
 ```
 

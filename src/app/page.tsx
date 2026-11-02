@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { REGULATORY } from "@/lib/domain/constants";
 import type { TraceEvent } from "@/lib/agents/state";
 import type { RunSummary } from "@/lib/db/repository";
 import type {
@@ -46,10 +47,13 @@ import {
   fmtNum,
   fmtPct,
 } from "@/components/ui";
-import type { SensitivityFrame, AccountingEntry, ComplianceDraftItem } from "@/lib/agents/state";
+import type { SensitivityFrame, AccountingEntry, ComplianceDraftItem, ValidationStatus } from "@/lib/agents/state";
 
 interface GenerationResult {
   runId: string | null;
+  status: string;
+  validationStatus: ValidationStatus;
+  error: string | null;
   prompt: string;
   request: ProductGenerationRequest | null;
   warnings: string[];
@@ -110,13 +114,28 @@ export default function Home() {
     }
   }, []);
 
+  useEffect(() => () => abortRef.current?.abort(), []);
+
   useEffect(() => {
-    loadRuns();
-    fetch("/api/benchmarks")
-      .then((r) => r.json())
-      .then((d) => setKbInfo(d.totals))
-      .catch(() => setKbInfo(null));
-  }, [loadRuns]);
+    let cancelled = false;
+    const loadInitialData = async () => {
+      const [runsData, benchmarkData] = await Promise.all([
+        fetch("/api/runs", { cache: "no-store" })
+          .then((response) => response.ok ? response.json() : null)
+          .catch(() => null),
+        fetch("/api/benchmarks", { cache: "no-store" })
+          .then((response) => response.ok ? response.json() : null)
+          .catch(() => null),
+      ]);
+      if (cancelled) return;
+      setRuns(Array.isArray(runsData?.runs) ? runsData.runs : []);
+      setKbInfo(benchmarkData?.totals ?? null);
+    };
+    void loadInitialData();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const submit = useCallback(
     async (prompt: string, options: ComposerOptions) => {
@@ -135,7 +154,11 @@ export default function Home() {
           body: JSON.stringify({ prompt, ...options }),
           signal: controller.signal,
         });
-        if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          const payload = await res.json().catch(() => null);
+          throw new Error(typeof payload?.error === "string" ? payload.error : `HTTP ${res.status}`);
+        }
+        if (!res.body) throw new Error("The server returned an empty event stream");
 
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -156,7 +179,23 @@ export default function Home() {
             });
             if (!data) continue;
             const parsed = JSON.parse(data) as Record<string, never>;
-            if (event === "trace") {
+            if (event === "status") {
+              const status = parsed as unknown as {
+                stage?: string;
+                titleFa?: string;
+                titleEn?: string;
+                persisted?: boolean;
+              };
+              setEvents((prev) => [{
+                id: 0,
+                node: "graph",
+                stage: status.stage ?? "bootstrap",
+                level: status.persisted ? "ok" : "warn",
+                titleFa: status.titleFa ?? "پایگاه داده درون‌حافظه‌ای فعال است",
+                titleEn: status.titleEn ?? "Using the in-memory data corpus",
+                ts: 0,
+              }, ...prev]);
+            } else if (event === "trace") {
               setEvents((prev) => [...prev, parsed as unknown as TraceEvent]);
             } else if (event === "result") {
               setResult(parsed as unknown as GenerationResult);
@@ -171,7 +210,10 @@ export default function Home() {
           setError(err instanceof Error ? err.message : String(err));
         }
       } finally {
-        setBusy(false);
+        if (abortRef.current === controller) {
+          abortRef.current = null;
+          setBusy(false);
+        }
       }
     },
     [loadRuns],
@@ -203,25 +245,36 @@ export default function Home() {
       const data = await res.json();
       const run = data.run;
       if (!run) return;
+      const findings = Array.isArray(run.findings) ? run.findings as CriticFinding[] : [];
+      const savedValidation = run.validationStatus as ValidationStatus | undefined;
+      const validationStatus: ValidationStatus =
+        savedValidation === "constraints_passed" || savedValidation === "not_validated"
+          ? savedValidation
+          : findings.some((finding) => finding.severity === "blocker")
+            ? "not_validated"
+            : "pending";
       setResult({
         runId: run.id,
+        status: run.status ?? "complete",
+        validationStatus,
+        error: null,
         prompt: run.prompt,
         request: run.intent,
         warnings: [],
         constraints: run.retrievedConstraints ?? [],
-        persona: null,
+        persona: run.persona ?? null,
         ecosystem: run.guild ?? null,
         product: run.productSpec,
         alm: run.metrics,
-        findings: [],
+        findings,
         iterations: [],
         iterationCount: run.iterations,
         sensitivity: run.sensitivity ?? null,
-        accountingEntries: [],
-        complianceDraft: [],
-        benchmarks: [],
+        accountingEntries: Array.isArray(run.accountingEntries) ? run.accountingEntries : [],
+        complianceDraft: Array.isArray(run.complianceDraft) ? run.complianceDraft : [],
+        benchmarks: Array.isArray(run.benchmarks) ? run.benchmarks : [],
         reportFa: run.reportFa,
-        reportEn: "",
+        reportEn: run.reportEn ?? "",
         elapsedMs: 0,
       });
       setEvents(Array.isArray(run.trace) ? run.trace : []);
@@ -233,6 +286,8 @@ export default function Home() {
 
   const metrics = result?.alm?.metrics ?? null;
   const request = result?.request ?? null;
+  const effectiveLdrCeiling = Math.min(request?.ldrCeiling ?? REGULATORY.ldrCeiling, REGULATORY.ldrCeiling);
+  const effectiveLcrFloor = Math.max(request?.lcrFloor ?? REGULATORY.lcrFloor, REGULATORY.lcrFloor);
 
   return (
     <main className="mx-auto w-full max-w-[1560px] px-4 pb-16 pt-6 md:px-6">
@@ -365,15 +420,18 @@ export default function Home() {
                 icon={<IconLayers className="h-4 w-4" />}
                 actions={
                   <div className="flex flex-wrap gap-1.5">
+                    <Badge tone={result.validationStatus === "constraints_passed" ? "teal" : result.validationStatus === "not_validated" ? "rose" : "gold"}>
+                      {result.validationStatus === "constraints_passed" ? "قیود سخت مدل پاس شدند" : result.validationStatus === "not_validated" ? "غیرقابل‌تأیید" : "اعتبارسنجی نهایی نشده"}
+                    </Badge>
                     {metrics ? (
                       <>
                         <Badge tone={metrics.irrBankAnnual >= (request?.targetIrr ?? 0.26) ? "teal" : "rose"}>
                           IRR {fmtPct(metrics.irrBankAnnual, 1)}
                         </Badge>
-                        <Badge tone={metrics.p95Ldr <= (request?.ldrCeiling ?? 0.85) ? "teal" : "rose"}>
+                        <Badge tone={metrics.p95Ldr <= effectiveLdrCeiling ? "teal" : "rose"}>
                           p95 LDR {fmtPct(metrics.p95Ldr, 1)}
                         </Badge>
-                        <Badge tone={metrics.p5Lcr >= (request?.lcrFloor ?? 1.05) ? "teal" : "rose"}>
+                        <Badge tone={metrics.p5Lcr >= effectiveLcrFloor ? "teal" : "rose"}>
                           p5 LCR {fmtNum(metrics.p5Lcr, 2)}
                         </Badge>
                         <Badge tone="gold">γ وزنی {fmtPct(result.product?.blendedClosedLoopRetention ?? 0, 0)}</Badge>
@@ -404,6 +462,9 @@ export default function Home() {
                       request={request}
                       iterations={result.iterations}
                       findings={result.findings}
+                      validationStatus={result.validationStatus}
+                      horizonMonths={result.alm?.horizonMonths ?? request?.horizonMonths ?? 60}
+                      monteCarloRuns={result.alm?.monteCarloRuns ?? 0}
                     />
                   ) : null}
                   {tab === "matrix" ? (

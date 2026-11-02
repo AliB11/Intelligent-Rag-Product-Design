@@ -24,44 +24,51 @@ export interface KbDocumentSeed {
 
 export function tokenise(text: string): string[] {
   const normalised = text
+    .normalize("NFKC")
     .toLowerCase()
-    .replace(/[\u200c\u200f]/g, " ")
+    .replace(/[\u064A\u0649]/g, "ی")
+    .replace(/\u0643/g, "ک")
+    .replace(/[\u200c\u200f\u0640]/g, " ")
     .replace(/[^0-9a-z\u0600-\u06FF]+/g, " ")
     .trim();
   return normalised
     .split(/\s+/)
-    .filter((t) => t.length > 1)
+    .filter((token) => token.length > 1)
     .slice(0, 400);
 }
 
-/** Deterministic feature-hashing embedding (no external model, reproducible). */
+/** Deterministic signed feature hashing with sublinear term-frequency weighting. */
 export function embed(text: string): number[] {
-  const vec = new Array<number>(EMBEDDING_DIM).fill(0);
-  const tokens = tokenise(text);
-  tokens.forEach((token) => {
-    let h = 2166136261;
+  const vector = new Array<number>(EMBEDDING_DIM).fill(0);
+  const frequencies = new Map<string, number>();
+  for (const token of tokenise(text)) frequencies.set(token, (frequencies.get(token) ?? 0) + 1);
+
+  frequencies.forEach((frequency, token) => {
+    let hash = 2166136261;
     for (let i = 0; i < token.length; i += 1) {
-      h ^= token.charCodeAt(i);
-      h = Math.imul(h, 16777619);
+      hash ^= token.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
     }
-    const idx = (h >>> 0) % EMBEDDING_DIM;
-    vec[idx] += 1 + Math.log(1 + tokens.filter((t) => t === token).length) * 0;
+    const unsignedHash = hash >>> 0;
+    const index = unsignedHash % EMBEDDING_DIM;
+    const sign = (unsignedHash & 0x80000000) === 0 ? 1 : -1;
+    vector[index] += sign * (1 + Math.log(frequency));
   });
-  const norm = Math.sqrt(vec.reduce((a, b) => a + b * b, 0)) || 1;
-  return vec.map((v) => v / norm);
+  const norm = Math.sqrt(vector.reduce((total, value) => total + value * value, 0)) || 1;
+  return vector.map((value) => value / norm);
 }
 
 export function cosine(a: number[], b: number[]): number {
-  if (!a.length || !b.length) return 0;
+  if (!a.length || a.length !== b.length || a.some((value) => !Number.isFinite(value)) || b.some((value) => !Number.isFinite(value))) return 0;
   let dot = 0;
-  let na = 0;
-  let nb = 0;
+  let normA = 0;
+  let normB = 0;
   for (let i = 0; i < a.length; i += 1) {
     dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
   }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
+  return normA > 0 && normB > 0 ? dot / Math.sqrt(normA * normB) : 0;
 }
 
 export const KB_SEED: KbDocumentSeed[] = [
@@ -104,7 +111,7 @@ export const KB_SEED: KbDocumentSeed[] = [
     titleFa: "نرخ سپرده قانونی بر حسب نوع سپرده",
     titleEn: "Statutory reserve ratio by deposit type",
     bodyFa:
-      "نرخ سپرده قانونی برای سپرده‌های قرض‌الحسنه پس‌انداز و جاری ۲ درصد، برای سپرده‌های کوتاه‌مدت سرمایه‌گذاری ۱۰ درصد و برای سپرده‌های بلندمدت سرمایه‌گذاری تا ۱۵ درصد تعیین می‌شود. اوراق مشارکت و اوراق گام مشمول سپرده قانونی نیستند (صفر درصد). بانک مرکزی به‌ازای سپرده قانونیblkشده نرخ پاداش ۱ درصد پرداخت می‌کند و ضریب نقدینگی صندوق و خودپرداز حدود ۱ درصد از منابع آزاد را جذب می‌کند.",
+      "نرخ سپرده قانونی برای سپرده‌های قرض‌الحسنه پس‌انداز و جاری ۲ درصد، برای سپرده‌های کوتاه‌مدت سرمایه‌گذاری ۱۰ درصد و برای سپرده‌های بلندمدت سرمایه‌گذاری تا ۱۵ درصد تعیین می‌شود. اوراق مشارکت و اوراق گام مشمول سپرده قانونی نیستند (صفر درصد). بانک مرکزی به‌ازای سپرده قانونی مسدودشده نرخ پاداش ۱ درصد پرداخت می‌کند و ضریب نقدینگی صندوق و خودپرداز حدود ۱ درصد از منابع آزاد را جذب می‌کند.",
     bodyEn:
       "Statutory reserve is 2% for QH savings/current deposits, 10% for short-term and up to 15% for long-term investment deposits, and 0% for participation bonds and Gam certificates. The CBI pays a 1% reward on blocked reserves and roughly 1% of free resources is absorbed by vault and ATM liquidity needs.",
     citation: "دستورالعمل سپرده قانونی و ضریب نقدینگی",
@@ -369,7 +376,7 @@ export const KB_DOCUMENTS: KbVectorDocument[] = KB_SEED.map((doc) => {
   };
 });
 
-/** Hybrid cosine + lexical retrieval over the Iranian banking vector store. */
+/** Hybrid hashed-vector + lexical retrieval over the local sample knowledge base. */
 export function retrieveKnowledge(
   query: string,
   topK = 6,
@@ -377,19 +384,22 @@ export function retrieveKnowledge(
 ): RegulatoryConstraint[] {
   const queryEmbedding = embed(query);
   const queryTokens = new Set(tokenise(query));
+  const limit = Math.max(1, Math.min(20, Math.floor(topK)));
   const scored = KB_DOCUMENTS.map((doc) => {
-    const semantic = cosine(queryEmbedding, doc.embedding);
-    const overlap = doc.tokens.filter((t) => queryTokens.has(t)).length;
-    const lexical = doc.tokens.length ? overlap / Math.sqrt(doc.tokens.length) : 0;
-    const boost = boostCategories.includes(doc.category) ? 0.18 : 0;
+    const semantic = Math.max(0, cosine(queryEmbedding, doc.embedding));
+    const overlap = doc.tokens.reduce((count, token) => count + Number(queryTokens.has(token)), 0);
+    const lexical = queryTokens.size && doc.tokens.length
+      ? overlap / Math.sqrt(queryTokens.size * doc.tokens.length)
+      : 0;
+    const boost = boostCategories.includes(doc.category) ? 0.08 : 0;
     return {
       doc,
-      relevance: Math.max(0, 0.55 * semantic + 0.45 * Math.min(1, lexical * 1.9) + boost),
+      relevance: Math.min(1, 0.55 * semantic + 0.45 * lexical + boost),
     };
   })
-    .filter((s) => s.relevance > 0.06)
+    .filter((item) => item.relevance > 0.04)
     .sort((a, b) => b.relevance - a.relevance)
-    .slice(0, topK);
+    .slice(0, limit);
 
   return scored.map(({ doc, relevance }) => ({
     id: doc.id,

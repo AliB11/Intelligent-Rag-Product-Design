@@ -21,7 +21,9 @@ import type {
   AccountingEntry,
   ComplianceDraftItem,
   SensitivityFrame,
+  ValidationStatus,
 } from "@/lib/agents/state";
+import { REGULATORY } from "@/lib/domain/constants";
 import type { OptimizerIteration } from "@/lib/domain/optimizer";
 import type { RunSummary } from "@/lib/db/repository";
 import {
@@ -59,24 +61,36 @@ export function MetricsPanel({
   request,
   iterations,
   findings,
+  validationStatus,
+  horizonMonths,
+  monteCarloRuns,
 }: {
   metrics: AlmMetrics | null;
   request: ProductGenerationRequest | null;
   iterations: OptimizerIteration[];
   findings: { severity: string; messageFa: string; metric: string; observed: number; limit: number }[];
+  validationStatus: ValidationStatus;
+  horizonMonths: number;
+  monteCarloRuns: number;
 }) {
   if (!metrics || !request) return null;
   const blockers = findings.filter((f) => f.severity === "blocker");
+  const ldrCeiling = Math.min(request.ldrCeiling, REGULATORY.ldrCeiling);
+  const lcrFloor = Math.max(request.lcrFloor, REGULATORY.lcrFloor);
 
   return (
     <div className="space-y-3">
       <Panel
         title="سنجه‌های کلیدی دوقلوی دیجیتال"
-        subtitle="خروجی شبیه‌سازی ۶۰ ماهه با قیود الزام‌آور بانک مرکزی"
+        subtitle={`آزمون ALM ${fmtNum(horizonMonths)} ماهه با ${fmtNum(monteCarloRuns)} مسیر مونت‌کارلو؛ حد مؤثر = سخت‌گیرانه‌ترِ درخواست و حدود مدل‌شده`}
         icon={<IconScale className="h-4 w-4" />}
         actions={
-          <Badge tone={blockers.length ? "rose" : "teal"}>
-            {blockers.length ? `${fmtNum(blockers.length)} مانع انطباق` : "کاملاً موجه"}
+          <Badge tone={validationStatus === "constraints_passed" ? "teal" : validationStatus === "not_validated" ? "rose" : "gold"}>
+            {validationStatus === "constraints_passed"
+              ? `قیود سخت مدل پاس شدند${findings.some((f) => f.severity === "warning") ? ` · ${fmtNum(findings.filter((f) => f.severity === "warning").length)} هشدار` : ""}`
+              : validationStatus === "not_validated"
+                ? `${fmtNum(blockers.length)} مانع · غیرقابل‌تأیید`
+                : "اعتبارسنجی نهایی نشده"}
           </Badge>
         }
       >
@@ -113,18 +127,18 @@ export function MetricsPanel({
           <Stat
             label="p95 نسبت تسهیلات به سپرده"
             value={fmtPct(metrics.p95Ldr)}
-            tone={metrics.p95Ldr <= request.ldrCeiling ? "teal" : "rose"}
-            limit={`≤ ${fmtPct(request.ldrCeiling, 0)}`}
-            ok={metrics.p95Ldr <= request.ldrCeiling}
-            hint={`میانگین ${fmtPct(metrics.meanLdr)}`}
+            tone={metrics.p95Ldr <= ldrCeiling ? "teal" : "rose"}
+            limit={`≤ ${fmtPct(ldrCeiling, 0)}`}
+            ok={metrics.p95Ldr <= ldrCeiling}
+            hint={request.ldrCeiling > REGULATORY.ldrCeiling ? `درخواست: ${fmtPct(request.ldrCeiling, 0)}؛ سقف مدل: ${fmtPct(REGULATORY.ldrCeiling, 0)}` : `میانگین ${fmtPct(metrics.meanLdr)}`}
           />
           <Stat
             label="p5 نسبت پوشش نقدینگی"
             value={fmtNum(metrics.p5Lcr, 2)}
-            tone={metrics.p5Lcr >= request.lcrFloor ? "teal" : "rose"}
-            limit={`≥ ${fmtNum(request.lcrFloor, 2)}`}
-            ok={metrics.p5Lcr >= request.lcrFloor}
-            hint={`میانگین ${fmtNum(metrics.meanLcr, 2)}`}
+            tone={metrics.p5Lcr >= lcrFloor ? "teal" : "rose"}
+            limit={`≥ ${fmtNum(lcrFloor, 2)}`}
+            ok={metrics.p5Lcr >= lcrFloor}
+            hint={request.lcrFloor < REGULATORY.lcrFloor ? `درخواست: ${fmtNum(request.lcrFloor, 2)}؛ کف مدل: ${fmtNum(REGULATORY.lcrFloor, 2)}` : `میانگین ${fmtNum(metrics.meanLcr, 2)}`}
           />
           <Stat
             label="شوک واژگونی منابع"
@@ -748,7 +762,7 @@ export function RunHistory({
           <table className="w-full text-[11px]">
             <thead className="sticky top-0 bg-panel text-mist">
               <tr>
-                {["زمان", "درخواست", "منابع", "IRR", "p95 LDR", "p5 LCR", "واژگونی", "گام‌ها", ""].map((h) => (
+                {["زمان", "درخواست", "منابع", "IRR", "p95 LDR", "p5 LCR", "واژگونی", "اعتبار مدل", "گام‌ها", ""].map((h) => (
                   <th key={h} className="whitespace-nowrap px-2 py-1.5 text-right font-medium">
                     {h}
                   </th>
@@ -775,6 +789,11 @@ export function RunHistory({
                   <td className="num px-2 py-1.5">{run.minLcr != null ? fmtNum(run.minLcr, 2) : "—"}</td>
                   <td className="num px-2 py-1.5">
                     {run.overturningRisk != null ? fmtPct(run.overturningRisk, 1) : "—"}
+                  </td>
+                  <td className="px-2 py-1.5">
+                    <Badge tone={run.validationStatus === "constraints_passed" ? "teal" : run.validationStatus === "not_validated" ? "rose" : "gold"}>
+                      {run.validationStatus === "constraints_passed" ? "قیود پاس" : run.validationStatus === "not_validated" ? "غیرقابل‌تأیید" : "نامشخص"}
+                    </Badge>
                   </td>
                   <td className="num px-2 py-1.5">{fmtNum(run.iterations)}</td>
                   <td className="px-2 py-1.5">

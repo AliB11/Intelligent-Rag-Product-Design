@@ -6,6 +6,8 @@
  * no language model ever invents a number.
  */
 
+import type { ContractType } from "./types";
+
 /** 1 Hemmat (همت) = 10^13 Rial. The CBI large-scale resource unit. */
 export const HEMMAT_RIAL = 1e13;
 /** 1 Toman = 10 Rial. */
@@ -27,8 +29,14 @@ export const DAYS_PER_MONTH = 30;
 export const ALM_HORIZON_MONTHS = 60;
 /** Monte Carlo runs for the stress tester. */
 export const MC_RUNS = 1000;
+/** Supported bounds for externally requested simulations. */
+export const MIN_MONTE_CARLO_RUNS = 100;
+export const MAX_MONTE_CARLO_RUNS = 2_000;
 /** Fast screening runs used by the inverse optimiser candidate sweep. */
 export const MC_SCREEN_RUNS = 120;
+export const MIN_OPTIMIZER_CANDIDATES = 8;
+export const MAX_OPTIMIZER_CANDIDATES = 60;
+export const MAX_PROMPT_LENGTH = 4_000;
 
 /** Statutory reserve ratio (سپرده قانونی) defaults per CBI directive. */
 export const STATUTORY_RESERVE = {
@@ -79,6 +87,13 @@ export const REGULATORY = {
   /** Maximum self-correction iterations of the critic loop. */
   maxCriticIterations: 5,
 } as const;
+
+/** Conservative default rate caps used by both the optimizer and compliance draft. */
+export function contractRateCeiling(contract: ContractType): number {
+  if (contract === "qarz-hasaneh") return REGULATORY.qarzHasanehMaxCommission;
+  if (contract === "gam") return 0.19;
+  return REGULATORY.morabahaMaxRate;
+}
 
 /** Capital / liquidity calibration of the digital twin. */
 export const CAPITAL = {

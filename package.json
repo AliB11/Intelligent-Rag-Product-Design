@@ -8,7 +8,7 @@
     "typecheck": "tsc --noEmit",
     "verify": "node scripts/verify.mjs",
     "smoke": "node scripts/smoke.mjs",
-    "db:push": "drizzle-kit push --force",
+    "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "ci": "npm run lint && npx next typegen && npm run typecheck && npm run build && node scripts/verify.mjs --fast"
   },

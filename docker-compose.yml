@@ -38,15 +38,13 @@ services:
     environment:
       NODE_ENV: production
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-app_db}
-      ALM_HORIZON_MONTHS: ${ALM_HORIZON_MONTHS:-60}
-      MONTE_CARLO_RUNS: ${MONTE_CARLO_RUNS:-1000}
     depends_on:
       postgres:
         condition: service_healthy
     ports:
       - "${APP_PORT:-3000}:3000"
 
-  # One-shot schema synchronisation: docker compose run --rm db-push
+  # One-shot schema synchronisation: docker compose --profile tools run --rm db-push
   db-push:
     build:
       context: .
@@ -57,7 +55,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["npx", "drizzle-kit", "push", "--force"]
+    command: ["npx", "drizzle-kit", "push"]
 
 volumes:
   pgdata:

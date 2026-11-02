@@ -24,39 +24,96 @@ async function json(path, init) {
 // 1) health
 {
   const { status, body } = await json("/api/health");
-  check("GET /api/health", status === 200 && body.ok === true, `status ${status}`);
+  check(
+    "GET /api/health",
+    status === 200 && body.ok === true && ["available", "unavailable"].includes(body.persistence),
+    `status ${status}, persistence ${body.persistence ?? "unreported"}`,
+  );
 }
 
-// 2) knowledge base + benchmarks
+// 2) server-rendered Persian application shell
+{
+  const response = await fetch(BASE);
+  const html = await response.text();
+  check(
+    "GET / renders the Persian application shell",
+    response.ok && /<html[^>]*lang="fa"/.test(html) && html.includes("<main") && html.includes("ALM"),
+    `status ${response.status}, ${html.length} HTML characters`,
+  );
+}
+
+// 3) knowledge base + benchmarks
 {
   const { status, body } = await json("/api/benchmarks");
   check(
     "GET /api/benchmarks",
     status === 200 &&
       Number(body?.totals?.benchmarks) > 20 &&
-      Number(body?.totals?.kbDocuments) > 10,
-    `${body?.totals?.benchmarks} benchmarks / ${body?.totals?.kbDocuments} kb docs`,
+      Number(body?.totals?.kbDocuments) > 10 &&
+      ["available", "unavailable"].includes(body?.persistence),
+    `${body?.totals?.benchmarks} benchmarks / ${body?.totals?.kbDocuments} kb docs / persistence ${body?.persistence ?? "unreported"}`,
   );
 }
 
-// 3) runs index
+// 4) persisted knowledge search must accurately reflect the configured store
+{
+  const { status, body } = await json("/api/benchmarks?source=db");
+  const expectedPersisted = body?.persistence === "available";
+  const persistedCount = Array.isArray(body?.persistedKnowledge) ? body.persistedKnowledge.length : -1;
+  check(
+    "GET /api/benchmarks?source=db reflects persistence state",
+    status === 200 && ["available", "unavailable"].includes(body?.persistence) &&
+      (expectedPersisted ? persistedCount > 0 : persistedCount === 0),
+    `persistence ${body?.persistence ?? "unreported"}, ${persistedCount} persisted results`,
+  );
+}
+
+// 5) runs index
 {
   const { status, body } = await json("/api/runs");
   check("GET /api/runs", status === 200 && Array.isArray(body.runs), `${body?.count ?? 0} runs`);
 }
 
-// 4) full generation over SSE
+// 6) invalid run counts must be rejected, not silently reduced
 {
+  const { status, body } = await json("/api/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "تست", runs: 99 }),
+  });
+  check("POST /api/generate rejects an unsupported Monte Carlo count", status === 400 && /runs/.test(body.error ?? ""), `status ${status}`);
+}
+
+// 7) composer overrides are validated before a long-running generation starts
+{
+  const { status, body } = await json("/api/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "تست", intentOverrides: { lcrFloor: 0.9 } }),
+  });
+  check("POST /api/generate rejects invalid intent overrides", status === 400 && /lcrFloor/.test(body.error ?? ""), `status ${status}`);
+}
+
+// 8) full generation over SSE
+{
+  const requestedRuns = 120;
   const prompt =
     "یک بسته ۴ طرحی میانگین حساب برای جذب ۲۰ همت منبع با IRR حداقل ۲۶٪، سقف LDR ۸۵٪، کف LCR ۱٫۰۵ و حداکثر ریسک واژگونی ۶٪ طراحی کن";
   const res = await fetch(`${BASE}/api/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, candidates: 8, runs: 120, withSensitivity: false }),
+    body: JSON.stringify({
+      prompt,
+      candidates: 8,
+      runs: requestedRuns,
+      withSensitivity: false,
+      intentOverrides: { targetIrr: 0.27 },
+    }),
   });
   const text = await res.text();
   const frames = text.split("\n\n");
   const events = [];
+  let bootstrapPayload = null;
   let resultPayload = null;
   for (const frame of frames) {
     const lines = frame.split("\n");
@@ -67,6 +124,13 @@ async function json(path, init) {
       .join("");
     if (!event || !data) continue;
     events.push(event);
+    if (event === "status") {
+      try {
+        bootstrapPayload = JSON.parse(data);
+      } catch {
+        bootstrapPayload = null;
+      }
+    }
     if (event === "result") {
       try {
         resultPayload = JSON.parse(data);
@@ -87,6 +151,11 @@ async function json(path, init) {
     `${events.length} frames, ${hasTrace} trace events`,
   );
   check(
+    "generation bootstrap reports persistence mode",
+    typeof bootstrapPayload?.persisted === "boolean",
+    bootstrapPayload?.persisted ? "PostgreSQL corpus" : "in-memory corpus",
+  );
+  check(
     "synthesised matrix has >= 4 modes",
     (product.modes?.length ?? 0) >= 4,
     `${product.modes?.length ?? 0} modes`,
@@ -102,13 +171,60 @@ async function json(path, init) {
     m.p5Lcr != null ? m.p5Lcr.toFixed(3) : "n/a",
   );
   check(
+    "final ALM uses exactly the requested Monte Carlo count",
+    alm.monteCarloRuns === requestedRuns,
+    `${alm.monteCarloRuns ?? "n/a"}/${requestedRuns} paths`,
+  );
+  check(
+    "explicit composer intent override is applied",
+    Math.abs((metrics.request?.targetIrr ?? 0) - 0.27) < 1e-9,
+    `target IRR ${metrics.request?.targetIrr ?? "missing"}`,
+  );
+  const validationExplicit =
+    (metrics.validationStatus === "not_validated" && metrics.reportFa?.includes("غیرقابل‌تأیید")) ||
+    (metrics.validationStatus === "constraints_passed" && metrics.reportFa?.includes("قیود سخت پاس شدند"));
+  check(
+    "validation result is explicit in API and report",
+    validationExplicit,
+    String(metrics.validationStatus ?? "missing status"),
+  );
+  if (bootstrapPayload?.persisted === true) {
+    if (typeof metrics.runId === "string") {
+      const { status, body } = await json(`/api/runs?id=${encodeURIComponent(metrics.runId)}`);
+      const stored = body?.run;
+      check(
+        "persisted run rehydrates its validation and audit artifacts",
+        status === 200 && stored?.validationStatus === metrics.validationStatus &&
+          stored?.metrics?.monteCarloRuns === requestedRuns &&
+          Array.isArray(stored?.findings) && Array.isArray(stored?.accountingEntries) &&
+          Array.isArray(stored?.complianceDraft) && Array.isArray(stored?.benchmarks) &&
+          typeof stored?.reportEn === "string",
+        status === 200 ? `validation ${stored?.validationStatus ?? "missing"}` : `status ${status}`,
+      );
+    } else {
+      check("persisted generation returns a run id", false, "PostgreSQL was available but runId was null");
+    }
+  } else {
+    check(
+      "in-memory mode does not claim a persisted run id",
+      bootstrapPayload?.persisted === false && metrics.runId === null,
+      `persisted=${bootstrapPayload?.persisted}; runId=${metrics.runId ?? "null"}`,
+    );
+  }
+  const { status: historyStatus, body: historyBody } = await json("/api/runs");
+  check(
+    "run history matches the active persistence mode",
+    historyStatus === 200 && (bootstrapPayload?.persisted === true ? historyBody.count > 0 : historyBody.count === 0),
+    `${historyBody?.count ?? 0} runs, persisted=${bootstrapPayload?.persisted}`,
+  );
+  check(
     "executive report emitted",
     (metrics.reportFa?.length ?? 0) > 800,
     `${metrics.reportFa?.length ?? 0} chars`,
   );
 }
 
-// 5) verification suite endpoint
+// 9) verification suite endpoint
 {
   const { status, body } = await json("/api/selftest?fast=1");
   check(

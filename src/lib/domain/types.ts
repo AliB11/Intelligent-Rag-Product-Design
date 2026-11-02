@@ -192,6 +192,7 @@ export interface RegulatoryConstraint {
 export interface AlmMonthRow {
   t: number;
   deposits: number;
+  usableDeposits: number;
   blockedDeposits: number;
   freeDeposits: number;
   loans: number;
@@ -205,6 +206,7 @@ export interface AlmMonthRow {
   treasuryIncome: number;
   depositCost: number;
   opex: number;
+  wholesaleCost: number;
   expectedLoss: number;
   netIncome: number;
   newOriginations: number;
@@ -220,6 +222,7 @@ export interface AlmMonthRow {
 export interface AlmMetrics {
   irrBank: number;
   irrBankAnnual: number;
+  irrValidPathShare: number;
   roi: number;
   roe: number;
   nim: number;

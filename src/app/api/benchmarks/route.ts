@@ -15,16 +15,19 @@ export async function GET(request: Request) {
   const q = url.searchParams.get("q") ?? "";
   const source = url.searchParams.get("source") ?? "memory";
 
-  await ensureSeeded();
+  const corpus = await ensureSeeded();
 
   const schemes = q ? searchBenchmarks(q, 24) : BENCHMARK_SCHEMES;
   const documents = q ? retrieveKnowledge(q, 10) : KB_DOCUMENTS.slice(0, 12);
-  const persisted = source === "db" ? await kbSearch(q || "قرض‌الحسنه میانگین حساب", 10) : [];
+  const persisted = source === "db" && corpus.persisted
+    ? await kbSearch(q || "قرض‌الحسنه میانگین حساب", 10)
+    : [];
 
   return Response.json({
     benchmarks: schemes,
     knowledge: documents,
     persistedKnowledge: persisted,
+    persistence: corpus.persisted ? "available" : "unavailable",
     regulatory: {
       ...REGULATORY,
       statutoryReserve: STATUTORY_RESERVE,
