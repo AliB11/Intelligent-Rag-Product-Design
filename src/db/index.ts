@@ -16,7 +16,8 @@ export const pool =
     connectionString: databaseUrl,
     connectionTimeoutMillis: 2_500,
     idleTimeoutMillis: 30_000,
-    max: 10,
+    // Each serverless instance owns a pool; keep its footprint small on Vercel.
+    max: process.env.VERCEL ? 2 : 10,
   });
 
 if (process.env.NODE_ENV !== "production") {
