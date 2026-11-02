@@ -23,6 +23,11 @@ const AR_DIGITS = "٠١٢٣٤٥٦٧٨٩";
 
 export function normaliseDigits(input: string): string {
   return input
+    .normalize("NFKC")
+    .replace(/[\u064A\u0649]/g, "ی")
+    .replace(/\u0643/g, "ک")
+    .replace(/\u0640/g, "")
+    .replace(/[\u200c\u200f\u202a-\u202e]/g, " ")
     .split("")
     .map((ch) => {
       const fa = FA_DIGITS.indexOf(ch);
@@ -30,6 +35,7 @@ export function normaliseDigits(input: string): string {
       const ar = AR_DIGITS.indexOf(ch);
       if (ar >= 0) return String(ar);
       if (ch === "٬" || ch === "،") return ",";
+      if (ch === "٫") return ".";
       return ch;
     })
     .join("");
@@ -40,13 +46,17 @@ const WORD_NUMBERS: Record<string, number> = {
   one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
 };
 
+const NUMERIC_TOKEN = String.raw`(?:[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?|\.[0-9]+)`;
+const WORD_NUMBER_TOKEN = Object.keys(WORD_NUMBERS)
+  .sort((a, b) => b.length - a.length)
+  .join("|");
+
 function parseNumber(token: string): number | null {
-  const cleaned = token.replace(/[,\s\u066C]/g, "");
+  const cleaned = token.replace(/[,\s\u066c]/gi, "");
   if (!cleaned) return null;
   const direct = Number(cleaned);
   if (Number.isFinite(direct)) return direct;
-  if (WORD_NUMBERS[cleaned] !== undefined) return WORD_NUMBERS[cleaned];
-  return null;
+  return WORD_NUMBERS[cleaned.toLowerCase()] ?? null;
 }
 
 const PERSONA_KEYWORDS: { key: string; words: string[] }[] = [
@@ -88,7 +98,7 @@ interface NumericCapture {
 
 function captureNumberUnits(text: string, unitRegex: RegExp): NumericCapture[] {
   const out: NumericCapture[] = [];
-  const re = new RegExp(`([0-9]+(?:\\.[0-9]+)?|${Object.keys(WORD_NUMBERS).join("|")})\\s*(${unitRegex.source})`, "gi");
+  const re = new RegExp(`(${NUMERIC_TOKEN}|${WORD_NUMBER_TOKEN})\\s*(${unitRegex.source})`, "gi");
   let match: RegExpExecArray | null;
   while ((match = re.exec(text)) !== null) {
     const value = parseNumber(match[1]);
@@ -141,22 +151,27 @@ export function parseTargetDeposits(text: string): { rial: number; tokens: Numer
   return { rial, tokens };
 }
 
+function parseRateLike(text: string, keywords: RegExp, percentOnly: boolean): number | null {
+  const modifier = String.raw`(?:حداقل|حداکثر|سقف|کف|حد|برابر|at least|at most|ceiling|floor|limit|target|at|is|of|min|max|>=|<=|>|<)?`;
+  const re = new RegExp(
+    `(?:${keywords.source})\\s*${modifier}\\s*[:=]?\\s*(${NUMERIC_TOKEN})(\\s*(?:%|درصد|percent))?`,
+    "i",
+  );
+  const match = re.exec(text);
+  if (!match) return null;
+  const value = parseNumber(match[1]);
+  if (value === null) return null;
+  const hasPercentUnit = Boolean(match[2]);
+  if (percentOnly || hasPercentUnit) return hasPercentUnit || value > 1 ? value / 100 : value;
+  return value;
+}
+
 function parsePercent(text: string, keywords: RegExp): number | null {
-  for (const kw of keywords.source.split("|")) {
-    const re = new RegExp(`${kw}\\s*(?:حداقل|حداکثر|at least|at most|min|max|>=|<=|>|<|target)?\\s*[:=]?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*(?:%|درصد|percent)`, "i");
-    const m = re.exec(text);
-    if (m) {
-      const v = Number(m[1]);
-      if (Number.isFinite(v)) return v / 100;
-    }
-    const re2 = new RegExp(`${kw}\\s*(?:حداقل|حداکثر|at least|at most|min|max|>=|<=|>|<|target)?\\s*[:=]?\\s*(0?\\.[0-9]+)`, "i");
-    const m2 = re2.exec(text);
-    if (m2) {
-      const v = Number(m2[1]);
-      if (Number.isFinite(v)) return v <= 1 ? v : v / 100;
-    }
-  }
-  return null;
+  return parseRateLike(text, keywords, true);
+}
+
+function parseRatio(text: string, keywords: RegExp): number | null {
+  return parseRateLike(text, keywords, false);
 }
 
 function detectPersona(text: string): { key: string; score: number } | null {
@@ -194,7 +209,7 @@ function detectEmphases(text: string): string[] {
 function detectModeCount(text: string): number {
   const m = /([0-9]+)\s*(?:طرح|حالت|mode|tier|product)/i.exec(text);
   if (m) return clamp(Number(m[1]), 1, 5);
-  const words = /(\b(?:three|four|five|سه|چهار|پنج|۳|۴|۵)\b)\s*(?:طرحی|طرح|mode|tier)/i.exec(text);
+  const words = /(\b(?:one|two|three|four|five)\b|یک|دو|سه|چهار|پنج)\s*(?:طرحی|طرح|حالت|mode|tier)/i.exec(text);
   if (words) {
     const v = parseNumber(words[1]);
     if (v) return clamp(v, 1, 5);
@@ -204,47 +219,72 @@ function detectModeCount(text: string): number {
   return 4;
 }
 
+export interface IntentOverrides {
+  targetDepositsHemmat?: number;
+  targetIrr?: number;
+  ldrCeiling?: number;
+  lcrFloor?: number;
+  maxOverturningShock?: number;
+}
+
 export interface ParseResult {
   request: ProductGenerationRequest;
   warnings: string[];
 }
 
-/** Stage 1 — natural language -> formal objective function + constraints. */
-export function parseIntent(rawPrompt: string): ParseResult {
+/** Stage 1 — natural language plus explicit UI controls -> formal request. */
+export function parseIntent(rawPrompt: string, overrides: IntentOverrides = {}): ParseResult {
   const prompt = rawPrompt.trim();
   const text = normaliseDigits(prompt);
   const language = detectLanguage(text);
   const warnings: string[] = [];
 
   const deposits = parseTargetDeposits(text);
-  let targetDepositsRial = deposits.rial;
-  if (targetDepositsRial <= 0) {
-    targetDepositsRial = 20 * HEMMAT_RIAL;
+  let targetDepositsHemmat =
+    Number.isFinite(overrides.targetDepositsHemmat) && overrides.targetDepositsHemmat! > 0
+      ? overrides.targetDepositsHemmat!
+      : deposits.rial / HEMMAT_RIAL;
+  if (targetDepositsHemmat <= 0) {
+    targetDepositsHemmat = 20;
     warnings.push(
       language === "fa"
         ? "حجم منابع هدف در پیام یافت نشد؛ مقدار پیش‌فرض ۲۰ همت اعمال شد."
         : "No explicit resource target found; defaulted to 20 Hemmat.",
     );
   }
+  targetDepositsHemmat = clamp(targetDepositsHemmat, 0.01, 1_000);
+  const targetDepositsRial = targetDepositsHemmat * HEMMAT_RIAL;
 
   const personaHit = detectPersona(text);
   const personaKey = personaHit?.key ?? null;
   const persona = PERSONAS.find((p) => p.key === personaKey) ?? null;
 
-  const targetIrr =
-    parsePercent(text, /irr|بازده داخلی|نرخ بازده داخلی|internal rate/i) ??
-    (persona ? 0.27 : 0.26);
-  const targetRoi = parsePercent(text, /roi|بازده سرمایه گذاری|بازده سرمایه‌گذاری|return on investment/i) ?? 0.9;
-  const targetRoe = parsePercent(text, /roe|بازده حقوق صاحبان سهام|return on equity/i) ?? 0.28;
-  const targetNim = parsePercent(text, /nim|حاشیه سود|net interest margin/i) ?? 0.075;
+  const targetIrr = clamp(
+    overrides.targetIrr ?? parsePercent(text, /irr|بازده داخلی|نرخ بازده داخلی|internal rate/i) ?? (persona ? 0.27 : 0.26),
+    0.01,
+    1.0,
+  );
+  const targetRoi = clamp(parsePercent(text, /roi|بازده سرمایه گذاری|بازده سرمایه‌گذاری|return on investment/i) ?? 0.9, 0, 5);
+  const targetRoe = clamp(parsePercent(text, /roe|بازده حقوق صاحبان سهام|return on equity/i) ?? 0.28, 0, 1.5);
+  const targetNim = clamp(parsePercent(text, /nim|حاشیه سود|net interest margin/i) ?? 0.075, 0, 0.5);
 
-  const ldrCeiling =
-    parsePercent(text, /ldr|تسهیلات به سپرده|credit[- ]to[- ]deposit|نسبت تسهیلات/i) ??
-    REGULATORY.ldrCeiling;
-  const lcrFloor =
-    parsePercent(text, /lcr|پوشش نقدینگی|liquidity coverage/i) ?? REGULATORY.lcrFloor;
-  const maxOverturningShock =
-    parsePercent(text, /overturning|واژگونی|واژگونی منابع|resource reversal/i) ?? 0.06;
+  const ldrCeiling = clamp(
+    overrides.ldrCeiling ?? parsePercent(text, /ldr|تسهیلات به سپرده|credit[- ]to[- ]deposit|نسبت تسهیلات/i) ?? REGULATORY.ldrCeiling,
+    0.4,
+    0.95,
+  );
+  const lcrFloor = clamp(
+    overrides.lcrFloor ?? parseRatio(text, /lcr|پوشش نقدینگی|liquidity coverage/i) ?? REGULATORY.lcrFloor,
+    1.0,
+    2.0,
+  );
+  const maxOverturningShock = clamp(
+    overrides.maxOverturningShock ??
+      parsePercent(text, /overturning|واژگونی|واژگونی منابع|resource reversal/i) ??
+      (/نزدیک\s*صفر|near\s*zero/i.test(text) ? 0.02 : 0.06),
+    0.01,
+    0.25,
+  );
 
   const contracts = detectContracts(text);
   const emphases = detectEmphases(text);
@@ -272,7 +312,9 @@ export function parseIntent(rawPrompt: string): ParseResult {
   lambdas.lambda4Overturning /= lsum;
 
   const parsedTokens: ProductGenerationRequest["parsedTokens"] = [
-    ...deposits.tokens.map((t) => ({ raw: t.raw, kind: "resource-target", value: t.value })),
+    ...(overrides.targetDepositsHemmat !== undefined
+      ? [{ raw: "composer target", kind: "resource-target", value: targetDepositsHemmat }]
+      : deposits.tokens.map((t) => ({ raw: t.raw, kind: "resource-target", value: t.value }))),
     { raw: "IRR", kind: "profitability-target", value: targetIrr },
     { raw: "ROI", kind: "profitability-target", value: targetRoi },
     { raw: "ROE", kind: "profitability-target", value: targetRoe },
@@ -291,14 +333,14 @@ export function parseIntent(rawPrompt: string): ParseResult {
     prompt,
     language,
     targetDepositsRial,
-    targetDepositsHemmat: targetDepositsRial / HEMMAT_RIAL,
+    targetDepositsHemmat,
     targetIrr,
     targetRoi,
     targetRoe,
     targetNim,
-    ldrCeiling: clamp(ldrCeiling, 0.4, 0.95),
-    lcrFloor: clamp(lcrFloor, 1.0, 2.0),
-    maxOverturningShock: clamp(maxOverturningShock, 0.01, 0.25),
+    ldrCeiling,
+    lcrFloor,
+    maxOverturningShock,
     personaKey,
     guild: persona ? persona.titleFa : null,
     preferredContracts: contracts,

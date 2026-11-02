@@ -6,9 +6,9 @@ export const maxDuration = 300;
 
 /**
  * GET /api/selftest?fast=1 — executes the automated verification suite:
- * the deterministic financial-engine unit layer plus the two mandated
- * end-to-end integration tests (20-Hemmat multi-mode matrix and the
- * physician / dental closed-loop B2B2C ecosystem).
+ * deterministic financial-engine tests, correction/seed and graph-control
+ * regressions, plus two product integration scenarios: the 20-Hemmat matrix
+ * and the physician/dental closed-loop ecosystem.
  */
 export async function GET(request: Request) {
   const url = new URL(request.url);

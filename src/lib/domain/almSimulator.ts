@@ -18,8 +18,8 @@ import {
   ALM_HORIZON_MONTHS,
   CAPITAL,
   HURDLE_RATE,
+  MAX_MONTE_CARLO_RUNS,
   MC_RUNS,
-  MC_SCREEN_RUNS,
   REGULATORY,
   TREASURY_RATE,
 } from "./constants";
@@ -67,8 +67,12 @@ export const ALM_CALIBRATION = {
   capitalReleaseFactor: 0.96,
   /** Share of released blocked funds that immediately re-deposits. */
   blockedRedepositFraction: 0.3,
+  /** Retained settlement split credited back to the originating deposit cohort. */
+  closedLoopAccountSplit: 0.25,
   /** Share of exiting cohorts that roll into a fresh average-balance cycle. */
   cohortRolloverRetention: 0.38,
+  /** Share of a maturing merchant float that is re-settled into a fresh float. */
+  floatRolloverRetention: 0.3,
   /** Life of the closed-loop merchant float bucket (months). */
   floatLifeMonths: 3,
   /** Spread over interbank paid on wholesale funding gaps. */
@@ -101,6 +105,7 @@ interface FloatBucket {
 
 const NUMERIC_ROW_KEYS: (keyof AlmMonthRow)[] = [
   "deposits",
+  "usableDeposits",
   "blockedDeposits",
   "freeDeposits",
   "loans",
@@ -114,6 +119,7 @@ const NUMERIC_ROW_KEYS: (keyof AlmMonthRow)[] = [
   "treasuryIncome",
   "depositCost",
   "opex",
+  "wholesaleCost",
   "expectedLoss",
   "netIncome",
   "newOriginations",
@@ -149,8 +155,11 @@ export interface AlmSimulationInput {
   seed?: number | string;
   horizonMonths?: number;
   scenario?: StressScenario;
+  /** Request-specific LDR/LCR limits used in breach counts and breach events. */
+  limits?: { ldrCeiling: number; lcrFloor: number };
   /** Optional per-mode parameter overrides used by the sensitivity dashboard. */
   overrides?: Partial<ModeSpec>[];
+  signal?: AbortSignal;
 }
 
 const scenarioFactors: Record<
@@ -219,9 +228,7 @@ function simulatePath(
   let cumulativeCash = 0;
   let prevDeposits = 0;
   let totalIntake = 0;
-  let grossDrain = 0;
   let netDrainSum = 0;
-  let totalOriginations = 0;
   const cf: number[] = new Array<number>(horizon).fill(0);
   let peakLoans = 0;
   let peakDeposits = 0;
@@ -235,6 +242,7 @@ function simulatePath(
     let jointIncome = 0;
     let feeIncome = 0;
     let disbursementLeak = 0;
+    let originationCost = 0;
 
     // 1) cohort intake -------------------------------------------------------
     for (let m = 0; m < product.modes.length; m += 1) {
@@ -312,13 +320,17 @@ function simulatePath(
         const retained = loan * mode.closedLoopRetention;
         if (retained > 0) {
           closedLoopInflow += retained;
-          floats.push({
-            balance: retained,
-            age: 0,
-            life: ALM_CALIBRATION.floatLifeMonths,
-            modeIdx: c.modeIdx,
-          });
-          c.balance += retained * 0.25; // settlement residual kept on account
+          const accountResidual = retained * ALM_CALIBRATION.closedLoopAccountSplit;
+          const floatResidual = retained - accountResidual;
+          if (floatResidual > 0) {
+            floats.push({
+              balance: floatResidual,
+              age: 0,
+              life: ALM_CALIBRATION.floatLifeMonths,
+              modeIdx: c.modeIdx,
+            });
+          }
+          c.balance += accountResidual;
         }
         newOriginations += loan;
         // non-joint fee income at origination
@@ -326,23 +338,23 @@ function simulatePath(
           feeIncome += loan * mode.loanRate; // commission charged upfront
         }
         feeIncome += loan * mode.feeIncomeRate;
-        cf[t] -= loan * ALM_CALIBRATION.originationCostRate;
+        originationCost += loan * ALM_CALIBRATION.originationCostRate;
       }
 
-      if (c.phase === 2 && c.loanOutstanding > 0) {
+      if (c.phase === 2 && c.loanOutstanding > 0 && c.age > Math.round(mode.sleepMonths + mode.waitingMonths)) {
         const tenor = Math.max(1, mode.tenorMonths);
-        const installment =
-          c.loanOriginal * rt.installmentCache * (rt.annuity ? 1 : 1);
+        const scheduledInstallment = c.loanOriginal * rt.installmentCache;
         const interestPart = rt.annuity
-          ? Math.min(c.loanOutstanding * rt.monthlyRate * sf.rate, installment)
+          ? Math.min(c.loanOutstanding * rt.monthlyRate * sf.rate, scheduledInstallment)
           : 0;
         const principalPart = Math.min(
           c.loanOutstanding,
-          Math.max(0, installment - interestPart),
+          Math.max(0, scheduledInstallment - interestPart),
         );
+        const actualInstallment = interestPart + principalPart;
         c.loanOutstanding -= principalPart;
         jointIncome += interestPart;
-        installmentsIn += installment;
+        installmentsIn += actualInstallment;
 
         const idx = Math.min(c.age - Math.round(mode.sleepMonths + mode.waitingMonths) - 1, tenor - 1);
         const release = idx >= 0 && idx < c.releaseSchedule.length ? c.releaseSchedule[idx] : 0;
@@ -391,9 +403,18 @@ function simulatePath(
         f.balance * ALM_CALIBRATION.interchangeRatePerTurn * ALM_CALIBRATION.monthlyTurnover *
         (mode.sourceKappa >= 1.3 ? 1.25 : 1);
       if (f.age >= f.life) {
-        withdrawals += f.balance * 0.7;
-        closedLoopInflow += f.balance * 0.3; // re-settled into merchant accounts
+        const reDeposited = f.balance * ALM_CALIBRATION.floatRolloverRetention;
+        withdrawals += f.balance - reDeposited;
+        closedLoopInflow += reDeposited;
         floats.splice(i, 1);
+        if (reDeposited > 0) {
+          floats.push({
+            balance: reDeposited,
+            age: 0,
+            life: ALM_CALIBRATION.floatLifeMonths,
+            modeIdx: f.modeIdx,
+          });
+        }
       } else {
         f.balance *= 0.985;
       }
@@ -404,9 +425,10 @@ function simulatePath(
     let blockedBalance = 0;
     let loanBalance = 0;
     let weightedRr = 0;
+    let weightedLiquidity = 0;
     let depositCost = 0;
     let expectedLoss = 0;
-    let opex = 0;
+    let opex = originationCost;
     let activeCustomers = 0;
 
     for (const c of cohorts) {
@@ -415,20 +437,23 @@ function simulatePath(
       blockedBalance += c.blockedRemaining;
       loanBalance += c.loanOutstanding;
       weightedRr += c.balance * mode.statutoryReserve;
+      weightedLiquidity += c.balance * mode.liquidityDeduction;
       depositCost += (c.balance * mode.depositRate) / 12;
       expectedLoss += (c.loanOutstanding * mode.pd * mode.lgd) / 12;
-      opex += (c.balance * (1 - mode.statutoryReserve) * mode.opexRatio) / 12;
+      opex += (c.balance * Math.max(0, 1 - mode.statutoryReserve - mode.liquidityDeduction) * mode.opexRatio) / 12;
       if (c.loanOutstanding > 0) activeCustomers += 1;
     }
     let floatBalance = 0;
     for (const f of floats) {
       floatBalance += f.balance;
       weightedRr += f.balance * 0.02;
+      weightedLiquidity += f.balance * 0.01;
       depositCost += (f.balance * 0.01) / 12; // low-cost current deposit
     }
     const deposits = depositBalance + floatBalance;
     const rrWeighted = deposits > 0 ? weightedRr / deposits : 0;
-    const usableDeposits = deposits * (1 - rrWeighted);
+    const liquidityWeighted = deposits > 0 ? weightedLiquidity / deposits : 0;
+    const usableDeposits = Math.max(0, deposits * (1 - rrWeighted - liquidityWeighted) - blockedBalance);
     const hotDeposits = Math.max(0, deposits - blockedBalance);
 
     // 5) treasury / wholesale funding leg ------------------------------------
@@ -451,10 +476,10 @@ function simulatePath(
       jointIncome + feeIncome + treasuryIncome - depositCost - opex - expectedLoss - wholesaleCost;
 
     earningsBuffer += netIncome;
-    cf[t] += netIncome - (t === 0 ? 0 : 0);
+    cf[t] += netIncome;
 
     // 6) regulatory ratios ---------------------------------------------------
-    const ldr = usableDeposits > 0 ? loanBalance / usableDeposits : 0;
+    const ldr = loanBalance > 0 ? loanBalance / Math.max(1, usableDeposits) : 0;
     const stressedOutflow =
       CAPITAL.stressedOutflowShock * hotDeposits * sf.outflow + 0.25 * blockedReleased;
     const inflow30 = installmentsIn + treasuryIncome + feeIncome * 0.5;
@@ -464,9 +489,7 @@ function simulatePath(
       prevDeposits > 0
         ? Math.max(0, withdrawals - closedLoopInflow) / prevDeposits
         : 0;
-    grossDrain += Math.max(0, withdrawals - closedLoopInflow);
     netDrainSum += Math.max(0, disbursementLeak - closedLoopInflow);
-    totalOriginations += newOriginations;
     cumulativeCash += netIncome;
     peakLoans = Math.max(peakLoans, loanBalance);
     peakDeposits = Math.max(peakDeposits, deposits);
@@ -474,6 +497,7 @@ function simulatePath(
     rows.push({
       t: t + 1,
       deposits,
+      usableDeposits,
       blockedDeposits: blockedBalance,
       freeDeposits: Math.max(0, deposits - blockedBalance),
       loans: loanBalance,
@@ -487,6 +511,7 @@ function simulatePath(
       treasuryIncome,
       depositCost,
       opex,
+      wholesaleCost,
       expectedLoss,
       netIncome,
       newOriginations,
@@ -514,9 +539,7 @@ function simulatePath(
     irrMonthly: Number.isFinite(monthlyIrr) ? monthlyIrr : NaN,
     economicCapital,
     totalIntake,
-    grossDrain,
     netDrain: netDrainSum,
-    totalOriginations,
   };
 }
 
@@ -525,32 +548,31 @@ export interface PathOutput {
   irrMonthly: number;
   economicCapital: number;
   totalIntake: number;
-  grossDrain: number;
   /** Disbursement leakage net of the closed-loop return (Rial). */
   netDrain: number;
-  totalOriginations: number;
 }
 
-interface PathSummary {
-  irrMonthly: number;
-  maxLdr: number;
-  minLcr: number;
-  overturning: number;
-  netDrain: number;
-  totalIntake: number;
-  peakLoans: number;
-  peakDeposits: number;
-  originations: number;
-  netIncomeTotal: number;
-  monthsBreachLdr: number;
-  monthsBreachLcr: number;
+
+function throwIfAlmCancelled(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error("ALM simulation cancelled by the caller");
+  error.name = "AbortError";
+  throw error;
 }
 
-/** Full Monte Carlo ALM stress test. */
-export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
-  const horizon = Math.max(6, input.horizonMonths ?? ALM_HORIZON_MONTHS);
-  const runs = Math.max(1, input.runs ?? MC_RUNS);
+/** Full Monte Carlo ALM stress test, implemented as a resumable path generator. */
+function* simulateAlmSimulation(input: AlmSimulationInput): Generator<number, AlmResult, void> {
+  const horizon = clamp(Math.round(input.horizonMonths ?? ALM_HORIZON_MONTHS), 6, 120);
+  const runs = input.runs ?? MC_RUNS;
+  if (!Number.isSafeInteger(runs) || runs < 1 || runs > MAX_MONTE_CARLO_RUNS) {
+    throw new RangeError(`ALM runs must be an integer between 1 and ${MAX_MONTE_CARLO_RUNS}; received ${runs}`);
+  }
   const scenario = input.scenario ?? "base";
+  if (!Object.prototype.hasOwnProperty.call(scenarioFactors, scenario)) {
+    throw new RangeError(`Unknown ALM stress scenario: ${String(scenario)}`);
+  }
+  const ldrCeiling = clamp(input.limits?.ldrCeiling ?? REGULATORY.ldrCeiling, 0.01, 1);
+  const lcrFloor = clamp(input.limits?.lcrFloor ?? REGULATORY.lcrFloor, 0.1, 5);
   const seedValue =
     typeof input.seed === "string"
       ? seedFromString(input.seed)
@@ -581,7 +603,8 @@ export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
     peakLoans: [] as number[],
     peakDeposits: [] as number[],
     originations: [] as number[],
-    netIncome: [] as number[],
+    irrAnnual: [] as number[],
+    invalidIrr: 0,
     breachLdr: [] as number[],
     breachLcr: [] as number[],
     ldrByMonth: [] as number[][],
@@ -592,9 +615,8 @@ export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
     series.lcrByMonth.push([]);
   }
 
-  const summaries: PathSummary[] = [];
-
   for (let p = 0; p < runs; p += 1) {
+    throwIfAlmCancelled(input.signal);
     const path = simulatePath(product, runtime, horizon, rng, stochastic, scenario);
     const rows = path.rows;
     let maxLdr = 0;
@@ -603,7 +625,6 @@ export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
     let netDrain = 0;
     let intake = 0;
     let originations = 0;
-    let netIncomeTotal = 0;
     let breachLdr = 0;
     let breachLcr = 0;
     let peakLoans = 0;
@@ -615,6 +636,7 @@ export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
       const row = rows[t];
       const target = acc[t];
       target.deposits += row.deposits;
+      target.usableDeposits += row.usableDeposits;
       target.blockedDeposits += row.blockedDeposits;
       target.freeDeposits += row.freeDeposits;
       target.loans += row.loans;
@@ -628,6 +650,7 @@ export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
       target.treasuryIncome += row.treasuryIncome;
       target.depositCost += row.depositCost;
       target.opex += row.opex;
+      target.wholesaleCost += row.wholesaleCost;
       target.expectedLoss += row.expectedLoss;
       target.netIncome += row.netIncome;
       target.newOriginations += row.newOriginations;
@@ -645,15 +668,21 @@ export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
       minLcr = Math.min(minLcr, row.lcr);
       overturning = Math.max(overturning, row.reversal);
       originations += row.newOriginations;
-      netIncomeTotal += row.netIncome;
       peakLoans = Math.max(peakLoans, row.loans);
       peakDeposits = Math.max(peakDeposits, row.deposits);
-      if (row.ldr > REGULATORY.ldrCeiling) breachLdr += 1;
-      if (row.lcr < REGULATORY.lcrFloor) breachLcr += 1;
+      if (row.ldr > ldrCeiling) breachLdr += 1;
+      if (row.lcr < lcrFloor) breachLcr += 1;
     }
 
     const irrMonthly = path.irrMonthly;
-    if (Number.isFinite(irrMonthly)) series.irr.push(irrMonthly);
+    if (Number.isFinite(irrMonthly)) {
+      series.irr.push(irrMonthly);
+      series.irrAnnual.push(annualise(irrMonthly));
+    } else {
+      series.irr.push(-1);
+      series.irrAnnual.push(-1);
+      series.invalidIrr += 1;
+    }
     series.maxLdr.push(maxLdr);
     series.minLcr.push(Number.isFinite(minLcr) ? minLcr : 0);
     series.overturning.push(overturning);
@@ -662,23 +691,9 @@ export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
     series.peakLoans.push(peakLoans);
     series.peakDeposits.push(peakDeposits);
     series.originations.push(originations);
-    series.netIncome.push(netIncomeTotal);
     series.breachLdr.push(breachLdr);
     series.breachLcr.push(breachLcr);
-    summaries.push({
-      irrMonthly: Number.isFinite(irrMonthly) ? irrMonthly : 0,
-      maxLdr,
-      minLcr: Number.isFinite(minLcr) ? minLcr : 0,
-      overturning,
-      netDrain,
-      totalIntake: intake,
-      peakLoans,
-      peakDeposits,
-      originations,
-      netIncomeTotal,
-      monthsBreachLdr: breachLdr,
-      monthsBreachLcr: breachLcr,
-    });
+    yield p + 1;
   }
 
   const monthly = acc.map((row) => {
@@ -690,12 +705,12 @@ export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
   });
 
   const avgEarningAssets = mean(
-    monthly.map((r) => r.loans + r.hqla + Math.max(0, r.freeDeposits - r.loans)),
+    monthly.map((r) => Math.max(r.loans + r.hqla, r.usableDeposits)),
   );
   const totalJoint = monthly.reduce((a, r) => a + r.jointIncome + r.treasuryIncome, 0);
   const totalFee = monthly.reduce((a, r) => a + r.feeIncome, 0);
   const totalCost = monthly.reduce(
-    (a, r) => a + r.depositCost + r.opex + r.expectedLoss,
+    (a, r) => a + r.depositCost + r.opex + r.wholesaleCost + r.expectedLoss,
     0,
   );
   const totalNetIncome = monthly.reduce((a, r) => a + r.netIncome, 0);
@@ -704,13 +719,14 @@ export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
     CAPITAL.hqlaToDeposits * mean(series.peakDeposits) +
     mean(series.intake) * ALM_CALIBRATION.programSetupCostRate;
 
-  const irrMonthly = series.irr.length ? mean(series.irr) : NaN;
-  const irrAnnual = Number.isFinite(irrMonthly) ? annualise(irrMonthly) : 0;
+  const irrMonthly = series.irr.length ? mean(series.irr) : -1;
+  const irrAnnual = series.irrAnnual.length ? mean(series.irrAnnual) : -1;
   const years = horizon / 12;
 
   const metrics: AlmMetrics = {
     irrBank: Number.isFinite(irrMonthly) ? irrMonthly : 0,
     irrBankAnnual: irrAnnual,
+    irrValidPathShare: runs > 0 ? (runs - series.invalidIrr) / runs : 0,
     roi: economicCapital > 0 ? totalNetIncome / economicCapital : 0,
     roe:
       economicCapital > 0
@@ -755,13 +771,13 @@ export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
   const breaches: AlmResult["breaches"] = [];
   series.ldrByMonth.forEach((values, i) => {
     const p95 = percentile(values, 95);
-    if (p95 > REGULATORY.ldrCeiling)
-      breaches.push({ t: i + 1, metric: "LDR", value: p95, limit: REGULATORY.ldrCeiling });
+    if (p95 > ldrCeiling)
+      breaches.push({ t: i + 1, metric: "LDR", value: p95, limit: ldrCeiling });
   });
   series.lcrByMonth.forEach((values, i) => {
     const p5 = percentile(values, 5);
-    if (p5 < REGULATORY.lcrFloor)
-      breaches.push({ t: i + 1, metric: "LCR", value: p5, limit: REGULATORY.lcrFloor });
+    if (p5 < lcrFloor)
+      breaches.push({ t: i + 1, metric: "LCR", value: p5, limit: lcrFloor });
   });
 
   const buckets = [0, 0.02, 0.04, 0.06, 0.08, 0.12, 0.2, 1];
@@ -795,14 +811,41 @@ export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
   };
 }
 
+/** Synchronous evaluator retained for deterministic screening and tests. */
+export function runAlmSimulation(input: AlmSimulationInput): AlmResult {
+  const simulation = simulateAlmSimulation(input);
+  let step = simulation.next();
+  while (!step.done) step = simulation.next();
+  return step.value;
+}
+
+/**
+ * Asynchronous evaluator for request paths. It yields to the event loop every
+ * 32 Monte Carlo paths so client disconnects and AbortSignals can be observed.
+ */
+export async function runAlmSimulationAsync(input: AlmSimulationInput): Promise<AlmResult> {
+  const requestedRuns = input.runs ?? MC_RUNS;
+  const simulation = simulateAlmSimulation(input);
+  let step = simulation.next();
+  while (!step.done) {
+    if (step.value % 32 === 0 && step.value < requestedRuns) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      throwIfAlmCancelled(input.signal);
+    }
+    step = simulation.next();
+  }
+  return step.value;
+}
+
 /** Deterministic screening evaluator (expected-value path, no sampling). */
 export function evaluateProduct(
   product: ProductSpec,
   seed: number | string = "screen",
   horizonMonths = ALM_HORIZON_MONTHS,
+  limits?: { ldrCeiling: number; lcrFloor: number },
 ): AlmMetrics {
-  return runAlmSimulation({ product, runs: 1, seed, horizonMonths }).metrics;
+  return runAlmSimulation({ product, runs: 1, seed, horizonMonths, limits }).metrics;
 }
 
-export { MC_SCREEN_RUNS, MC_RUNS };
-export type { AlmMonthRow, PathSummary };
+export { MC_RUNS };
+export type { AlmMonthRow };

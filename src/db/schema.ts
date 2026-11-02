@@ -1,5 +1,6 @@
 import {
   doublePrecision,
+  index,
   integer,
   jsonb,
   pgTable,
@@ -65,15 +66,22 @@ export const generationRuns = pgTable("generation_runs", {
   prompt: text("prompt").notNull(),
   language: text("language").notNull(),
   status: text("status").notNull(),
+  validationStatus: text("validation_status").notNull().default("pending"),
   iterations: integer("iterations").notNull(),
   intent: jsonb("intent").notNull(),
   retrievedConstraints: jsonb("retrieved_constraints").notNull(),
   guild: jsonb("guild"),
+  persona: jsonb("persona"),
+  findings: jsonb("findings").notNull().default([]),
   productSpec: jsonb("product_spec").notNull(),
   metrics: jsonb("metrics").notNull(),
   sensitivity: jsonb("sensitivity"),
+  benchmarks: jsonb("benchmarks").notNull().default([]),
+  accountingEntries: jsonb("accounting_entries").notNull().default([]),
+  complianceDraft: jsonb("compliance_draft").notNull().default([]),
   trace: jsonb("trace").notNull(),
   reportFa: text("report_fa").notNull(),
+  reportEn: text("report_en").notNull().default(""),
   targetDeposits: doublePrecision("target_deposits").notNull(),
   irrBank: doublePrecision("irr_bank"),
   maxLdr: doublePrecision("max_ldr"),
@@ -82,7 +90,11 @@ export const generationRuns = pgTable("generation_runs", {
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
-});
+}, (table) => ({
+  createdAtIndex: index("generation_runs_created_at_idx").on(table.createdAt),
+  statusIndex: index("generation_runs_status_idx").on(table.status),
+  validationStatusIndex: index("generation_runs_validation_status_idx").on(table.validationStatus),
+}));
 
 export type KbDocument = typeof kbDocuments.$inferSelect;
 export type Benchmark = typeof benchmarks.$inferSelect;

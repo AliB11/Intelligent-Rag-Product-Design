@@ -9,30 +9,38 @@ Errors return `{ error: string, errorFa?: string }` with an appropriate HTTP sta
 
 ## `GET /api/health`
 
-Liveness + database connectivity.
+Application liveness plus an explicit persistence/corpus status.
 
 ```json
-{ "ok": true }
+{
+  "ok": true,
+  "persistence": "available",
+  "corpus": { "documents": 18, "benchmarks": 27 }
+}
 ```
 
-`200` when `select 1` succeeds, `500` with `{ "ok": false }` otherwise.
+The endpoint returns `200` while the generator is available, even if PostgreSQL
+is not configured or reachable; `persistence` distinguishes that degraded mode
+from a database-backed corpus.
 
 ---
 
 ## `POST /api/generate`
 
-Runs the full five-stage inverse goal-seeking pipeline and streams the agent
+Runs the full seven-node inverse goal-seeking pipeline and streams the agent
 trace over **Server-Sent Events**.
 
 ### Request body
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `prompt` | `string` | — | **Required.** Persian or English strategic objective. Trimmed, min length 1. |
-| `candidates` | `number` | `26` | Structural candidates screened by stage C. 8–60. |
-| `runs` | `number` | `1000` | Monte Carlo paths for the final confirmation. |
-| `maxIterations` | `number` | `5` | Upper bound on the critic self-correction loop. |
-| `withSensitivity` | `boolean` | `true` | Compute the 6-dimension sensitivity sweep. |
+| `prompt` | `string` | — | **Required.** Persian or English strategic objective, trimmed and limited to 4,000 characters. |
+| `candidates` | `number` | `26` | Structural candidates screened by stage C. Integer in 8–60. |
+| `runs` | `number` | `1000` | Final base-case Monte Carlo paths. Integer in 100–2,000; the API rejects invalid counts and never silently reduces the requested final count. |
+| `maxIterations` | `number` | `5` | Critic self-correction limit, integer in 1–5. |
+| `withSensitivity` | `boolean` | `true` | Compute the six-dimension sensitivity sweep. |
+| `seed` | `string` | derived from prompt | Optional reproducibility seed (up to 128 characters); also seeds sensitivity evaluation. |
+| `intentOverrides` | `object` | `{}` | Optional explicit composer values; overrides conflicting prompt-parsed values. Keys/ranges: `targetDepositsHemmat` 0.01–1,000; `targetIrr` 0.01–1; `ldrCeiling` 0.4–0.95; `lcrFloor` 1–2; `maxOverturningShock` 0.01–0.25. Unknown keys and invalid values return `400`. |
 
 ```bash
 curl -N -X POST localhost:3000/api/generate \
@@ -44,11 +52,11 @@ curl -N -X POST localhost:3000/api/generate \
 
 | `event:` | Payload |
 | --- | --- |
-| `status` | `{ stage: "bootstrap", titleFa, titleEn }` — knowledge-base seeding result |
+| `status` | `{ stage: "bootstrap", titleFa, titleEn, persisted }` — reports whether the corpus is backed by PostgreSQL or in-memory data |
 | `trace` | `TraceEvent` — one per agent reasoning step (see below) |
-| `result` | the complete `GenerationResult` |
-| `done` | `{ ok: true, runId }` |
-| `error` | `{ message }` |
+| `result` | the complete generation result, including `validationStatus` and nullable `runId` |
+| `done` | `{ ok: boolean, runId?: string | null }` |
+| `error` | `{ message, status? }` — a failed graph may be reported in-band after the SSE response starts |
 
 `TraceEvent`:
 
@@ -75,7 +83,8 @@ curl -N -X POST localhost:3000/api/generate \
 {
   runId: string | null;
   prompt: string;
-  status: "complete" | "failed";
+  status: "complete";
+  validationStatus: "constraints_passed" | "not_validated";
   error: string | null;
   elapsedMs: number;
   iterationCount: number;
@@ -112,7 +121,7 @@ monthlyInstallmentToman, installmentToIncome, npvBankRial, customers`
 
 ## `GET /api/benchmarks`
 
-Knowledge base + benchmark registry. Seeds PostgreSQL idempotently on first call.
+Knowledge base + benchmark registry. Seeds PostgreSQL idempotently on first call when configured; local domain data remains available if persistence is unavailable.
 
 | Query param | Default | Notes |
 | --- | --- | --- |
@@ -124,6 +133,7 @@ Knowledge base + benchmark registry. Seeds PostgreSQL idempotently on first call
   "benchmarks": [ /* BenchmarkScheme[] */ ],
   "knowledge": [ /* RegulatoryConstraint[] with relevance */ ],
   "persistedKnowledge": [],
+  "persistence": "unavailable",
   "regulatory": { "ldrCeiling": 0.85, "lcrFloor": 1.05, "statutoryReserve": { "...": "..." } },
   "totals": { "benchmarks": 27, "kbDocuments": 18 }
 }
@@ -135,7 +145,7 @@ Knowledge base + benchmark registry. Seeds PostgreSQL idempotently on first call
 
 | Param | Notes |
 | --- | --- |
-| none | Latest 25 runs (ascending recency), summary columns only. |
+| none | Latest 25 persisted runs (newest first), summary columns only; returns an empty list when persistence is unavailable. |
 | `?limit=N` | 1–100. |
 | `?id=<uuid>` | Full audit trail of one run, including `trace`. |
 
@@ -145,6 +155,7 @@ Knowledge base + benchmark registry. Seeds PostgreSQL idempotently on first call
     "id": "f9a8dbf7-…",
     "prompt": "برای پزشکان متخصص …",
     "status": "complete",
+    "validationStatus": "constraints_passed",
     "iterations": 2,
     "targetDeposits": 6.0e13,
     "irrBank": 0.2817,
@@ -157,30 +168,38 @@ Knowledge base + benchmark registry. Seeds PostgreSQL idempotently on first call
 }
 ```
 
-`GET /api/runs?id=…` returns `{ run: { intent, retrievedConstraints, guild,
-productSpec, metrics /* full AlmResult */, sensitivity, trace, reportFa } }`.
+`GET /api/runs?id=…` returns the stored `generation_runs` row with parsed
+`intent`, `retrievedConstraints`, `guild`, `persona`, `findings`, `productSpec`,
+`metrics` (full ALM result), `sensitivity`, `benchmarks`, accounting and
+compliance artifacts, `trace`, both reports, and `validationStatus`.
 
 ---
 
 ## `GET /api/selftest`
 
-Executes the deterministic verification suite.
+Executes the deterministic verification suite: financial unit checks, directional
+LDR/LCR correction and sensitivity-seed regressions, graph budget/cancellation,
+and two end-to-end product scenarios.
 
 | Param | Notes |
 | --- | --- |
-| `?fast=1` | Reduced Monte Carlo paths, CI-friendly. |
+| `?fast=1` | Uses 220 final ALM paths for the two integration cases; CI-friendly. The exact requested path count remains enforced. |
+
+The current suite has 47 assertions across `TC0`, `TC-CORRECTION`, `TC-GRAPH`,
+`TC1` and `TC2`. Counts may change as coverage is extended.
 
 ```json
 {
   "passed": true,
-  "totalAssertions": 33,
-  "passedAssertions": 33,
-  "durationMs": 1736,
-  "ranAt": "2026-01-01T10:00:00.000Z",
+  "totalAssertions": 47,
+  "passedAssertions": 47,
+  "durationMs": 4567,
   "cases": [
-    { "id": "TC0", "passed": true, "assertions": [ { "id": "U-COF-01", "passed": true, "expected": "0.253058", "actual": "0.253058" } ], "summary": { } },
-    { "id": "TC1", "passed": true, "summary": { "modes": 4, "irrBankAnnual": 0.3162, "p95Ldr": 0.4195, "p5Lcr": 1.392 } },
-    { "id": "TC2", "passed": true, "summary": { "gammaWeighted": 0.729, "netLiquidityDrainRatio": 0 } }
+    { "id": "TC0", "passed": true },
+    { "id": "TC-CORRECTION", "passed": true },
+    { "id": "TC-GRAPH", "passed": true },
+    { "id": "TC1", "passed": true },
+    { "id": "TC2", "passed": true }
   ]
 }
 ```
@@ -191,8 +210,13 @@ Executes the deterministic verification suite.
 
 ## Rate / size notes
 
-* A full run with sensitivity takes **≈ 4–6 s** of CPU; `candidates: 60` and
-  `runs: 2000` can reach ≈ 25 s. Keep `maxDuration` generous when deploying
-  behind a proxy that buffers SSE.
+* Final base-case ALM always uses exactly the requested `runs`; candidate
+  screening, severe-run diagnostics and sensitivity points are separate
+  auxiliary evaluations and are not substituted for the final result.
+* `validationStatus` is `not_validated` when hard blockers remain after the
+  configured correction loop. A completed pipeline is not itself a claim that
+  every constraint passed.
+* Large requests (up to `runs: 2000` and `candidates: 60`) are CPU-intensive.
+  Keep `maxDuration` generous when deploying behind a proxy that buffers SSE.
 * SSE responses set `Cache-Control: no-cache, no-transform` and
   `X-Accel-Buffering: no` for nginx compatibility.

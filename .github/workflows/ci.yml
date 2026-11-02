@@ -63,8 +63,8 @@ jobs:
             echo "## Financial-engine verification suite"
             echo ""
             echo '```'
-            echo "Deterministic unit layer + 20-Hemmat multi-mode matrix"
-            echo "+ physician / dental closed-loop B2B2C ecosystem"
+            echo "Deterministic unit layer + sensitivity-seed and LDR/LCR correction regressions"
+            echo "+ graph budget/cancellation + 20-Hemmat and physician/dental integrations"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -98,7 +98,7 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Push Drizzle schema
-        run: npx drizzle-kit push --force
+        run: npx drizzle-kit push
 
       - name: Build
         run: npm run build

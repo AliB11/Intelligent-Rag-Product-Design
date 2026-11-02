@@ -57,6 +57,8 @@ export interface ComplianceDraftItem {
   severity: "mandatory" | "advisory";
 }
 
+export type ValidationStatus = "pending" | "constraints_passed" | "not_validated";
+
 export interface AgentState {
   prompt: string;
   request: ProductGenerationRequest | null;
@@ -76,6 +78,8 @@ export interface AgentState {
   reportFa: string;
   reportEn: string;
   trace: TraceEvent[];
+  /** Model-constraint result; this is not regulatory or production approval. */
+  validationStatus: ValidationStatus;
   status: "running" | "complete" | "failed";
   error?: string;
   elapsedMs: number;
@@ -112,6 +116,7 @@ export function createInitialState(prompt: string): AgentState {
     reportFa: "",
     reportEn: "",
     trace: [],
+    validationStatus: "pending",
     status: "running",
     startedAt: Date.now(),
     elapsedMs: 0,
@@ -149,10 +154,24 @@ export class StateGraph {
     return this;
   }
 
-  async invoke(state: AgentState, emit: Emit, maxSteps = 24): Promise<AgentState> {
+  async invoke(
+    state: AgentState,
+    emit: Emit,
+    maxSteps = 24,
+    signal?: AbortSignal,
+  ): Promise<AgentState> {
+    if (!Number.isSafeInteger(maxSteps) || maxSteps < 1) {
+      throw new RangeError(`StateGraph maxSteps must be a positive integer; received ${maxSteps}`);
+    }
     let current: NodeName | "END" = this.entry;
     let steps = 0;
-    while (current !== "END" && steps < maxSteps) {
+    while (current !== "END") {
+      if (signal?.aborted) {
+        const error = new Error("Pipeline cancelled by the caller");
+        error.name = "AbortError";
+        throw error;
+      }
+      if (steps >= maxSteps) throw new Error(`StateGraph exhausted its ${maxSteps}-step execution budget`);
       steps += 1;
       const node = this.nodes.get(current);
       if (!node) throw new Error(`Missing node implementation: ${current}`);
@@ -164,6 +183,11 @@ export class StateGraph {
         titleEn: `Entering node "${current}"`,
       });
       await node(state, emit);
+      if (signal?.aborted) {
+        const error = new Error("Pipeline cancelled by the caller");
+        error.name = "AbortError";
+        throw error;
+      }
       // yield so buffered trace events flush to the SSE client between nodes
       await new Promise((resolve) => setTimeout(resolve, 0));
       const router = this.routers.get(current);

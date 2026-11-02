@@ -29,9 +29,13 @@ export function sampleNormal(rng: Rng, mean = 0, sd = 1): number {
 }
 
 /** Marsaglia–Tsang gamma variate (shape > 0). */
-function sampleGamma(rng: Rng, shape: number, scale = 1): number {
+export function sampleGamma(rng: Rng, shape: number, scale = 1): number {
+  if (!Number.isFinite(shape) || shape <= 0 || !Number.isFinite(scale) || scale < 0) {
+    throw new RangeError("Gamma shape must be positive and scale must be non-negative");
+  }
+  if (scale === 0) return 0;
   if (shape < 1) {
-    const u = rng();
+    const u = Math.max(Number.MIN_VALUE, rng());
     return sampleGamma(rng, shape + 1, scale) * Math.pow(u, 1 / shape);
   }
   const d = shape - 1 / 3;
@@ -46,16 +50,32 @@ function sampleGamma(rng: Rng, shape: number, scale = 1): number {
     v = v * v * v;
     const u = rng();
     if (u < 1 - 0.0331 * x * x * x * x) return d * v * scale;
-    if (Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(v))) return d * v * scale;
+    if (Math.log(Math.max(Number.MIN_VALUE, u)) < 0.5 * x * x + d * (1 - v + Math.log(v)))
+      return d * v * scale;
   }
+}
+
+/** Draw a probability vector from a Dirichlet distribution. */
+export function sampleDirichlet(rng: Rng, concentrations: number[]): number[] {
+  if (!concentrations.length || concentrations.some((a) => !Number.isFinite(a) || a <= 0)) {
+    throw new RangeError("Dirichlet concentrations must be a non-empty array of positive values");
+  }
+  const draws = concentrations.map((a) => sampleGamma(rng, a));
+  const total = sum(draws);
+  return total > 0 && Number.isFinite(total)
+    ? draws.map((value) => value / total)
+    : concentrations.map((value) => value / sum(concentrations));
 }
 
 /** Beta(alpha, beta) variate — used for the unblocked withdrawal fraction delta_m. */
 export function sampleBeta(rng: Rng, a: number, b: number): number {
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) {
+    throw new RangeError("Beta parameters must be positive finite numbers");
+  }
   const x = sampleGamma(rng, a);
   const y = sampleGamma(rng, b);
-  const s = x + y;
-  return s === 0 ? a / (a + b) : x / s;
+  const total = x + y;
+  return total === 0 ? a / (a + b) : x / total;
 }
 
 export const clamp = (v: number, lo: number, hi: number) =>
@@ -65,10 +85,11 @@ export const sum = (xs: number[]) => xs.reduce((acc, x) => acc + x, 0);
 
 export const mean = (xs: number[]) => (xs.length ? sum(xs) / xs.length : 0);
 
-/** numpy.percentile equivalent (linear interpolation). */
+/** numpy.percentile equivalent (linear interpolation), ignoring non-finite samples. */
 export function percentile(values: number[], p: number): number {
-  if (!values.length) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
+  const finite = values.filter(Number.isFinite);
+  if (!finite.length) return 0;
+  const sorted = finite.sort((a, b) => a - b);
   const idx = clamp(p, 0, 100) / 100 * (sorted.length - 1);
   const lo = Math.floor(idx);
   const hi = Math.ceil(idx);
@@ -78,14 +99,23 @@ export function percentile(values: number[], p: number): number {
 
 /** numpy_financial.pmt — annuity installment for a monthly rate. */
 export function pmt(rateMonthly: number, periods: number, present: number): number {
+  if (![rateMonthly, periods, present].every(Number.isFinite)) {
+    throw new RangeError("PMT inputs must be finite");
+  }
   if (periods <= 0) return 0;
+  if (rateMonthly <= -1) throw new RangeError("Monthly rate must be greater than -100%");
   if (Math.abs(rateMonthly) < 1e-12) return present / periods;
   const factor = Math.pow(1 + rateMonthly, periods);
-  return (present * rateMonthly * factor) / (factor - 1);
+  const denominator = factor - 1;
+  if (denominator === 0 || !Number.isFinite(factor)) return NaN;
+  return (present * rateMonthly * factor) / denominator;
 }
 
 /** numpy_financial.npv — flows[0] occurs at t = 0 when `firstAtZero` is true. */
 export function npv(rate: number, flows: number[], firstAtZero = true): number {
+  if (!Number.isFinite(rate) || rate <= -1 || flows.some((flow) => !Number.isFinite(flow))) {
+    return NaN;
+  }
   let acc = 0;
   for (let i = 0; i < flows.length; i += 1) {
     const t = firstAtZero ? i : i + 1;
@@ -95,38 +125,58 @@ export function npv(rate: number, flows: number[], firstAtZero = true): number {
 }
 
 /**
- * numpy_financial.irr — monthly internal rate of return solved with a
- * bracketed bisection + Newton polish. Returns NaN when no sign change exists.
+ * numpy_financial.irr — monthly internal rate of return solved inside a
+ * bracketed interval. Returns NaN when no sign change exists in that interval.
  */
 export function irr(flows: number[], guess = 0.02): number {
-  if (flows.length < 2) return NaN;
-  const hasPositive = flows.some((f) => f > 0);
-  const hasNegative = flows.some((f) => f < 0);
-  if (!hasPositive || !hasNegative) return NaN;
+  if (flows.length < 2 || flows.some((flow) => !Number.isFinite(flow))) return NaN;
+  if (!flows.some((flow) => flow > 0) || !flows.some((flow) => flow < 0)) return NaN;
 
-  const f = (r: number) => npv(r, flows, true);
-
+  const f = (rate: number) => npv(rate, flows, true);
   let lo = -0.9;
   let hi = 10;
-  if (f(lo) * f(hi) > 0) return NaN;
-  // Newton polish seeded from the guess, falls back to bisection.
-  let r = clamp(guess, lo + 1e-6, hi - 1e-6);
-  for (let i = 0; i < 60; i += 1) {
-    const value = f(r);
-    const dr = 1e-6;
-    const slope = (f(r + dr) - value) / dr;
-    if (!Number.isFinite(slope) || Math.abs(slope) < 1e-14) break;
-    const next = r - value / slope;
-    if (!Number.isFinite(next) || next <= lo || next >= hi) break;
-    if (Math.abs(next - r) < 1e-10) return next;
-    r = next;
+  let fLo = f(lo);
+  let fHi = f(hi);
+  if (!Number.isFinite(fLo) || !Number.isFinite(fHi) || Math.sign(fLo) === Math.sign(fHi)) return NaN;
+  if (fLo === 0) return lo;
+  if (fHi === 0) return hi;
+
+  // Newton steps accelerate convergence, but every step remains bracketed.
+  let rate = clamp(guess, lo + 1e-8, hi - 1e-8);
+  for (let i = 0; i < 80; i += 1) {
+    const value = f(rate);
+    if (!Number.isFinite(value)) break;
+    if (Math.abs(value) <= Math.max(1e-7, Math.abs(flows[0]) * 1e-12)) return rate;
+    if (Math.sign(value) === Math.sign(fLo)) {
+      lo = rate;
+      fLo = value;
+    } else {
+      hi = rate;
+      fHi = value;
+    }
+    let slope = 0;
+    for (let t = 1; t < flows.length; t += 1) {
+      slope -= (t * flows[t]) / Math.pow(1 + rate, t + 1);
+    }
+    const candidate = rate - value / slope;
+    rate = Number.isFinite(candidate) && candidate > lo && candidate < hi
+      ? candidate
+      : (lo + hi) / 2;
+    if (hi - lo < 1e-12) return (lo + hi) / 2;
   }
+
   for (let i = 0; i < 200; i += 1) {
     const mid = (lo + hi) / 2;
     const value = f(mid);
-    if (Math.abs(value) < 1e-7 || hi - lo < 1e-10) return mid;
-    if (f(lo) * value < 0) hi = mid;
-    else lo = mid;
+    if (!Number.isFinite(value)) return NaN;
+    if (Math.abs(value) <= Math.max(1e-7, Math.abs(flows[0]) * 1e-12) || hi - lo < 1e-12) return mid;
+    if (Math.sign(value) === Math.sign(fLo)) {
+      lo = mid;
+      fLo = value;
+    } else {
+      hi = mid;
+      fHi = value;
+    }
   }
   return (lo + hi) / 2;
 }

@@ -158,7 +158,7 @@ cd alm-digital-twin
 
 npm ci
 cp .env.example .env                 # DATABASE_URL را تنظیم کنید
-npx drizzle-kit push --force         # ساخت جدول‌ها + بذر خودکار پایگاه دانش
+npm run db:push                        # بازبینی و همگام‌سازی طرح پایگاه داده
 
 npm run dev                          # http://localhost:3000
 ```
@@ -170,7 +170,7 @@ idempotent انجام می‌شود.
 
 ```bash
 docker compose up --build -d         # postgres + app روی پورت ۳۰۰۰
-docker compose run --rm db-push      # همگام‌سازی طرح داده
+docker compose --profile tools run --rm db-push  # همگام‌سازی افزایشی طرح داده
 curl localhost:3000/api/health
 ```
 
@@ -178,35 +178,41 @@ curl localhost:3000/api/health
 
 | دستور | کار |
 | --- | --- |
-| `make ci` | کل خط لوله CI به‌صورت محلی: lint + typegen + typecheck + build + verify |
-| `make verify` | مجموعه آزمون با ۱۰۰۰ مسیر مونت‌کارلو |
+| `make ci` | کل خط لوله CI به‌صورت محلی: lint + typegen + typecheck + build + verify-fast |
+| `make verify` | مجموعه کامل آزمون؛ TC1 با ۱۰۰۰ و TC2 با ۴۰۰ مسیر مونت‌کارلو |
 | `make verify-fast` | نسخه سریع مناسب CI |
 | `make smoke` | آزمون دود سرور در حال اجرا |
 | `make db-push` / `make db-studio` | همگام‌سازی و بازبینی داده |
 
 ## ۶) مجموعه آزمون راستی‌آزمایی
 
-`node scripts/verify.mjs` (معادل `tests/test_financial_engine.py`) — کاملاً قطعی، بدون دیتابیس و بدون شبکه.
+`node scripts/verify.mjs` — آزمون‌های قطعی TypeScript، بدون نیاز به دیتابیس یا شبکه.
 
 | آزمون | ادعاها |
 | --- | --- |
-| **TC0** لایه واحد + قطعیت | فرمول CoF و حل معکوس آن · سازگاری PMT/NPV/IRR · میانگین موزون با κ · جمع زمان‌بندی آزادسازی مسدودی · میانگین نمونه‌گیری بتا · صدک ۹۵ · مجموع تخصیص LP = ۱ · توان بازپرداخت · معادل عملیاتی · **بازتولیدپذیری کامل با بذر یکسان** |
-| **TC1** محصول ۲۰ همتی چندطرحی | همگرایی به ماتریس ≥ ۴ طرحی · **پلکانی‌سازی** دوره خواب · برابری Σ منابع با هدف · **IRR ≥ ۲۶٪** · **p95 LDR ≤ ۰٫۸۵** · **p5 LCR ≥ ۱٫۰۵** · واژگونی ≤ ۶٪ · NPV ≥ ۰ در همه طرح‌ها · قسط/درآمد ≤ ۴۰٪ · پایان کامل خط لوله |
-| **TC2** زیست‌بوم حلقه بسته پزشکی | شناسایی پرسونا از پیام فارسی · ساخت زیست‌بوم سه‌جانبه · **γ وزنی ≥ ۰٫۶۵** · **γ حداقلی ≥ ۰٫۶۵** · **خالص خروج نقدینگی ≈ صفر** · حضور طرح پذیرنده + زنجیره تأمین · LDR/LCR هم‌زمان · تولید سند حسابداری و انطباق |
+| **TC0** لایه واحد + قطعیت | نرمال‌سازی ارقام فارسی/عربی و درصد/اعشار · اولویت مقدار صریح Composer · فرمول و حل معکوس CoF · سازگاری PMT/NPV/IRR · نقطه‌موتور و صدک‌ها · تخصیص LP · بازتولیدپذیری مالی |
+| **TC-CORRECTION** اصلاح‌گر | جهت اصلاح LDR/LCR واقعاً سنجه شبیه‌سازی‌شده را بهتر می‌کند · تعداد مسیر درخواستی حفظ می‌شود · شمار نامعتبر رد می‌شود · بذر حساسیت بازتولیدپذیر و مؤثر است |
+| **TC-GRAPH** کنترل اجرا | بودجه گام‌های گراف از حلقه نامحدود جلوگیری می‌کند · لغو پیش از اجرا و هنگام شبیه‌سازی مونت‌کارلو آزموده می‌شود |
+| **TC1** محصول ۲۰ همتی چندطرحی | حداقل ۴ طرح · برابری Σ منابع با هدف · IRR، LDR، LCR، واژگونی و توان بازپرداخت · ALM نهایی با دقیقاً تعداد مسیر درخواستی · گزارش وضعیت اعتبارسنجی صریح |
+| **TC2** زیست‌بوم حلقه‌بسته پزشکی | شناسایی پزشک/دندان‌پزشک · زیست‌بوم سه‌جانبه · حفظ حلقه منابع · کنترل هم‌زمان LDR/LCR · اسناد حسابداری و انطباق · تعداد مسیر ALM دقیق |
 
 ```console
 $ node scripts/verify.mjs --fast
-SUITE PASSED — 33/33 assertions in ~1900 ms
+SUITE PASSED — 47/47 assertions
 
-  TC1  irrBankAnnual = 0.3162   p95Ldr = 0.4195   p5Lcr = 1.392   overturning = 0.0225
-  TC2  gammaWeighted = 0.729    netDrainRatio = 0.0000   p95Ldr = 0.5755   p5Lcr = 1.392
+  TC1  irrBankAnnual = 0.2903  p95Ldr = 0.6467  p5Lcr = 1.392  overturning = 0.0201
+  TC2  irrBankAnnual = 0.2947  p95Ldr = 0.4843  p5Lcr = 1.392  overturning = 0.0192
 ```
+
+For the standard final ALM, the requested run count is never silently reduced.
+If correction retries still leave a hard blocker, the result is marked
+`not_validated`; the suite also checks that sensitivity sweeps honor their seed.
 
 ## ۷) مرجع API
 
 | متد | مسیر | شرح |
 | --- | --- | --- |
-| `GET` | `/api/health` | سلامت سرویس و اتصال پایگاه داده |
+| `GET` | `/api/health` | سلامت سرویس و وضعیت صریح persistence (PostgreSQL یا حافظه) |
 | `POST` | `/api/generate` | اجرای خط لوله کامل؛ پاسخ **SSE** با فریم‌های `status`, `trace`, `result`, `done` |
 | `GET` | `/api/benchmarks?q=` | پایگاه دانش مقرراتی + ثبت بنچمارک بانکی ایران |
 | `GET` | `/api/runs` / `/api/runs?id=` | تاریخچه اجراها / ردپای کامل حسابرسی یک اجرا |
