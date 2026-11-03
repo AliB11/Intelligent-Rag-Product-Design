@@ -26,6 +26,7 @@ import {
   applyDirectives,
   assembleProduct,
   BLUEPRINTS,
+  buildCandidate,
   buildMode,
   feasibilityCheck,
   recomputeDerived,
@@ -35,6 +36,8 @@ import { parseIntent } from "../domain/intentParser";
 import { runAlmSimulation, runAlmSimulationAsync } from "../domain/almSimulator";
 import { runPipeline } from "../agents/graph";
 import { createInitialState, makeEmitter, StateGraph } from "../agents/state";
+import { analyzeMarket } from "../rag/marketIntel";
+import { MARKET_PRODUCTS } from "../rag/benchmarks";
 import {
   HEMMAT_RIAL,
   MAX_MONTE_CARLO_RUNS,
@@ -42,6 +45,7 @@ import {
   REGULATORY,
   STATUTORY_RESERVE,
   OPEX_RATIO_DEFAULT,
+  contractRateCeiling,
 } from "../domain/constants";
 import type { ModeArchetype } from "../domain/types";
 
@@ -915,10 +919,168 @@ export function buildReferenceProduct() {
   );
 }
 
+/** Market-intelligence layer: registry integrity, analog retrieval, priors, determinism. */
+export function runMarketIntelCase(): TestCaseResult {
+  const started = Date.now();
+  const out: Assertion[] = [];
+
+  // M-01 — registry size and uniqueness
+  const codes = new Set(MARKET_PRODUCTS.map((p) => p.code));
+  out.push(
+    assert(
+      "M-01",
+      "ثبت‌نام بازار حداقل ۵۰ محصول واقعی با کد یکتا دارد",
+      "The market registry holds at least 50 unique real-product records",
+      ">= 50 unique codes",
+      `${MARKET_PRODUCTS.length} products / ${codes.size} unique`,
+      MARKET_PRODUCTS.length >= 50 && codes.size === MARKET_PRODUCTS.length,
+    ),
+  );
+
+  // M-02 — every researched rate respects its contract ceiling. Bullion-backed
+  // special instruments are the documented exception (CBI-RATE-CEILING-287):
+  // they may price up to the absolute 28.7% ceiling.
+  const ceilingOf = (product: (typeof MARKET_PRODUCTS)[number]): number => {
+    const base = contractRateCeiling(product.contract);
+    const bullionSpecial = /شمش|طلا|bullion|gold/i.test(`${product.notesFa} ${product.productFa} ${product.productEn}`);
+    return bullionSpecial ? Math.max(base, REGULATORY.absoluteRateCeiling) : base;
+  };
+  const ratesOk = MARKET_PRODUCTS.every(
+    (p) => p.params.loanRate <= ceilingOf(p) + 1e-9,
+  );
+  out.push(
+    assert(
+      "M-02",
+      "نرخ پژوهش‌شده هر محصول داخل سقف قراردادی همان عقد است (ابزارهای شمش‌محور: سقف مطلق ۲۸٫۷٪)",
+      "Every researched loan rate respects its contract's rate ceiling (bullion-backed specials use the documented 28.7% absolute cap)",
+      "all within ceilings",
+      `${MARKET_PRODUCTS.filter((p) => p.params.loanRate > ceilingOf(p) + 1e-9).length} violations`,
+      ratesOk,
+    ),
+  );
+
+  // M-03 — analog retrieval for a specialist-physician request
+  const physician = parseIntent(
+    "برای پزشکان متخصص و کلینیک‌های درمانی یک بسته حلقه بسته طراحی کن؛ ۶ همت منبع با تأمین مالی تجهیزات",
+  ).request;
+  const market = analyzeMarket({
+    prompt: physician.prompt,
+    personaKey: physician.personaKey,
+    guild: physician.guild,
+    preferredContracts: physician.preferredContracts,
+    emphases: physician.emphases,
+    targetDepositsHemmat: physician.targetDepositsHemmat,
+  });
+  const medicalAnalogCount = market.analogs.filter(
+    (a) => /درمان|پزشک|بیمار/.test(`${a.product.segmentFa} ${a.product.productFa}`) ||
+      a.product.params.closedLoopRetention >= 0.7,
+  ).length;
+  out.push(
+    assert(
+      "M-03",
+      "درخواست پزشکی، محصولات واقعی هم‌خانواده (درمانی یا حلقه‌بسته بالا) بازیابی می‌کند",
+      "A physician request retrieves real medical / closed-loop market analogs",
+      ">= 3 relevant analogs with positive coverage",
+      `${medicalAnalogCount} relevant of ${market.analogCount}, coverage ${market.coverage.toFixed(2)}`,
+      medicalAnalogCount >= 3 && market.coverage > 0,
+    ),
+  );
+
+  // M-04 — priors derived for at least two archetypes with sane medians
+  const priorList = Object.values(market.byArchetype);
+  const mediansSane = priorList.every((prior) =>
+    Object.values(prior.median).every((value) => Number.isFinite(value) && value >= 0),
+  );
+  out.push(
+    assert(
+      "M-04",
+      "برای حداقل دو الگوی موتور، میانه ساختاری محاسبه و به نمونه‌گیری تزریق می‌شود",
+      "At least two engine archetypes receive finite, non-negative market medians as priors",
+      ">= 2 archetype priors with sane medians",
+      `${priorList.length} priors (${priorList.map((p) => `${p.archetype}:${p.analogCount}`).join(", ")})`,
+      priorList.length >= 2 && mediansSane,
+    ),
+  );
+
+  // M-05 — deterministic analysis
+  const replay = analyzeMarket({
+    prompt: physician.prompt,
+    personaKey: physician.personaKey,
+    guild: physician.guild,
+    preferredContracts: physician.preferredContracts,
+    emphases: physician.emphases,
+    targetDepositsHemmat: physician.targetDepositsHemmat,
+  });
+  const firstPrior = priorList[0];
+  const firstReplayPrior = Object.values(replay.byArchetype)[0];
+  out.push(
+    assert(
+      "M-05",
+      "تحلیل بازار قطعی است: بازیابی مجدد همان آنالوگ‌ها و میانه‌ها را می‌دهد",
+      "Market analysis is deterministic: replaying yields identical analogs and medians",
+      "same top analog and same medians",
+      `${market.analogs[0]?.product.code ?? "-"} vs ${replay.analogs[0]?.product.code ?? "-"}; ${
+        firstPrior && firstReplayPrior ? (firstPrior.median.loanMultiplier === firstReplayPrior.median.loanMultiplier ? "equal" : "diff") : "missing"
+      }`,
+      market.analogs[0]?.product.code === replay.analogs[0]?.product.code &&
+        firstPrior && firstReplayPrior &&
+        firstPrior.median.loanMultiplier === firstReplayPrior.median.loanMultiplier,
+    ),
+  );
+
+  // M-06 — market priors actually steer candidate synthesis (and stay deterministic)
+  const request = parseIntent(
+    "یک بسته ۴ طرحی میانگین حساب برای جذب ۲۰ همت منبع با IRR حداقل ۲۶٪ طراحی کن",
+  ).request;
+  const archetypes: ModeArchetype[] = ["retail-qarz-average", "merchant-pos-accelerator"];
+  const seed = 424242;
+  const withPriorsA = buildCandidate(request, archetypes, createRng(seed), null, 0, market);
+  const withPriorsB = buildCandidate(request, archetypes, createRng(seed), null, 0, market);
+  const withoutPriors = buildCandidate(request, archetypes, createRng(seed), null, 0, null);
+  const serialise = (product: ReturnType<typeof buildCandidate>) =>
+    JSON.stringify(product.modes.map((m) => [
+      m.archetype,
+      m.contract,
+      m.sleepMonths,
+      m.tenorMonths,
+      m.blockedRatio,
+      m.closedLoopRetention,
+      m.loanRate,
+      m.depositRate,
+    ]));
+  out.push(
+    assert(
+      "M-06",
+      "اولویت‌های بازار نمونه‌سازی کاندید را واقعاً هدایت می‌کنند و بازتولیدپذیر می‌مانند",
+      "Market priors steer candidate synthesis while replaying deterministically",
+      "prior run == prior replay && prior run != plain run",
+      `equal=${serialise(withPriorsA) === serialise(withPriorsB)}; differs=${serialise(withPriorsA) !== serialise(withoutPriors)}`,
+      serialise(withPriorsA) === serialise(withPriorsB) &&
+        serialise(withPriorsA) !== serialise(withoutPriors),
+    ),
+  );
+
+  return {
+    id: "TC-MARKET",
+    titleFa: "آزمون لایه هوش بازار — ثبت‌نام، بازیابی آنالوگ، اولویت‌ها و قطعیت",
+    titleEn: "Market-intelligence layer — registry, analog retrieval, priors and determinism",
+    assertions: out,
+    passed: out.every((item) => item.passed),
+    durationMs: Date.now() - started,
+    summary: {
+      products: MARKET_PRODUCTS.length,
+      analogs: market.analogCount,
+      coverage: Number(market.coverage.toFixed(2)),
+      priors: priorList.length,
+    },
+  };
+}
+
 export async function runVerificationSuite(fast = false): Promise<VerificationSuiteResult> {
   const started = Date.now();
   const cases: TestCaseResult[] = [runDeterminismCase(), runCorrectionCase()];
   cases.push(await runStateGraphCase());
+  cases.push(runMarketIntelCase());
   cases.push(await runTestCase1(fast));
   cases.push(await runTestCase2(fast));
   const all = cases.flatMap((c) => c.assertions);

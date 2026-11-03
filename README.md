@@ -10,7 +10,7 @@ MILP/MINLP · مونت‌کارلو ۶۰ ماهه · خط لوله هفت‌گر
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](tsconfig.json)
 [![Next.js](https://img.shields.io/badge/Next.js-16_App_Router-000000?logo=nextdotjs&logoColor=white)](https://nextjs.org)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16_%2B_Drizzle-4169E1?logo=postgresql&logoColor=white)](src/db)
-[![Tests](https://img.shields.io/badge/verification-33%2F33_passing-2EA043)](src/lib/verification/financialEngineTests.ts)
+[![Tests](https://img.shields.io/badge/verification-53%2F53_passing-2EA043)](src/lib/verification/financialEngineTests.ts)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 </div>
@@ -44,9 +44,29 @@ MILP/MINLP · مونت‌کارلو ۶۰ ماهه · خط لوله هفت‌گر
 > «۲۰ همت منبع جذب کن، IRR بانک حداقل ۲۶٪، p95 نسبت تسهیلات به سپرده حداکثر ۸۵٪،
 > کف پوشش نقدینگی ۱٫۰۵، ریسک واژگونی منابع زیر ۶٪ — برای پزشکان متخصص.»
 
-سامانه خودش **تابع هدف و قیود صوری** را می‌سازد، مقررات را بازیابی می‌کند، ساختار بهینه را
-حل می‌کند، آن را در دوقلوی دیجیتال ALM آزمون تنش می‌دهد، و اگر موجه نبود خودش را اصلاح می‌کند —
+سامانه خودش **تابع هدف و قیود صوری** را می‌سازد، مقررات را بازیابی می‌کند، **از
+آنالوگ‌های واقعی بازار یاد می‌گیرد**، ساختار بهینه را حل می‌کند، آن را در
+دوقلوی دیجیتال ALM آزمون تنش می‌دهد، و اگر موجه نبود خودش را اصلاح می‌کند —
 تا پنج گام.
+
+### هوش بازار (Market Intelligence)
+
+ثبت‌نام **۵۳ محصول واقعی تحقیق‌شده** بازار ایران (مهر ایران، تجارت، ملت، صادرات،
+ملی، شهر، پارسیان، سامان، پاسارگاد، کارآفرین، رسالت، کشاورزی، توسعه تعاون،
+صندوق‌های رفاه و درمان و بازنشستگی، فین‌تک‌های BNPL مانند دیجی‌پی و اسنپ‌پی، و
+برنامه‌های مقرراتی گام/تأمین‌یار) با پارامترهای ساختاری و منبع عمومی هر رکورد،
+سه قابلیت به موتور اضافه می‌کند:
+
+1. **بازیابی آنالوگ** — نزدیک‌ترین محصولات واقعی به درخواست کاربر با دلیل تطابق؛
+2. **اولویت‌های نمونه‌گیری از میانه بازار** — حل‌کننده معکوس به‌جای جست‌وجوی
+   یکنواخت، حول میانه ساختاری آنالوگ‌ها (τ_d, τ_l, ω, α, β, γ, δ, r_d, r_l)
+   و عقدِ غالب بازار نمونه‌گیری می‌کند؛
+3. **تیلت وزن بر اساس توان نرخ** — وقتی هدف IRR بالاست، سهم لایه‌های
+   کم‌حاشیه (قرض‌الحسنه ۴٪) کوچک و بار سودآوری به لایه‌های مرابحه/BNPL منتقل
+   می‌شود؛ همان کاری که واحدهای طراحی محصول در ماتریس‌های پلکانی انجام می‌دهند.
+
+خروجی در تب «تحلیل بازار»، بخش ۱۰ گزارش مدیریتی و ستون `market_intel` پایگاه
+داده قابل بازبینی است. روش‌شناسی کامل در [docs/MARKET_RESEARCH.md](docs/MARKET_RESEARCH.md).
 
 ### قاعده بنیادین معماری
 
@@ -153,8 +173,8 @@ intent_analyzer ──▶ regulatory_rag ──┬─(persona شناسایی ش�
 | npm | 10+ |
 
 ```bash
-git clone https://github.com/<org>/alm-digital-twin.git
-cd alm-digital-twin
+git clone https://github.com/AliB11/Intelligent-Rag-Product-Design.git
+cd Intelligent-Rag-Product-Design
 
 npm ci
 cp .env.example .env                 # DATABASE_URL را تنظیم کنید
@@ -163,7 +183,29 @@ npm run db:push                        # بازبینی و همگام‌سازی
 npm run dev                          # http://localhost:3000
 ```
 
-بذرگذاری پایگاه دانش (۱۸ سند مقرراتی و ۲۷ بنچمارک واقعی بانکی) در نخستین فراخوانی API به‌صورت
+### راه‌اندازی بومی روی ویندوز (بدون Docker)
+
+اگر Docker در دسترس نیست، PostgreSQL قابل‌حمل کافی است (برنامه به pgvector نیاز
+ندارد؛ بردارها به‌صورت آرایه `double precision` ذخیره می‌شوند):
+
+1. باینری قابل‌حمل PostgreSQL 16 را دانلود و اکسترکت کنید:
+   `https://get.enterprisedb.com/postgresql/postgresql-16.9-1-windows-x64-binaries.zip`
+   — پوشه `pgsql` را در `..\tools\pg16-extract` کنار مخزن قرار دهید
+   (یا مسیرها را با متغیرهای `PG_HOME_ENV` و `PGDATA_ENV` بازتعریف کنید).
+2. سپس فقط:
+
+```bat
+scripts\win-dev.cmd                   % حالت توسعه: دیتابیس + Next.js dev
+scripts\win-start.cmd                 % حالت production: دیتابیس + build + start
+scripts\win-db-start.cmd              % فقط راه‌اندازی PostgreSQL
+scripts\win-db-stop.cmd               % توقف PostgreSQL
+```
+
+اسکریپت‌ها initdb، اجرای سرور روی پورت ۵۴۳۲، ساخت `app_db`، همگام‌سازی طرح
+Drizzle و اجرای Next.js را خودکار انجام می‌دهند (اعتبار پیش‌فرض
+`postgres / postgres` مطابق `.env.example`).
+
+بذرگذاری پایگاه دانش (۱۸ سند مقرراتی و ۵۳ بنچمارک واقعی بانکی) در نخستین فراخوانی API به‌صورت
 idempotent انجام می‌شود.
 
 ### با Docker

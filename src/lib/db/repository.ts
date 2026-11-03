@@ -150,6 +150,7 @@ export async function saveRun(state: AgentState): Promise<string | null> {
       iterations: state.iteration,
       intent: state.request,
       retrievedConstraints: state.constraints,
+      marketIntel: state.marketIntel ?? null,
       guild: state.ecosystem ?? null,
       persona: state.persona ?? null,
       findings: state.findings,

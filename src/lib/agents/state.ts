@@ -17,6 +17,8 @@ import type {
   RegulatoryConstraint,
 } from "../domain/types";
 import type { OptimizerIteration } from "../domain/optimizer";
+import type { MarketPriors } from "../rag/marketIntel";
+import type { MarketProduct } from "../rag/marketIntel";
 
 export type NodeName =
   | "intent_analyzer"
@@ -59,11 +61,53 @@ export interface ComplianceDraftItem {
 
 export type ValidationStatus = "pending" | "constraints_passed" | "not_validated";
 
+/** Market-research intelligence snapshot produced by the RAG node. */
+export interface MarketIntel {
+  /** Closest real market products with match scores and reasons. */
+  analogs: {
+    code: string;
+    bank: string;
+    productFa: string;
+    productEn: string;
+    contract: string;
+    archetype: string;
+    segmentFa: string;
+    ceilingToman: number;
+    feeRate: number | null;
+    profitRate: number | null;
+    tenorMonths: number | null;
+    sleepMonths: number | null;
+    loanToDepositRatio: number | null;
+    blockedRatio: number | null;
+    closedLoopRetention: number | null;
+    sourceType: string;
+    sourceRef: string;
+    score: number;
+    reasonsFa: string[];
+    params: {
+      sleepMonths: number;
+      tenorMonths: number;
+      waitingMonths: number;
+      loanMultiplier: number;
+      blockedRatio: number;
+      closedLoopRetention: number;
+      withdrawalFraction: number;
+      depositRate: number;
+      loanRate: number;
+    };
+  }[];
+  /** Archetype-level medians fed to the optimizer sampler. */
+  priors: MarketPriors["byArchetype"];
+  coverage: number;
+  analogCount: number;
+}
+
 export interface AgentState {
   prompt: string;
   request: ProductGenerationRequest | null;
   warnings: string[];
   constraints: RegulatoryConstraint[];
+  marketIntel: MarketIntel | null;
   persona: PersonaSpec | null;
   ecosystem: GuildEcosystem | null;
   product: ProductSpec | null;
@@ -102,6 +146,7 @@ export function createInitialState(prompt: string): AgentState {
     request: null,
     warnings: [],
     constraints: [],
+    marketIntel: null,
     persona: null,
     ecosystem: null,
     product: null,

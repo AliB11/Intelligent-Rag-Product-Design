@@ -21,6 +21,7 @@ import AgentReasoningStream from "@/components/AgentReasoningStream";
 import MultiModeMatrixTable from "@/components/MultiModeMatrixTable";
 import ALMCashFlowChart from "@/components/ALMCashFlowChart";
 import GuildEcosystemCanvas from "@/components/GuildEcosystemCanvas";
+import MarketIntelPanel from "@/components/MarketIntelPanel";
 import {
   CompliancePanel,
   KnowledgePanel,
@@ -47,7 +48,7 @@ import {
   fmtNum,
   fmtPct,
 } from "@/components/ui";
-import type { SensitivityFrame, AccountingEntry, ComplianceDraftItem, ValidationStatus } from "@/lib/agents/state";
+import type { SensitivityFrame, AccountingEntry, ComplianceDraftItem, ValidationStatus, MarketIntel } from "@/lib/agents/state";
 
 interface GenerationResult {
   runId: string | null;
@@ -58,6 +59,7 @@ interface GenerationResult {
   request: ProductGenerationRequest | null;
   warnings: string[];
   constraints: RegulatoryConstraint[];
+  marketIntel: MarketIntel | null;
   persona: PersonaSpec | null;
   ecosystem: GuildEcosystem | null;
   product: ProductSpec | null;
@@ -79,6 +81,7 @@ type TabKey =
   | "matrix"
   | "alm"
   | "guild"
+  | "market"
   | "sensitivity"
   | "compliance"
   | "knowledge"
@@ -262,6 +265,7 @@ export default function Home() {
         request: run.intent,
         warnings: [],
         constraints: run.retrievedConstraints ?? [],
+        marketIntel: (run.marketIntel as MarketIntel | null) ?? null,
         persona: run.persona ?? null,
         ecosystem: run.guild ?? null,
         product: run.productSpec,
@@ -448,6 +452,7 @@ export default function Home() {
                     { key: "matrix", label: "ماتریس چندطرحی", icon: <IconLayers className="h-3.5 w-3.5" />, badge: fmtNum(result.product?.modes.length ?? 0) },
                     { key: "alm", label: "جریان نقد ALM", icon: <IconChart className="h-3.5 w-3.5" /> },
                     { key: "guild", label: "بوم زیست‌بوم صنفی", icon: <IconNetwork className="h-3.5 w-3.5" /> },
+                    { key: "market", label: "تحلیل بازار", icon: <IconDatabase className="h-3.5 w-3.5" /> },
                     { key: "sensitivity", label: "حساسیت‌سنجی", icon: <IconFlask className="h-3.5 w-3.5" /> },
                     { key: "compliance", label: "انطباق و حسابداری", icon: <IconShield className="h-3.5 w-3.5" /> },
                     { key: "knowledge", label: "RAG و بنچمارک", icon: <IconDatabase className="h-3.5 w-3.5" /> },
@@ -478,6 +483,7 @@ export default function Home() {
                       product={result.product}
                     />
                   ) : null}
+                  {tab === "market" ? <MarketIntelPanel intel={result.marketIntel} /> : null}
                   {tab === "sensitivity" ? <SensitivityDashboard sensitivity={result.sensitivity} /> : null}
                   {tab === "compliance" ? (
                     <CompliancePanel

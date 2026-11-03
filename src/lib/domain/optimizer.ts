@@ -44,6 +44,7 @@ import {
 } from "./pointEngine";
 import { evaluateProduct, runAlmSimulation } from "./almSimulator";
 import { PERSONAS } from "./guildValueChain";
+import type { MarketPriors, MarketStructuralParams } from "../rag/marketIntel";
 import type {
   AlmMetrics,
   AlmResult,
@@ -233,6 +234,8 @@ export interface SolveOptions {
   persona?: PersonaSpec | null;
   forcedArchetypes?: ModeArchetype[];
   gammaFloor?: number;
+  /** Market-research priors: median structural parameters of the closest real products. */
+  priors?: MarketPriors | null;
   signal?: AbortSignal;
   onProgress?: (event: OptimizerProgress) => void;
 }
@@ -859,18 +862,27 @@ export function applyDirectives(
   }
 
   if (has("irr-shortfall")) {
+    // Market-centred starts sit near realistic market margins; when the target
+    // IRR is still unmet the correction must move fast enough to reach it
+    // within the bounded iteration budget (2%/step toward the contract ceiling).
+    const shortfall = magnitude("irr-shortfall");
+    const step = clamp(0.012 + shortfall * 0.6, 0.012, 0.03);
     next.forEach((mode) => {
       const bp = BLUEPRINTS[mode.archetype];
       const ceiling = contractRateCeiling(mode.contract);
-      mode.loanRate = clamp(mode.loanRate + 0.008, 0, ceiling);
-      mode.feeIncomeRate = clamp(mode.feeIncomeRate + 0.0015, bp.feeIncomeRate[0], bp.feeIncomeRate[1] * 1.35);
+      mode.loanRate = clamp(mode.loanRate + step, 0, ceiling);
+      mode.feeIncomeRate = clamp(mode.feeIncomeRate + step * 0.3, bp.feeIncomeRate[0], bp.feeIncomeRate[1] * 1.35);
       mode.closedLoopRetention = clamp(mode.closedLoopRetention + 0.05, 0, 0.95);
       if (mode.archetype === "investment-deposit") {
-        mode.depositRate = clamp(mode.depositRate - 0.004, 0.05, 0.205);
+        mode.depositRate = clamp(mode.depositRate - 0.006, 0.05, 0.205);
+      }
+      if (mode.archetype === "retail-qarz-average") {
+        // lift the loan multiplier within the blueprint band to deepen joint income
+        mode.loanMultiplier = clamp(mode.loanMultiplier * 1.04, bp.loanMultiplier[0], bp.loanMultiplier[1]);
       }
     });
     appliedFa.push(
-      "افزایش نرخ سود/کارمزد تا سقف قراردادی، ارتقای درآمد غیرمشاع و بهبود بازگشت منابع حلقه بسته",
+      "افزایش محسوس نرخ سود/کارمزد تا سقف قراردادی، ارتقای درآمد غیرمشاع و بهبود بازگشت منابع حلقه بسته",
     );
   }
 
@@ -1049,11 +1061,56 @@ function pickArchetypes(
   return chosen;
 }
 
-function pickContract(bp: ArchetypeBlueprint, request: ProductGenerationRequest, rng: Rng): ContractType {
+function pickContract(
+  bp: ArchetypeBlueprint,
+  request: ProductGenerationRequest,
+  rng: Rng,
+  contractHint?: ContractType | null,
+): ContractType {
+  // Market-intelligence bias: when the researched analogs of this archetype
+  // converge on one contract the market actually uses, prefer it if offered.
+  if (contractHint && bp.contracts.includes(contractHint)) {
+    const preferred = request.preferredContracts.includes(contractHint);
+    if (preferred || Math.floor(rng() * 3) > 0) return contractHint;
+  }
   const preferred = bp.contracts.filter((c) => request.preferredContracts.includes(c));
   const list = preferred.length ? preferred : bp.contracts;
   return list[Math.floor(rng() * list.length)];
 }
+
+/**
+ * Engine-parameter sampling ranges — the blueprint fields each sampler key maps
+ * onto. Market priors are expressed in these units through inverseLerp, so a
+ * median observed in the market is centred *inside* the feasible design space.
+ */
+const PRIOR_PARAM_RANGES: Record<
+  "rd" | "rl" | "tl" | "omega" | "alpha" | "beta" | "gamma" | "delta",
+  (bp: ArchetypeBlueprint) => [number, number]
+> = {
+  rd: (bp) => bp.depositRate,
+  rl: (bp) => bp.loanRate,
+  tl: (bp) => bp.tenorMonths,
+  omega: (bp) => bp.waitingMonths,
+  alpha: (bp) => bp.loanMultiplier,
+  beta: (bp) => bp.blockedRatio,
+  gamma: (bp) => bp.closedLoopRetention,
+  delta: (bp) => bp.withdrawalFraction,
+};
+
+/** Half-width (u-space) of the market-centred sampler; 0.5 keeps local exploration. */
+const PRIOR_SPREAD_U = 0.5;
+
+/** Sampler-key -> MarketStructuralParams key. */
+const PRIOR_MEDIAN_KEY: Record<"rd" | "rl" | "tl" | "omega" | "alpha" | "beta" | "gamma" | "delta", keyof MarketStructuralParams> = {
+  rd: "depositRate",
+  rl: "loanRate",
+  tl: "tenorMonths",
+  omega: "waitingMonths",
+  alpha: "loanMultiplier",
+  beta: "blockedRatio",
+  gamma: "closedLoopRetention",
+  delta: "withdrawalFraction",
+};
 
 /** Stage A/B/C — one candidate structure. */
 export function buildCandidate(
@@ -1062,11 +1119,26 @@ export function buildCandidate(
   rng: Rng,
   persona: PersonaSpec | null,
   gammaFloor: number,
+  priors?: MarketPriors | null,
 ): ProductSpec {
   const shares = randomUnitVector(rng, archetypes.length);
-  const weights = allocateWeights(archetypes, shares);
+  // Contracts are drawn first (with the market hint) so the weight allocation
+  // can see each tier's rate capability: a 26% IRR target cannot be carried by
+  // a 4%-commission Qarz tier, so when the profitability bar is high the
+  // water-filling LP tilts resource share toward margin-capable contracts —
+  // exactly how a real product-design unit blends a QH anchor with Morabaha
+  // yield tiers in a staggered matrix.
+  const contracts = archetypes.map(
+    (archetype) =>
+      pickContract(BLUEPRINTS[archetype], request, rng, priors?.byArchetype[archetype]?.contractHint),
+  );
+  const tiltedShares = request.targetIrr >= 0.24
+    ? shares.map((share, i) => share * Math.sqrt(contractRateCeiling(contracts[i])))
+    : shares;
+  const weights = allocateWeights(archetypes, tiltedShares);
   const modes = archetypes.map((archetype, i) => {
     const bp = BLUEPRINTS[archetype];
+    const prior = priors?.byArchetype[archetype];
     const params: Record<string, number> = {};
     (
       [
@@ -1089,13 +1161,25 @@ export function buildCandidate(
     ).forEach((key) => {
       params[key] = rng();
     });
+    if (prior) {
+      // Market-grounded sampling: centre each researchable knob on the median
+      // observed in the closest real products, jittered for local exploration.
+      const median = prior.median;
+      (
+        ["rd", "rl", "tl", "omega", "alpha", "beta", "gamma", "delta"] as const
+      ).forEach((key) => {
+        const range = PRIOR_PARAM_RANGES[key](bp);
+        const centreU = inverseLerp(range, median[PRIOR_MEDIAN_KEY[key]]);
+        params[key] = clamp(centreU + (rng() - 0.5) * PRIOR_SPREAD_U, 0, 1);
+      });
+    }
     // structural prior: stagger sleep periods across modes from the start
     params.td = clamp(0.2 + i * 0.18 + (rng() - 0.5) * 0.2, 0, 1);
     params.beta = clamp(params.beta * 0.8 + 0.15, 0, 1);
     params.gamma = clamp(params.gamma * 0.75 + 0.25, 0, 1);
     return buildMode(
       bp,
-      pickContract(bp, request, rng),
+      contracts[i],
       weights[i],
       request.targetDepositsRial,
       params,
@@ -1188,12 +1272,13 @@ export async function optimizeProduct(
   );
   const persona = options.persona ?? null;
   const gammaFloor = options.gammaFloor ?? 0;
+  const priors = options.priors ?? null;
   const riskLimits = effectiveRiskLimits(request);
 
   options.onProgress?.({
     stage: "optimizer:start",
-    messageFa: `آغاز حل معکوس MILP/MINLP با ${candidateCount} کاندید ساختاری و افق ${horizon} ماهه`,
-    messageEn: `Inverse MILP/MINLP solve with ${candidateCount} structural candidates over ${horizon} months`,
+    messageFa: `آغاز حل معکوس MILP/MINLP با ${candidateCount} کاندید ساختاری و افق ${horizon} ماهه${priors ? ` — نمونه‌گیری متمرکز روی میانه‌های ${Object.keys(priors.byArchetype).length} الگوی واقعی بازار` : ""}`,
+    messageEn: `Inverse MILP/MINLP solve with ${candidateCount} structural candidates over ${horizon} months${priors ? ` — market-centred sampling on ${Object.keys(priors.byArchetype).length} archetype prior(s)` : ""}`,
   });
 
   // ---- Stage A/B/C screening -------------------------------------------------
@@ -1210,6 +1295,7 @@ export async function optimizeProduct(
       createRng(seedValue + c * 7919),
       persona,
       gammaFloor,
+      priors,
     );
     const metrics = evaluateProduct(candidate, seedValue + c, horizon, riskLimits);
     const { score } = objectiveScore(metrics, request);
@@ -1239,7 +1325,7 @@ export async function optimizeProduct(
     const applied =
       it === 1
         ? { modes: refined.modes, appliedFa: ["انتخاب بهترین کاندید غربالگری‌شده به‌عنوان نقطه شروع"] }
-        : { modes: refined.modes, appliedFa: ["بازجستجوی مختصاتی محلی around incumbent"] };
+        : { modes: refined.modes, appliedFa: ["بازجست‌وجوی مختصاتی محلی حول ساختار فعلی"] };
 
     const alm = runAlmSimulation({
       product: refined,

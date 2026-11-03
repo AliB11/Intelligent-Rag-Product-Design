@@ -1,11 +1,69 @@
 /**
- * app/rag/seed_iran_banking_kb.py (benchmark registry half) -> TypeScript twin
+ * app/rag/seed_iran_banking_kb.py (market registry half) -> TypeScript twin
  * ---------------------------------------------------------------------------
- * Authentic Iranian banking product benchmarks used for retrieval and for
- * comparative evaluation of synthesized products.
+ * Researched registry of Iranian banking / fund / fintech products. Combines
+ * the original benchmark registry with a compiled market-research layer: every
+ * row carries its public source and — where known — the structural design
+ * parameters in engine space (τ_d, τ_l, ω, α, β, γ, δ, r_d, r_l) that feed the
+ * market-prior engine in `marketIntel.ts`.
+ *
+ * Values are calibrated samples compiled from public sources (bank product
+ * pages, press coverage, CBI directives). They must be re-verified against
+ * current Money & Credit Council directives before operational use.
  */
 
-import type { BenchmarkScheme, ContractType } from "../domain/types";
+import type { BenchmarkScheme, ContractType, ModeArchetype } from "../domain/types";
+
+export type MarketSourceType = "bank" | "fund" | "fintech" | "regulatory" | "press";
+
+/** Structural design parameters in engine space (engine units, not marketing text). */
+export interface MarketStructuralParams {
+  /** τ_d — deposit sleep / average-balance window (months). */
+  sleepMonths: number;
+  /** τ_l — repayment tenor (months). */
+  tenorMonths: number;
+  /** ω — waiting queue between sleep expiry and disbursement (months). */
+  waitingMonths: number;
+  /** α — facility multiplier over the weighted average balance. */
+  loanMultiplier: number;
+  /** β — contractually blocked fraction. */
+  blockedRatio: number;
+  /** γ — closed-loop retention of disbursed funds inside the same bank. */
+  closedLoopRetention: number;
+  /** δ — mean unblocked withdrawal fraction at disbursement. */
+  withdrawalFraction: number;
+  /** r_d — deposit rate / expected return (annual fraction). */
+  depositRate: number;
+  /** r_l — Morabaha profit rate or Qarz-ol-Hasanah commission (annual fraction). */
+  loanRate: number;
+}
+
+export interface MarketProduct {
+  code: string;
+  bank: string;
+  productFa: string;
+  productEn: string;
+  contract: ContractType;
+  archetype: ModeArchetype;
+  ceilingToman: number;
+  feeRate: number | null;
+  profitRate: number | null;
+  tenorMonths: number | null;
+  sleepMonths: number | null;
+  waitingDays: number | null;
+  loanToDepositRatio: number | null;
+  blockedRatio: number | null;
+  closedLoopRetention: number | null;
+  segmentFa: string;
+  segmentEn: string;
+  notesFa: string;
+  multiMode?: string[];
+  sourceType: MarketSourceType;
+  /** Short public-source reference, e.g. bank product page or press item. */
+  sourceRef: string;
+  /** Engine-space parameters used for prior derivation. */
+  params: MarketStructuralParams;
+}
 
 interface Raw {
   code: string;
@@ -13,6 +71,7 @@ interface Raw {
   productFa: string;
   productEn: string;
   contract: ContractType;
+  archetype: ModeArchetype;
   ceilingToman: number;
   feeRate?: number | null;
   profitRate?: number | null;
@@ -26,16 +85,21 @@ interface Raw {
   segmentEn: string;
   notesFa: string;
   multiMode?: string[];
+  sourceType: MarketSourceType;
+  sourceRef: string;
+  /** Engine-space parameters; missing fields fall back to the archetype default. */
+  params?: Partial<MarketStructuralParams>;
 }
 
 const RAW: Raw[] = [
   // ---------------- Bank Mehr Iran ----------------
   {
     code: "MEHR-NOURA",
-    bank: "بانک مهر ایران",
+    bank: "بانک قرض‌الحسنه مهر ایران",
     productFa: "طرح نورا",
     productEn: "Noura scheme",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 500e6,
     feeRate: 0,
     profitRate: 0,
@@ -45,29 +109,37 @@ const RAW: Raw[] = [
     segmentFa: "مشتریان خرد سپرده‌گذار",
     segmentEn: "Retail depositors",
     notesFa:
-      "سقف ۵۰۰ میلیون تومان، کارمزد صفر، دوره میانگین حساب ۱ تا ۳۶ ماه، اعطا بر مبنای امتیاز میانگین کارکرد حساب.",
+      "سقف ۴۰۰ تا ۵۰۰ میلیون تومان بدون کارمزد؛ مبنای پرداخت معدل موجودی حساب قرض‌الحسنه پس‌انداز؛ بازپرداخت ۱۸ تا ۶۰ ماه.",
+    sourceType: "bank",
+    sourceRef: "qmb.ir · rade.ir · namnak.com (شرایط طرح نورا)",
+    params: { sleepMonths: 6, tenorMonths: 36, waitingMonths: 2, loanMultiplier: 1.2, blockedRatio: 0, closedLoopRetention: 0.3, withdrawalFraction: 0.4, depositRate: 0, loanRate: 0 },
   },
   {
     code: "MEHR-NILOUFAR",
-    bank: "بانک مهر ایران",
+    bank: "بانک قرض‌الحسنه مهر ایران",
     productFa: "طرح نیلوفر",
     productEn: "Niloufar scheme",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 500e6,
     feeRate: 0.03,
-    tenorMonths: 36,
+    tenorMonths: 60,
     sleepMonths: 6,
     segmentFa: "مشتریان خرد با قابلیت انتقال امتیاز",
     segmentEn: "Retail with transferable points",
     notesFa:
       "سقف ۵۰۰ میلیون تومان، کارمزد ۲ تا ۴ درصد، امتیاز میانگین حساب قابل انتقال به بستگان درجه یک.",
+    sourceType: "bank",
+    sourceRef: "qmb.ir · entekhab.ir (شرایط طرح نیلوفر)",
+    params: { sleepMonths: 6, tenorMonths: 48, waitingMonths: 2, loanMultiplier: 1.4, blockedRatio: 0.08, closedLoopRetention: 0.32, withdrawalFraction: 0.38, depositRate: 0, loanRate: 0.03 },
   },
   {
     code: "MEHR-ORKIDEH",
-    bank: "بانک مهر ایران",
+    bank: "بانک قرض‌الحسنه مهر ایران",
     productFa: "طرح ارکیده",
     productEn: "Orkideh scheme",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 500e6,
     feeRate: 0.02,
     ldr: 2.0,
@@ -77,57 +149,74 @@ const RAW: Raw[] = [
     segmentFa: "ترکیب صندوق اجتماعی و منابع بانک",
     segmentEn: "Social fund + bank resources blend",
     notesFa:
-      "سقف ۲۰۰ تا ۵۰۰ میلیون تومان، نسبت تسهیلات به سپرده ۲۰۰ درصد، دوره انتظار ۳۰ تا ۱۲۰ روز، تأمین مالی ترکیبی از صندوق اجتماعی با نرخ صفر و منابع بانک با کارمزد ۴ درصد.",
+      "سقف ۲۰۰ تا ۵۰۰ میلیون تومان، توان مالی تا ۲ برابر سپرده، دوره انتظار ۳۰ تا ۱۲۰ روز، تأمین مالی ترکیبی از صندوق اجتماعی با نرخ صفر و منابع بانک با کارمزد ۴ درصد.",
     multiMode: ["صندوق اجتماعی ۰٪", "منابع بانک ۴٪"],
+    sourceType: "bank",
+    sourceRef: "qmb.ir · vista.ir · ghatreh.com (شرایط ارکیده)",
+    params: { sleepMonths: 4, tenorMonths: 30, waitingMonths: 2.5, loanMultiplier: 2.0, blockedRatio: 0.05, closedLoopRetention: 0.45, withdrawalFraction: 0.35, depositRate: 0, loanRate: 0.03 },
   },
   {
     code: "MEHR-NAJM",
-    bank: "بانک مهر ایران",
+    bank: "بانک قرض‌الحسنه مهر ایران",
     productFa: "طرح نجم",
     productEn: "Najm scheme",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 150e6,
     feeRate: 0.03,
     tenorMonths: 60,
     sleepMonths: 5,
     segmentFa: "اقشار آسیب‌پذیر و مناطق روستایی",
     segmentEn: "Vulnerable & rural segments",
-    notesFa: "سقف ۱۵۰ میلیون تومان، کارمزد ۲ تا ۴ درصد، بازپرداخت تا ۶۰ ماه.",
+    notesFa: "سقف ۱۵۰ میلیون تومان، کارمزد ۲ تا ۴ درصد، معدل‌گیری ۱ تا ۳۶ ماه، بازپرداخت تا ۶۰ ماه؛ حمایت از کم‌درآمدها.",
+    sourceType: "bank",
+    sourceRef: "qmb.ir · eghtesadonline.com (طرح نجم)",
+    params: { sleepMonths: 5, tenorMonths: 60, waitingMonths: 1.5, loanMultiplier: 1.0, blockedRatio: 0.04, closedLoopRetention: 0.25, withdrawalFraction: 0.45, depositRate: 0, loanRate: 0.03 },
   },
   {
     code: "MEHR-NARVAN",
-    bank: "بانک مهر ایران",
-    productFa: "طرح نارون",
-    productEn: "Narvan scheme",
+    bank: "بانک قرض‌الحسنه مهر ایران",
+    productFa: "طرح نارون (اصناف)",
+    productEn: "Narvan guild scheme",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 1e9,
     feeRate: 0.02,
     tenorMonths: 48,
     sleepMonths: 8,
-    segmentFa: "مشتریان میان‌رده",
-    segmentEn: "Mid-tier customers",
-    notesFa: "سقف ۱ میلیارد تومان، کارمزد صفر تا ۴ درصد، بازپرداخت ماهانه یا یکجا در سررسید.",
+    segmentFa: "اصناف، کسبه و صاحبان مشاغل",
+    segmentEn: "Guilds & shopkeepers",
+    notesFa: "مخصوص اصناف و کسبه؛ سقف تا ۱ میلیارد تومان، کارمزد صفر تا ۴ درصد، بازپرداخت ماهانه یا یکجا در سررسید.",
+    sourceType: "bank",
+    sourceRef: "qmb.ir · rade.ir (طرح نارون اصناف)",
+    params: { sleepMonths: 8, tenorMonths: 48, waitingMonths: 2, loanMultiplier: 1.6, blockedRatio: 0.12, closedLoopRetention: 0.55, withdrawalFraction: 0.32, depositRate: 0, loanRate: 0.03 },
   },
   {
     code: "MEHR-YAGHOUT",
-    bank: "بانک مهر ایران",
+    bank: "بانک قرض‌الحسنه مهر ایران",
     productFa: "طرح یاقوت",
     productEn: "Yaghout scheme",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 1.5e9,
     feeRate: 0.04,
     tenorMonths: 48,
     sleepMonths: 10,
-    segmentFa: "مشتریان ممتاز خرد",
-    segmentEn: "Premium retail",
-    notesFa: "سقف ۱٫۵ میلیارد تومان با کارمزد ۴ درصد.",
+    segmentFa: "کادر درمان و اعضای صندوق",
+    segmentEn: "Medical staff & fund members",
+    notesFa: "بالاترین ضریب با کمترین مسدودی؛ مناسب منابع پایدار و خوش‌حساب.",
+    multiMode: ["ضریب ۲٫۵", "مسدودی ۵٪"],
+    sourceType: "bank",
+    sourceRef: "qmb.ir (طرح یاقوت کادر درمان)",
+    params: { sleepMonths: 10, tenorMonths: 48, waitingMonths: 2, loanMultiplier: 2.4, blockedRatio: 0.05, closedLoopRetention: 0.5, withdrawalFraction: 0.28, depositRate: 0, loanRate: 0.04 },
   },
   {
     code: "MEHR-ALMAS",
-    bank: "بانک مهر ایران",
+    bank: "بانک قرض‌الحسنه مهر ایران",
     productFa: "طرح الماس",
     productEn: "Almas scheme",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 3e9,
     feeRate: 0.04,
     tenorMonths: 60,
@@ -135,6 +224,27 @@ const RAW: Raw[] = [
     segmentFa: "مشتریان ویژه و صاحبان کسب‌وکار",
     segmentEn: "Private & business owners",
     notesFa: "سقف ۳ میلیارد تومان با کارمزد ۴ درصد و دوره میانگین حساب بلندتر.",
+    sourceType: "bank",
+    sourceRef: "qmb.ir (طرح الماس)",
+    params: { sleepMonths: 12, tenorMonths: 60, waitingMonths: 2, loanMultiplier: 2.2, blockedRatio: 0.08, closedLoopRetention: 0.45, withdrawalFraction: 0.26, depositRate: 0, loanRate: 0.04 },
+  },
+  {
+    code: "MEHR-FIROUZEH",
+    bank: "بانک قرض‌الحسنه مهر ایران",
+    productFa: "طرح فیروزه (سازمان‌های طرف قرارداد)",
+    productEn: "Firouzeh contracted-payroll scheme",
+    contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
+    ceilingToman: 800e6,
+    feeRate: 0.02,
+    tenorMonths: 36,
+    sleepMonths: 7,
+    segmentFa: "کارکنان سازمان‌های طرف قرارداد",
+    segmentEn: "Contracted payroll staff",
+    notesFa: "طرح میانگین‌حسابی سازمان‌های طرف قرارداد با ضریب امتیاز افزایش‌یافته در جشنواره‌ها (جشنواره ۲۲).",
+    sourceType: "bank",
+    sourceRef: "qmb.ir (جشنواره ۲۲ مهر ایران)",
+    params: { sleepMonths: 7, tenorMonths: 36, waitingMonths: 2, loanMultiplier: 1.8, blockedRatio: 0.1, closedLoopRetention: 0.45, withdrawalFraction: 0.3, depositRate: 0, loanRate: 0.02 },
   },
 
   // ---------------- Tejarat Bank ----------------
@@ -143,7 +253,8 @@ const RAW: Raw[] = [
     bank: "بانک تجارت",
     productFa: "طرح ممتاز",
     productEn: "Momtaz scheme",
-    contract: "qarz-hasaneh",
+    contract: "morabaha",
+    archetype: "retail-qarz-average",
     ceilingToman: 700e6,
     feeRate: 0.04,
     sleepMonths: 6,
@@ -151,8 +262,11 @@ const RAW: Raw[] = [
     segmentFa: "خرد و پذیرندگان POS",
     segmentEn: "Retail & POS merchants",
     notesFa:
-      "سقف ۷۰۰ میلیون تومان برای مشتریان خرد و ۵ میلیارد تومان برای پذیرندگان POS؛ ماتریس قابل تنظیم دوره خواب، سررسید و نرخ در قالب عقود قرض‌الحسنه و مرابحه.",
+      "سقف ۷۰۰ میلیون تومان برای مشتریان خرد و ۵ میلیارد تومان برای پذیرندگان POS؛ ماتریس قابل تنظیم دوره خواب، سررسید و نرخ در قالب عقود قرض‌الحسنه و مرابحه (مرابحه ۱۴٪/۲۳٪ مطابق تحقیق بازار).",
     multiMode: ["خرد ۷۰۰ میلیون تومان", "پذیرنده ۵ میلیارد تومان"],
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir (طرح ممتاز)",
+    params: { sleepMonths: 6, tenorMonths: 36, waitingMonths: 2, loanMultiplier: 1.5, blockedRatio: 0.1, closedLoopRetention: 0.45, withdrawalFraction: 0.32, depositRate: 0.002, loanRate: 0.2 },
   },
   {
     code: "TEJARAT-HAMI",
@@ -160,6 +274,7 @@ const RAW: Raw[] = [
     productFa: "طرح حامی",
     productEn: "Hami scheme",
     contract: "morabaha",
+    archetype: "investment-deposit",
     ceilingToman: 500e6,
     profitRate: 0.23,
     sleepMonths: 4,
@@ -167,6 +282,9 @@ const RAW: Raw[] = [
     segmentFa: "خانوارها با انتقال امتیاز به بستگان",
     segmentEn: "Households with point transfer",
     notesFa: "میانگین حساب با عقد مرابحه و امکان انتقال امتیاز به بستگان درجه یک.",
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir (طرح حامی)",
+    params: { sleepMonths: 4, tenorMonths: 36, waitingMonths: 1.5, loanMultiplier: 1.1, blockedRatio: 0.08, closedLoopRetention: 0.4, withdrawalFraction: 0.32, depositRate: 0.15, loanRate: 0.23 },
   },
   {
     code: "TEJARAT-ECOVAM",
@@ -174,13 +292,18 @@ const RAW: Raw[] = [
     productFa: "اکووام",
     productEn: "Eco-Vam",
     contract: "morabaha",
+    archetype: "investment-deposit",
     ceilingToman: 400e6,
     profitRate: 0.23,
     sleepMonths: 5,
     tenorMonths: 48,
     segmentFa: "خرید کالای بادوام و انرژی",
     segmentEn: "Durable goods & energy efficiency",
-    notesFa: "تسهیلات میانگین حساب مرابحه‌ای با امکان انتقال امتیاز به بستگان درجه یک.",
+    notesFa:
+      "دو طرح متناسب با میانگین موجودی حساب جاری/پس‌انداز؛ تسهیلات مرابحه با نرخ سود ترجیحی برای کالای بادوام و بهینه‌سازی انرژی.",
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir/personal-banking/ECOVAM",
+    params: { sleepMonths: 5, tenorMonths: 48, waitingMonths: 1.5, loanMultiplier: 1.0, blockedRatio: 0.08, closedLoopRetention: 0.55, withdrawalFraction: 0.3, depositRate: 0.16, loanRate: 0.18 },
   },
   {
     code: "TEJARAT-TASHIL",
@@ -188,6 +311,7 @@ const RAW: Raw[] = [
     productFa: "طرح تسهیل",
     productEn: "Tashil scheme",
     contract: "morabaha",
+    archetype: "corporate-float-anchor",
     ceilingToman: 5e9,
     profitRate: 0.23,
     sleepMonths: 2,
@@ -197,6 +321,9 @@ const RAW: Raw[] = [
     notesFa:
       "بر مبنای شناور حساب جاری شرکتی؛ معرفی تسهیلات B2B2C پس از ۲ ماه ماندگاری منبع.",
     gamma: 0.7,
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir (طرح تسهیل)",
+    params: { sleepMonths: 2, tenorMonths: 36, waitingMonths: 1, loanMultiplier: 1.2, blockedRatio: 0.06, closedLoopRetention: 0.7, withdrawalFraction: 0.26, depositRate: 0.04, loanRate: 0.23 },
   },
   {
     code: "TEJARAT-KARNOVAM",
@@ -204,6 +331,7 @@ const RAW: Raw[] = [
     productFa: "کارنووام",
     productEn: "Karno Vam",
     contract: "qarz-hasaneh",
+    archetype: "corporate-float-anchor",
     ceilingToman: 300e6,
     feeRate: 0.04,
     sleepMonths: 1,
@@ -213,6 +341,9 @@ const RAW: Raw[] = [
     notesFa:
       "اعطای فوری به کارمند پس از نخستین واریز حقوق، بدون مسدودی صندوق شرکت و بدون انتظار.",
     gamma: 0.62,
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir (کارنووام)",
+    params: { sleepMonths: 1, tenorMonths: 36, waitingMonths: 0, loanMultiplier: 1.0, blockedRatio: 0.02, closedLoopRetention: 0.62, withdrawalFraction: 0.25, depositRate: 0.005, loanRate: 0.04 },
   },
   {
     code: "TEJARAT-KALANO-BNPL",
@@ -220,6 +351,7 @@ const RAW: Raw[] = [
     productFa: "کالانو و BNPL شخصی",
     productEn: "Kalano & personal BNPL",
     contract: "bnpl",
+    archetype: "merchant-pos-accelerator",
     ceilingToman: 500e6,
     profitRate: 0.23,
     tenorMonths: 24,
@@ -228,6 +360,9 @@ const RAW: Raw[] = [
     notesFa:
       "۱۵۰ میلیون تومان لوازم خانگی، ۵۰۰ میلیون تومان موتورسیکلت و تا ۱۰ هزار میلیارد ریال اعتبار شرکتی از طریق باجت با نرخ تا ۲۳ درصد.",
     multiMode: ["لوازم خانگی ۱۵۰ م.ت", "موتورسیکلت ۵۰۰ م.ت", "اعتبار شرکتی باجت"],
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir (کالانو)",
+    params: { sleepMonths: 2, tenorMonths: 24, waitingMonths: 1, loanMultiplier: 1.5, blockedRatio: 0.06, closedLoopRetention: 0.78, withdrawalFraction: 0.24, depositRate: 0.01, loanRate: 0.23 },
   },
   {
     code: "TEJARAT-PAYNO",
@@ -235,6 +370,7 @@ const RAW: Raw[] = [
     productFa: "پی‌نو (اعتبار یک‌شبه پذیرنده)",
     productEn: "Pay-No overnight merchant credit",
     contract: "qarz-hasaneh",
+    archetype: "merchant-pos-accelerator",
     ceilingToman: 500e6,
     feeRate: 0.02,
     tenorMonths: 1,
@@ -244,6 +380,9 @@ const RAW: Raw[] = [
     notesFa:
       "اعتبار فوری یک‌شبه تا ۵۰۰ میلیون تومان برای پذیرندگان درجه A و B و تا ۲۰۰ میلیون تومان برای درجه C با تسویه از محل گردش پایانه در روز کاری بعد.",
     gamma: 0.88,
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir (پی‌نو)",
+    params: { sleepMonths: 1, tenorMonths: 1, waitingMonths: 0, loanMultiplier: 2.2, blockedRatio: 0.02, closedLoopRetention: 0.88, withdrawalFraction: 0.15, depositRate: 0.008, loanRate: 0.02 },
   },
   {
     code: "TEJARAT-TEBNO",
@@ -251,6 +390,7 @@ const RAW: Raw[] = [
     productFa: "طب‌نو",
     productEn: "Teb-No healthcare BNPL",
     contract: "bnpl",
+    archetype: "merchant-pos-accelerator",
     ceilingToman: 200e6,
     profitRate: 0.18,
     tenorMonths: 24,
@@ -258,6 +398,9 @@ const RAW: Raw[] = [
     segmentEn: "Ophthalmology & medical patients",
     notesFa: "اعتبار درمانی ۲۰ تا ۲۰۰ میلیون تومان با تسویه مستقیم نزد مرکز درمانی طرف قرارداد.",
     gamma: 0.8,
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir (طب‌نو)",
+    params: { sleepMonths: 1, tenorMonths: 24, waitingMonths: 1, loanMultiplier: 1.6, blockedRatio: 0.04, closedLoopRetention: 0.8, withdrawalFraction: 0.2, depositRate: 0.008, loanRate: 0.18 },
   },
   {
     code: "TEJARAT-DENTALPLUS",
@@ -265,6 +408,7 @@ const RAW: Raw[] = [
     productFa: "دنتال پلاس",
     productEn: "Dental Plus",
     contract: "bnpl",
+    archetype: "merchant-pos-accelerator",
     ceilingToman: 200e6,
     profitRate: 0.18,
     tenorMonths: 24,
@@ -272,6 +416,9 @@ const RAW: Raw[] = [
     segmentEn: "Dentistry & clinic equipment",
     notesFa: "اعتبار دندانپزشکی و تأمین مالی تجهیزات کلینیک در قالب مرابحه/جعاله.",
     gamma: 0.76,
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir (دنتال پلاس)",
+    params: { sleepMonths: 1, tenorMonths: 24, waitingMonths: 1, loanMultiplier: 1.5, blockedRatio: 0.05, closedLoopRetention: 0.76, withdrawalFraction: 0.22, depositRate: 0.008, loanRate: 0.18 },
   },
   {
     code: "TEJARAT-HAMYARBAR",
@@ -279,6 +426,7 @@ const RAW: Raw[] = [
     productFa: "همیاربار",
     productEn: "Hamyar Bar freight financing",
     contract: "kharid-deyn",
+    archetype: "supply-chain-gam",
     ceilingToman: 350e6,
     profitRate: 0.15,
     tenorMonths: 6,
@@ -286,6 +434,9 @@ const RAW: Raw[] = [
     segmentEn: "Road-fleet drivers",
     notesFa: "تأمین مالی کرایه راننده با اتکای بارنامه ثبت‌شده و تسویه از حساب وکالتی.",
     gamma: 0.72,
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir (همیاربار)",
+    params: { sleepMonths: 1, tenorMonths: 6, waitingMonths: 1, loanMultiplier: 1.4, blockedRatio: 0.04, closedLoopRetention: 0.72, withdrawalFraction: 0.2, depositRate: 0.008, loanRate: 0.15 },
   },
   {
     code: "TEJARAT-SARMAYEH-BAN",
@@ -293,21 +444,104 @@ const RAW: Raw[] = [
     productFa: "سرمایه‌بان و امانات شمش ۲۴ عیار",
     productEn: "Sarmayeh-Ban & 24K bullion custody",
     contract: "mudaraba",
+    archetype: "investment-deposit",
     ceilingToman: 10e9,
     profitRate: 0.287,
     tenorMonths: 12,
     segmentFa: "سرمایه‌گذاران طلا و صندوق امانات",
     segmentEn: "Gold investors & safe deposit",
     notesFa: "سپرده تضمینی با بازده ۲۴ تا ۲۸٫۷ درصد همراه با خدمات نگهداری شمش ۲۴ عیار.",
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir (سرمایه‌بان) · سقف مطلق ۲۸٫۷٪ شورای پول و اعتبار",
+    params: { sleepMonths: 1, tenorMonths: 12, waitingMonths: 0, loanMultiplier: 0.8, blockedRatio: 0.03, closedLoopRetention: 0.3, withdrawalFraction: 0.2, depositRate: 0.25, loanRate: 0.287 },
+  },
+  {
+    code: "TEJARAT-AM-23",
+    bank: "بانک تجارت",
+    productFa: "گواهی سپرده عام ۲۳ درصد",
+    productEn: "Tejarat 23% general deposit certificate",
+    contract: "mudaraba",
+    archetype: "investment-deposit",
+    ceilingToman: 1e10,
+    profitRate: 0.23,
+    tenorMonths: 12,
+    sleepMonths: 1,
+    segmentFa: "سپرده‌گذاران خرد و کلان",
+    segmentEn: "Retail & wholesale depositors",
+    notesFa:
+      "اوراق گواهی سپرده مدت‌دار با سود علی‌الحساب ۲۳٪ سالانه و پرداخت ماهانه، معاف از مالیات؛ بازخرید پیش از سررسید ۱۵٪؛ در حدود ۲۵ بانک عرضه شده است.",
+    sourceType: "bank",
+    sourceRef: "tejaratbank.ir · dolat.ir (عرضه گواهی سپرده ۲۳٪ در ۲۵ بانک)",
+    params: { sleepMonths: 1, tenorMonths: 12, waitingMonths: 0, loanMultiplier: 0.55, blockedRatio: 0.02, closedLoopRetention: 0.2, withdrawalFraction: 0.25, depositRate: 0.23, loanRate: 0.23 },
+  },
+  {
+    code: "TEJARAT-GAM",
+    bank: "بانک تجارت",
+    productFa: "اوراق گام زنجیره تأمین تجارت",
+    productEn: "Tejarat supply-chain Gam",
+    contract: "gam",
+    archetype: "supply-chain-gam",
+    ceilingToman: 5e9,
+    profitRate: 0.19,
+    tenorMonths: 12,
+    sleepMonths: 2,
+    blocked: 0,
+    gamma: 0.85,
+    segmentFa: "تولیدکنندگان و تأمین‌کنندگان زنجیره",
+    segmentEn: "Industrial supply chain",
+    notesFa:
+      "گواهی اعتبار تجاری مبتنی بر فاکتور خرید مواد اولیه با ضمانت بانک؛ قابل انتقال و تنزیل در بازار پول و سرمایه.",
+    sourceType: "bank",
+    sourceRef: "learning.emofid.com · khobregan-sarmaye.com (سازوکار اوراق گام)",
+    params: { sleepMonths: 2, tenorMonths: 12, waitingMonths: 1, loanMultiplier: 1.4, blockedRatio: 0, closedLoopRetention: 0.85, withdrawalFraction: 0.2, depositRate: 0.01, loanRate: 0.19 },
   },
 
   // ---------------- Mellat ----------------
+  {
+    code: "MELLAT-SHAYAN",
+    bank: "بانک ملت",
+    productFa: "طرح شایان",
+    productEn: "Mellat Shayan scheme",
+    contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
+    ceilingToman: 1e9,
+    feeRate: 0.04,
+    tenorMonths: 60,
+    sleepMonths: 8,
+    ldr: 4.5,
+    segmentFa: "سپرده‌گذاران خرد تا میانه",
+    segmentEn: "Retail depositors",
+    notesFa:
+      "تسهیلات متناسب با معدل حساب (گزارش‌شده تا ۴۵۰٪ میانگین) در سقف مصوب شورای پول و اعتبار؛ بازپرداخت ۱۲ تا ۶۰ ماه با سپرده + ضامن.",
+    sourceType: "bank",
+    sourceRef: "sibche.com/blog (طرح‌های ملت) · digivam.app/mellat-bank",
+    params: { sleepMonths: 8, tenorMonths: 60, waitingMonths: 2, loanMultiplier: 2.4, blockedRatio: 0.2, closedLoopRetention: 0.4, withdrawalFraction: 0.3, depositRate: 0.001, loanRate: 0.04 },
+  },
+  {
+    code: "MELLAT-NIK",
+    bank: "بانک ملت",
+    productFa: "وام ۳۰۰ میلیونی (طرح نیک)",
+    productEn: "Mellat Nik 300M scheme",
+    contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
+    ceilingToman: 300e6,
+    feeRate: 0.02,
+    tenorMonths: 36,
+    sleepMonths: 5,
+    segmentFa: "مشتریان خرد",
+    segmentEn: "Retail customers",
+    notesFa: "کف ۳۰ میلیون تومان سپرده با ۴ تا ۱۲ ماه میانگین حساب و ضامن رسمی.",
+    sourceType: "bank",
+    sourceRef: "sibche.com/blog/mellat-bank-loan-facilities",
+    params: { sleepMonths: 5, tenorMonths: 36, waitingMonths: 2, loanMultiplier: 1.5, blockedRatio: 0.06, closedLoopRetention: 0.3, withdrawalFraction: 0.38, depositRate: 0.001, loanRate: 0.02 },
+  },
   {
     code: "MELLAT-SPECIALISTS",
     bank: "بانک ملت",
     productFa: "بسته متخصصان",
     productEn: "Specialists package",
     contract: "morabaha",
+    archetype: "corporate-float-anchor",
     ceilingToman: 7e9,
     profitRate: 0.18,
     tenorMonths: 60,
@@ -315,30 +549,77 @@ const RAW: Raw[] = [
     segmentEn: "Doctors, dentists & lawyers",
     notesFa: "از ۱٫۵ تا ۷ میلیارد تومان با نرخ ۱۸ درصد برای پزشکان و وکلا.",
     gamma: 0.68,
+    sourceType: "bank",
+    sourceRef: "bankmellat.ir (بسته متخصصان)",
+    params: { sleepMonths: 3, tenorMonths: 60, waitingMonths: 1.5, loanMultiplier: 1.1, blockedRatio: 0.06, closedLoopRetention: 0.68, withdrawalFraction: 0.26, depositRate: 0.03, loanRate: 0.18 },
   },
   {
     code: "MELLAT-PAZIRANDEGAN",
     bank: "بانک ملت",
     productFa: "تسهیلات پذیرندگان",
     productEn: "POS merchants facility",
-    contract: "qarz-hasaneh",
+    contract: "morabaha",
+    archetype: "merchant-pos-accelerator",
     ceilingToman: 2.3e9,
     feeRate: 0.04,
     profitRate: 0.18,
     tenorMonths: 36,
     segmentFa: "پذیرندگان پایانه فروش",
     segmentEn: "POS merchants",
-    notesFa: "سقف ۲٫۳ میلیارد تومان با ترکیب کارمزد ۴ درصد و نرخ ۱۸ درصد.",
+    notesFa: "سقف ۲٫۳ میلیارد تومان با ترکیب کارمزد ۴ درصد (پله قرض‌الحسنه) و نرخ ۱۸ درصد (پله مرابحه).",
     gamma: 0.8,
+    sourceType: "bank",
+    sourceRef: "bankmellat.ir (تسهیلات پذیرندگان)",
+    params: { sleepMonths: 2, tenorMonths: 36, waitingMonths: 1, loanMultiplier: 1.8, blockedRatio: 0.08, closedLoopRetention: 0.8, withdrawalFraction: 0.22, depositRate: 0.008, loanRate: 0.18 },
+  },
+  {
+    code: "MELLAT-TAMINYAR",
+    bank: "بانک ملت",
+    productFa: "کارت اعتباری تولیدی تأمین‌یار",
+    productEn: "Mellat Tamin-Yar productive card",
+    contract: "morabaha",
+    archetype: "supply-chain-gam",
+    ceilingToman: 5e9,
+    profitRate: 0.23,
+    tenorMonths: 18,
+    sleepMonths: 2,
+    gamma: 0.9,
+    segmentFa: "بنگاه‌های تولیدی زنجیره",
+    segmentEn: "Manufacturing chain firms",
+    notesFa:
+      "سقف فردی ۵ میلیارد تومان مطابق دستورالعمل؛ تسویه صرفاً نزد تأمین‌کنندگان ثبت‌شده همان زنجیره.",
+    sourceType: "regulatory",
+    sourceRef: "دستورالعمل کارت اعتباری تولیدی (بانک مرکزی)",
+    params: { sleepMonths: 2, tenorMonths: 18, waitingMonths: 1, loanMultiplier: 1.6, blockedRatio: 0.03, closedLoopRetention: 0.9, withdrawalFraction: 0.15, depositRate: 0.01, loanRate: 0.23 },
   },
 
-  // ---------------- Melli ----------------
+  // ---------------- Saderat / Melli ----------------
+  {
+    code: "SADERAT-AVERAGE-250",
+    bank: "بانک صادرات",
+    productFa: "تسهیلات برابری ۲۵۰ درصدی",
+    productEn: "Saderat 250% average-balance facility",
+    contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
+    ceilingToman: 1e9,
+    feeRate: 0.04,
+    tenorMonths: 36,
+    sleepMonths: 3,
+    ldr: 2.5,
+    segmentFa: "مشتریان حساب قرض‌الحسنه",
+    segmentEn: "QH account holders",
+    notesFa: "حداقل ۳ ماه میانگین حساب قرض‌الحسنه (حداقل ۱۰۰ میلیون تومان) با حفظ میانگین؛ ضریب وام به سپرده تا ۲۵۰٪.",
+    sourceType: "bank",
+    sourceRef: "lendo.ir/blog/saderat-loan",
+    params: { sleepMonths: 3, tenorMonths: 36, waitingMonths: 2, loanMultiplier: 1.9, blockedRatio: 0.15, closedLoopRetention: 0.42, withdrawalFraction: 0.3, depositRate: 0.001, loanRate: 0.04 },
+  },
   {
     code: "MELLI-SADAF",
     bank: "بانک ملی ایران",
     productFa: "طرح صدف",
     productEn: "Sadaf scheme",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 300e6,
     feeRate: 0.04,
     sleepMonths: 6,
@@ -346,32 +627,321 @@ const RAW: Raw[] = [
     segmentFa: "پزشکان، وکلا و اعضای هیئت علمی",
     segmentEn: "Doctors, lawyers & faculty",
     notesFa: "سقف ۳۰۰ میلیون تومان بر مبنای میانگین حساب جامعه هدف متخصصان.",
+    sourceType: "bank",
+    sourceRef: "bankmelli.ir (طرح صدف)",
+    params: { sleepMonths: 6, tenorMonths: 36, waitingMonths: 2, loanMultiplier: 1.2, blockedRatio: 0.06, closedLoopRetention: 0.35, withdrawalFraction: 0.3, depositRate: 0.001, loanRate: 0.04 },
+  },
+  {
+    code: "MELLI-JASHN-2X",
+    bank: "بانک ملی ایران",
+    productFa: "طرح جشنواره وام ملی (۲ برابر)",
+    productEn: "Melli festival 2x scheme",
+    contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
+    ceilingToman: 600e6,
+    feeRate: 0.04,
+    tenorMonths: 36,
+    sleepMonths: 6,
+    ldr: 2.0,
+    segmentFa: "سپرده‌گذاران خرد",
+    segmentEn: "Retail depositors",
+    notesFa: "دوره جشنواره‌ای با ضریب ۲ برابر سپرده و حفظ معدل؛ کارمزد قانونی ۴ درصد.",
+    sourceType: "press",
+    sourceRef: "bankmelli.ir (طرح‌های جشنواره‌ای)",
+    params: { sleepMonths: 6, tenorMonths: 36, waitingMonths: 2, loanMultiplier: 1.7, blockedRatio: 0.1, closedLoopRetention: 0.35, withdrawalFraction: 0.32, depositRate: 0.001, loanRate: 0.04 },
   },
 
-  // ---------------- Shahr ----------------
+  // ---------------- Maskan / private banks ----------------
   {
-    code: "SHAHR-MEDICAL",
-    bank: "بانک شهر",
-    productFa: "بسته پزشکی بانک شهر",
-    productEn: "Shahr medical package",
+    code: "MASKAN-DEPOSIT-FACILITY",
+    bank: "بانک مسکن",
+    productFa: "تسهیلات مبتنی بر سپرده مسکن",
+    productEn: "Maskan deposit-backed facility",
     contract: "morabaha",
-    ceilingToman: 5e9,
+    archetype: "investment-deposit",
+    ceilingToman: 3e9,
     profitRate: 0.23,
     tenorMonths: 60,
-    segmentFa: "پزشکان عمومی و متخصص",
-    segmentEn: "GPs & specialists",
-    notesFa: "سقف ۲ میلیارد تومان برای پزشک عمومی و ۵ میلیارد تومان برای متخصص با نرخ ۲۳ درصد و بازپرداخت ۶۰ ماهه.",
-    multiMode: ["پزشک عمومی ۲ م.ت", "متخصص ۵ م.ت"],
-    gamma: 0.7,
+    sleepMonths: 12,
+    ldr: 1.5,
+    segmentFa: "متقاضیان مسکن و سازندگان",
+    segmentEn: "Housing applicants & builders",
+    notesFa:
+      "الگوی کلاسیک سپرده‌گذاری بلندمدت (۱۰ تا ۱۲ ماه خواب) با ضریب تسهیلات ساخت/خرید مسکن و بازپرداخت بلندمدت.",
+    sourceType: "bank",
+    sourceRef: "bank-maskan.ir (سامانه‌های سپرده‌محور)",
+    params: { sleepMonths: 12, tenorMonths: 60, waitingMonths: 2, loanMultiplier: 1.5, blockedRatio: 0.1, closedLoopRetention: 0.35, withdrawalFraction: 0.25, depositRate: 0.19, loanRate: 0.23 },
+  },
+  {
+    code: "PARSIAN-BARAN",
+    bank: "بانک پارسیان",
+    productFa: "طرح باران",
+    productEn: "Parsian Baran scheme",
+    contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
+    ceilingToman: 700e6,
+    feeRate: 0.04,
+    tenorMonths: 36,
+    sleepMonths: 6,
+    ldr: 2.0,
+    segmentFa: "سپرده‌گذاران خرد و کارکنان طرف قرارداد",
+    segmentEn: "Retail & contracted payroll",
+    notesFa: "میانگین‌حسابی با ضریب حدود ۲ برابر سپرده و بازپرداخت ۲۴ تا ۳۶ ماه.",
+    sourceType: "bank",
+    sourceRef: "parsiabank.ir (طرح‌های میانگین‌حسابی)",
+    params: { sleepMonths: 6, tenorMonths: 36, waitingMonths: 2, loanMultiplier: 1.6, blockedRatio: 0.1, closedLoopRetention: 0.4, withdrawalFraction: 0.32, depositRate: 0.002, loanRate: 0.04 },
+  },
+  {
+    code: "SAMAN-CALAFORNIYA",
+    bank: "بانک سامان",
+    productFa: "تسهیلات خرید کالای ایرانی",
+    productEn: "Saman domestic-goods facility",
+    contract: "morabaha",
+    archetype: "merchant-pos-accelerator",
+    ceilingToman: 500e6,
+    profitRate: 0.23,
+    tenorMonths: 24,
+    sleepMonths: 3,
+    gamma: 0.8,
+    segmentFa: "خریداران کالا از فروشگاه‌های طرف قرارداد",
+    segmentEn: "Contracted retail buyers",
+    notesFa: "مرابحه کالایی با تسویه مستقیم نزد فروشنده طرف قرارداد؛ حلقه بسته فروشگاهی قوی.",
+    sourceType: "bank",
+    sourceRef: "sb24.ir (تسهیلات کالایی)",
+    params: { sleepMonths: 3, tenorMonths: 24, waitingMonths: 1, loanMultiplier: 1.5, blockedRatio: 0.08, closedLoopRetention: 0.8, withdrawalFraction: 0.28, depositRate: 0.012, loanRate: 0.23 },
+  },
+  {
+    code: "PASARGAD-SALARY",
+    bank: "بانک پاسارگاد",
+    productFa: "تسهیلات حقوق‌بگیران",
+    productEn: "Pasargad payroll facility",
+    contract: "morabaha",
+    archetype: "corporate-float-anchor",
+    ceilingToman: 1e9,
+    profitRate: 0.23,
+    tenorMonths: 48,
+    sleepMonths: 3,
+    ldr: 1.5,
+    segmentFa: "کارکنان سازمان‌های طرف قرارداد",
+    segmentEn: "Contracted payroll employees",
+    notesFa:
+      "شناوری حقوق ماهانه به‌عنوان منبع کم‌هزینه؛ واریز حقوق + کسر اقساط از حقوق؛ قرض‌الحسنه کارکنان در کنار مرابحه مصرفی.",
+    sourceType: "bank",
+    sourceRef: "bpi.ir · tabnak.ir (سهم قرض‌الحسنه پاسارگاد به کارکنان)",
+    params: { sleepMonths: 3, tenorMonths: 48, waitingMonths: 1, loanMultiplier: 1.3, blockedRatio: 0.05, closedLoopRetention: 0.75, withdrawalFraction: 0.25, depositRate: 0.03, loanRate: 0.23 },
+  },
+  {
+    code: "PASARGAD-GOLD",
+    bank: "بانک پاسارگاد",
+    productFa: "گواهی سپرده پشتوانه طلا",
+    productEn: "Pasargad gold-backed certificate",
+    contract: "morabaha",
+    archetype: "investment-deposit",
+    ceilingToman: 5e9,
+    profitRate: 0.28,
+    tenorMonths: 12,
+    sleepMonths: 1,
+    segmentFa: "سرمایه‌گذاران طلا و شمش",
+    segmentEn: "Gold investors",
+    notesFa:
+      "ابزارهای خاص شمش‌محور تا نرخ مطلق ۲۸٫۷٪ مطابق مصوبه شورای پول و اعتبار؛ تسویه به شمش یا ریال.",
+    sourceType: "bank",
+    sourceRef: "bpi.ir · مصوبه سقف ۲۸٫۷٪ شورای پول و اعتبار",
+    params: { sleepMonths: 1, tenorMonths: 12, waitingMonths: 0, loanMultiplier: 0.8, blockedRatio: 0.03, closedLoopRetention: 0.3, withdrawalFraction: 0.2, depositRate: 0.25, loanRate: 0.28 },
+  },
+  {
+    code: "KARAFARIN-SALARY",
+    bank: "بانک کارآفرین",
+    productFa: "بسته اعتباری حقوق‌بگیران",
+    productEn: "Karafarin payroll credit package",
+    contract: "morabaha",
+    archetype: "corporate-float-anchor",
+    ceilingToman: 800e6,
+    profitRate: 0.23,
+    tenorMonths: 36,
+    sleepMonths: 3,
+    ldr: 1.4,
+    segmentFa: "کارکنان حقوق‌بگیر",
+    segmentEn: "Salaried employees",
+    notesFa: "اعتبار مصرفی در قالب مرابحه با کسر از حقوق؛ شناوری حقوق منبع پایدار بانک است.",
+    sourceType: "bank",
+    sourceRef: "karafarinbank.ir (بسته‌های حقوق‌بگیران)",
+    params: { sleepMonths: 3, tenorMonths: 36, waitingMonths: 1, loanMultiplier: 1.2, blockedRatio: 0.05, closedLoopRetention: 0.7, withdrawalFraction: 0.28, depositRate: 0.03, loanRate: 0.23 },
   },
 
-  // ---------------- Medical Welfare Fund ----------------
+  // ---------------- Resalat / agriculture / cooperative ----------------
+  {
+    code: "RESALAT-MULTIMODE",
+    bank: "بانک قرض‌الحسنه رسالت",
+    productFa: "ماتریس چندطرحی رسالت",
+    productEn: "Resalat multi-tier QH matrix",
+    contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
+    ceilingToman: 1e9,
+    feeRate: 0.04,
+    tenorMonths: 48,
+    sleepMonths: 5,
+    ldr: 2.0,
+    blocked: 0.25,
+    segmentFa: "مشتریان خرد و صندوق‌های محلی",
+    segmentEn: "Retail & local funds",
+    notesFa:
+      "پله‌های ۲٫۰x با مسدودی ۲۵٪ تا ۰٫۵x بدون مسدودی و اولویت اعطا؛ الگوی مرجع پلکانی‌سازی ریسک واژگونی در بانک قرض‌الحسنه.",
+    multiMode: ["ضریب ۲٫۰", "ضریب ۱٫۰", "ضریب ۰٫۵ اولویت‌دار"],
+    sourceType: "bank",
+    sourceRef: "rqbank.ir (ماتریس تسهیلات)",
+    params: { sleepMonths: 5, tenorMonths: 48, waitingMonths: 2, loanMultiplier: 1.9, blockedRatio: 0.22, closedLoopRetention: 0.4, withdrawalFraction: 0.3, depositRate: 0.001, loanRate: 0.04 },
+  },
+  {
+    code: "KESHAVARZI-NEJAT",
+    bank: "بانک کشاورزی",
+    productFa: "طرح نجات (خرید دین نهاده کشاورزی)",
+    productEn: "Keshavarzi Nejat input factoring",
+    contract: "kharid-deyn",
+    archetype: "supply-chain-gam",
+    ceilingToman: 2e9,
+    profitRate: 0.2,
+    tenorMonths: 12,
+    sleepMonths: 2,
+    gamma: 0.75,
+    segmentFa: "کشاورزان و دامداران",
+    segmentEn: "Farmers & livestock keepers",
+    notesFa:
+      "خرید دین محصول/فاکتور نهاده با تسویه در محل فروش محصول؛ کیف پول کشاورز در همان بانک نگه داشته می‌شود.",
+    sourceType: "bank",
+    sourceRef: "bk-aghala.ir (طرح‌های زنجیره کشاورزی)",
+    params: { sleepMonths: 2, tenorMonths: 12, waitingMonths: 1, loanMultiplier: 1.3, blockedRatio: 0.05, closedLoopRetention: 0.75, withdrawalFraction: 0.22, depositRate: 0.012, loanRate: 0.2 },
+  },
+  {
+    code: "TAAVON-GAM",
+    bank: "بانک توسعه تعاون",
+    productFa: "اوراق گام توسعه تعاون",
+    productEn: "Tose-Tavon Gam certificates",
+    contract: "gam",
+    archetype: "supply-chain-gam",
+    ceilingToman: 5e9,
+    profitRate: 0.19,
+    tenorMonths: 15,
+    sleepMonths: 2,
+    blocked: 0,
+    gamma: 0.88,
+    segmentFa: "تعاونی‌ها و زنجیره توزیع",
+    segmentEn: "Cooperatives & distribution chains",
+    notesFa:
+      "تأمین مالی زنجیره تعاونی با معافیت‌های نظارتی از ۱۴۰۱؛ تسویه صرفاً درون زنجیره ثبت‌شده.",
+    sourceType: "bank",
+    sourceRef: "btdt.ir · report.mrc.ir (معافیت‌های نظارتی اوراق گام)",
+    params: { sleepMonths: 2, tenorMonths: 15, waitingMonths: 1, loanMultiplier: 1.4, blockedRatio: 0, closedLoopRetention: 0.88, withdrawalFraction: 0.18, depositRate: 0.01, loanRate: 0.19 },
+  },
+  {
+    code: "KESHAVARZI-AM-215",
+    bank: "بانک کشاورزی",
+    productFa: "اوراق سپرده کشاورزی ۲۱٫۵ درصد",
+    productEn: "Keshavarzi 21.5% deposit paper",
+    contract: "mudaraba",
+    archetype: "investment-deposit",
+    ceilingToman: 1e10,
+    profitRate: 0.215,
+    tenorMonths: 12,
+    sleepMonths: 1,
+    segmentFa: "سپرده‌گذاران خرد",
+    segmentEn: "Retail depositors",
+    notesFa: "از پر‌سودترین اوراق سپرده معمولی شبکه؛ سقف مصوب سود سپرده ۲۲٫۵ درصد.",
+    sourceType: "press",
+    sourceRef: "rade.ir (مقایسه سود سپرده‌ها) · مصوبه شورای پول و اعتبار",
+    params: { sleepMonths: 1, tenorMonths: 12, waitingMonths: 0, loanMultiplier: 0.6, blockedRatio: 0.02, closedLoopRetention: 0.22, withdrawalFraction: 0.24, depositRate: 0.215, loanRate: 0.23 },
+  },
+
+  // ---------------- Fintech BNPL ----------------
+  {
+    code: "DIGIPAY-BNPL-4",
+    bank: "دیجی‌پی (گروه دیجی‌کالا)",
+    productFa: "خرید اقساطی ۴ قسطی",
+    productEn: "Digipay 4-instalment BNPL",
+    contract: "bnpl",
+    archetype: "merchant-pos-accelerator",
+    ceilingToman: 40e6,
+    feeRate: 0.03,
+    tenorMonths: 3,
+    sleepMonths: 1,
+    gamma: 0.85,
+    segmentFa: "خریداران آنلاین با رتبه اعتباری",
+    segmentEn: "Credit-ranked online shoppers",
+    notesFa:
+      "اعتبار تا ۴۰ میلیون تومان در ۴ قسط بدون سود برای خریدار؛ کارمزد و تخفیف فروش از پذیرنده دریافت می‌شود؛ رتبه‌بندی رفتاری.",
+    sourceType: "fintech",
+    sourceRef: "zoomit.ir · omidbodagh.ir (پلتفرم‌های BNPL)",
+    params: { sleepMonths: 1, tenorMonths: 3, waitingMonths: 0, loanMultiplier: 1.8, blockedRatio: 0.03, closedLoopRetention: 0.85, withdrawalFraction: 0.2, depositRate: 0.015, loanRate: 0.06 },
+  },
+  {
+    code: "DIGIPAY-BNPL-6",
+    bank: "دیجی‌پی (گروه دیجی‌کالا)",
+    productFa: "اعتبار خرید ۶ قسطی ۱۰۰ میلیونی",
+    productEn: "Digipay 6-instalment 100M credit",
+    contract: "bnpl",
+    archetype: "merchant-pos-accelerator",
+    ceilingToman: 100e6,
+    feeRate: 0.04,
+    tenorMonths: 6,
+    sleepMonths: 1,
+    gamma: 0.8,
+    segmentFa: "کاربران وفادار با سابقه رتبه اعتباری",
+    segmentEn: "Loyal credit-ranked users",
+    notesFa:
+      "ارتقای سقف اعتبار به ۱۰۰ میلیون تومان و بازپرداخت تا ۶ قسط؛ حدود ۹۸٪ سفارش‌های دیجی‌پی با BNPL انجام می‌شود.",
+    sourceType: "fintech",
+    sourceRef: "digiato.com (ارتقای BNPL دیجی‌پی)",
+    params: { sleepMonths: 1, tenorMonths: 6, waitingMonths: 0, loanMultiplier: 2.0, blockedRatio: 0.03, closedLoopRetention: 0.8, withdrawalFraction: 0.22, depositRate: 0.015, loanRate: 0.08 },
+  },
+  {
+    code: "SNAPPPAY-MERCHANT",
+    bank: "اسنپ‌پی",
+    productFa: "اعتبار پذیرندگان اسنپ‌پی",
+    productEn: "Snapppay merchant credit",
+    contract: "bnpl",
+    archetype: "merchant-pos-accelerator",
+    ceilingToman: 200e6,
+    feeRate: 0.035,
+    tenorMonths: 6,
+    sleepMonths: 1,
+    gamma: 0.88,
+    segmentFa: "پذیرندگان POS و فروشگاه‌های آنلاین",
+    segmentEn: "POS & online merchants",
+    notesFa:
+      "اعتبار خرید به مشتریان پذیرنده با تسویه مستقیم نزد فروشنده؛ حلقه بسته درون‌زیست‌بومی اسنپ.",
+    sourceType: "fintech",
+    sourceRef: "snapppay.ir (شرایط اعتبار پذیرندگان)",
+    params: { sleepMonths: 1, tenorMonths: 6, waitingMonths: 0, loanMultiplier: 1.9, blockedRatio: 0.03, closedLoopRetention: 0.88, withdrawalFraction: 0.2, depositRate: 0.015, loanRate: 0.07 },
+  },
+  {
+    code: "SNAPP-CREDIT",
+    bank: "اسنپ (اعتبار سفر)",
+    productFa: "اعتبار سفر و خدمات اسنپ",
+    productEn: "Snapp travel credit",
+    contract: "bnpl",
+    archetype: "merchant-pos-accelerator",
+    ceilingToman: 20e6,
+    feeRate: 0.02,
+    tenorMonths: 2,
+    sleepMonths: 1,
+    gamma: 0.92,
+    segmentFa: "کاربران سوپراپلیکیشن اسنپ",
+    segmentEn: "Super-app users",
+    notesFa:
+      "اعتبار خرد گردشی برای خدمات درون‌اپ (سفر، ارسال) با بازگشت تقریباً کامل به اکوسیستم خود (γ بسیار بالا).",
+    sourceType: "fintech",
+    sourceRef: "snapp.ir (اعتبار خدمات)",
+    params: { sleepMonths: 1, tenorMonths: 2, waitingMonths: 0, loanMultiplier: 2.2, blockedRatio: 0.02, closedLoopRetention: 0.92, withdrawalFraction: 0.15, depositRate: 0.012, loanRate: 0.05 },
+  },
+
+  // ---------------- Welfare / medical funds ----------------
   {
     code: "FUND-MULTIMODE-25",
     bank: "صندوق رفاه و درمان",
     productFa: "طرح ضریب ۲٫۵ با مسدودی ۵٪",
     productEn: "2.5x multiplier with 5% block",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 1e9,
     feeRate: 0.04,
     ldr: 2.5,
@@ -382,6 +952,9 @@ const RAW: Raw[] = [
     segmentEn: "Medical staff & fund members",
     notesFa: "بالاترین ضریب با کمترین مسدودی؛ مناسب منابع پایدار و خوش‌حساب.",
     multiMode: ["ضریب ۲٫۵", "مسدودی ۵٪"],
+    sourceType: "fund",
+    sourceRef: "ماتریس تسهیلات صندوق رفاه و درمان",
+    params: { sleepMonths: 6, tenorMonths: 36, waitingMonths: 2, loanMultiplier: 2.4, blockedRatio: 0.05, closedLoopRetention: 0.45, withdrawalFraction: 0.28, depositRate: 0.001, loanRate: 0.04 },
   },
   {
     code: "FUND-MULTIMODE-20",
@@ -389,6 +962,7 @@ const RAW: Raw[] = [
     productFa: "طرح ضریب ۲٫۰ با آزادسازی ۵۰٪ اقساط",
     productEn: "2.0x with 50% instalment unlock",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 1e9,
     feeRate: 0.04,
     ldr: 2.0,
@@ -398,6 +972,9 @@ const RAW: Raw[] = [
     segmentFa: "کادر درمان",
     segmentEn: "Medical staff",
     notesFa: "آزادسازی مسدودی پس از بازپرداخت ۵۰ درصد از اقساط.",
+    sourceType: "fund",
+    sourceRef: "ماتریس تسهیلات صندوق رفاه و درمان",
+    params: { sleepMonths: 5, tenorMonths: 36, waitingMonths: 2, loanMultiplier: 2.0, blockedRatio: 0.5, closedLoopRetention: 0.4, withdrawalFraction: 0.3, depositRate: 0.001, loanRate: 0.04 },
   },
   {
     code: "FUND-MULTIMODE-18",
@@ -405,6 +982,7 @@ const RAW: Raw[] = [
     productFa: "طرح ضریب ۱٫۸ با مسدودی ۳۵٪",
     productEn: "1.8x with 35% block",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 800e6,
     feeRate: 0.04,
     ldr: 1.8,
@@ -414,6 +992,9 @@ const RAW: Raw[] = [
     segmentFa: "کادر درمان و پیراپزشکی",
     segmentEn: "Medical & paramedical staff",
     notesFa: "تعادل بین ضریب تسهیلات و مسدودی برای کاهش ریسک واژگونی.",
+    sourceType: "fund",
+    sourceRef: "ماتریس تسهیلات صندوق رفاه و درمان",
+    params: { sleepMonths: 4, tenorMonths: 30, waitingMonths: 2, loanMultiplier: 1.8, blockedRatio: 0.35, closedLoopRetention: 0.4, withdrawalFraction: 0.3, depositRate: 0.001, loanRate: 0.04 },
   },
   {
     code: "FUND-MULTIMODE-10",
@@ -421,6 +1002,7 @@ const RAW: Raw[] = [
     productFa: "طرح ضریب ۱٫۰ بدون مسدودی",
     productEn: "1.0x with no block",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 600e6,
     feeRate: 0.04,
     ldr: 1.0,
@@ -430,6 +1012,9 @@ const RAW: Raw[] = [
     segmentFa: "اعضای جدید صندوق",
     segmentEn: "New fund members",
     notesFa: "بدون مسدودی و با دوره خواب بلندتر برای جبران نبود ضمانت نقدی.",
+    sourceType: "fund",
+    sourceRef: "ماتریس تسهیلات صندوق رفاه و درمان",
+    params: { sleepMonths: 6, tenorMonths: 24, waitingMonths: 2, loanMultiplier: 1.0, blockedRatio: 0, closedLoopRetention: 0.35, withdrawalFraction: 0.35, depositRate: 0.001, loanRate: 0.04 },
   },
   {
     code: "FUND-MULTIMODE-08",
@@ -437,6 +1022,7 @@ const RAW: Raw[] = [
     productFa: "طرح ضریب ۰٫۸ با اولویت اعطا",
     productEn: "0.8x with disbursement priority",
     contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
     ceilingToman: 500e6,
     feeRate: 0.04,
     ldr: 0.8,
@@ -447,40 +1033,210 @@ const RAW: Raw[] = [
     segmentFa: "موارد اضطراری و درمانی",
     segmentEn: "Emergency & medical cases",
     notesFa: "ضریب کمتر از یک با اعطای فوری و بدون صف انتظار.",
+    sourceType: "fund",
+    sourceRef: "ماتریس تسهیلات صندوق رفاه و درمان",
+    params: { sleepMonths: 3, tenorMonths: 24, waitingMonths: 0, loanMultiplier: 0.8, blockedRatio: 0, closedLoopRetention: 0.35, withdrawalFraction: 0.4, depositRate: 0.001, loanRate: 0.04 },
+  },
+  {
+    code: "FUND-SBB-MARRIAGE",
+    bank: "صندوق بازنشستگی کارکنان بانک‌ها",
+    productFa: "قرض‌الحسنه ازدواج اعضا",
+    productEn: "Bank-staff pension fund marriage loan",
+    contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
+    ceilingToman: 500e6,
+    feeRate: 0.04,
+    tenorMonths: 48,
+    sleepMonths: 6,
+    segmentFa: "بازنشستگان و کارکنان بانک‌ها",
+    segmentEn: "Bank staff & pensioners",
+    notesFa: "سقف ازدواج ۵۰۰ میلیون تومان با امکان افزایش با موافقت ارکان صندوق؛ بازپرداخت کسر از حقوق/حق نظارت.",
+    sourceType: "fund",
+    sourceRef: "sbbiran.ir (سقف قرض‌الحسنه ازدواج)",
+    params: { sleepMonths: 6, tenorMonths: 48, waitingMonths: 2, loanMultiplier: 1.1, blockedRatio: 0.05, closedLoopRetention: 0.5, withdrawalFraction: 0.25, depositRate: 0.002, loanRate: 0.04 },
+  },
+  {
+    code: "FUND-QH-CAP-15",
+    bank: "صندوق‌های قرض‌الحسنه (نوع اول تا سوم)",
+    productFa: "سقف مصوب صندوق‌های قرض‌الحسنه",
+    productEn: "Statutory fund loan ceiling",
+    contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
+    ceilingToman: 150e6,
+    feeRate: 0.04,
+    tenorMonths: 36,
+    sleepMonths: 4,
+    segmentFa: "اعضای صندوق محلی",
+    segmentEn: "Local fund members",
+    notesFa: "سقف تسهیلات به هر شخص در صندوق‌های نوع اول تا سوم ۱٫۵ میلیارد ریال مصوب شده است.",
+    sourceType: "regulatory",
+    sourceRef: "donya-e-eqtesad (تغییر سقف صندوق‌های قرض‌الحسنه)",
+    params: { sleepMonths: 4, tenorMonths: 36, waitingMonths: 1, loanMultiplier: 0.9, blockedRatio: 0.05, closedLoopRetention: 0.3, withdrawalFraction: 0.4, depositRate: 0.001, loanRate: 0.04 },
+  },
+
+  // ---------------- Regulatory programs ----------------
+  {
+    code: "CBI-GAM-PROGRAM-350",
+    bank: "بانک مرکزی — برنامه زنجیره‌ای",
+    productFa: "برنامه ۳۵۰ همتی ابزارهای زنجیره‌ای",
+    productEn: "CBI 350-Hemmat chain-finance program",
+    contract: "gam",
+    archetype: "supply-chain-gam",
+    ceilingToman: 5e9,
+    profitRate: 0.19,
+    tenorMonths: 12,
+    sleepMonths: 2,
+    blocked: 0,
+    gamma: 0.9,
+    segmentFa: "کل زنجیره تولید کشور",
+    segmentEn: "National production chains",
+    notesFa:
+      "برنامه تأمین مالی ۳۵۰ همتی با ابزارهای زنجیره‌ای در ۱۴۰۳ و انتشار ۶۱ هزار میلیارد تومان اوراق گام؛ الگوی مرجع مقیاس‌پذیری حلقه بسته صنعتی.",
+    sourceType: "regulatory",
+    sourceRef: "cbi.ir/datedlist/23461.aspx (برنامه تأمین مالی زنجیره‌ای)",
+    params: { sleepMonths: 2, tenorMonths: 12, waitingMonths: 1, loanMultiplier: 1.5, blockedRatio: 0, closedLoopRetention: 0.9, withdrawalFraction: 0.15, depositRate: 0.01, loanRate: 0.19 },
+  },
+  {
+    code: "MARITAL-QH-STATE",
+    bank: "شبکه بانکی (سیستمی)",
+    productFa: "قرض‌الحسنه ازدواج و فرزندآوری",
+    productEn: "State marriage & childbirth QH",
+    contract: "qarz-hasaneh",
+    archetype: "retail-qarz-average",
+    ceilingToman: 300e6,
+    feeRate: 0.04,
+    tenorMonths: 60,
+    sleepMonths: 3,
+    segmentFa: "زوجین واجد شرایط",
+    segmentEn: "Eligible couples",
+    notesFa:
+      "تسهیلات قرض‌الحسنه ازدواج ۱٫۵ میلیارد ریالی برای زوجین واجد شرایط؛ در ۱۴۰۵ بودجه ۳۵۰ همت ازدواج و ۸۵ همت فرزندآوری ابلاغ شد.",
+    sourceType: "regulatory",
+    sourceRef: "dolat.ir · qavanin.ir (بخشنامه ازدواج) · خبرآنلاین (۴۳۵ همت ۱۴۰۵)",
+    params: { sleepMonths: 3, tenorMonths: 60, waitingMonths: 1.5, loanMultiplier: 1.0, blockedRatio: 0.03, closedLoopRetention: 0.28, withdrawalFraction: 0.45, depositRate: 0, loanRate: 0.04 },
+  },
+  {
+    code: "TEJARAT-KHAS-30",
+    bank: "بانک تجارت",
+    productFa: "گواهی سپرده خاص ۳۰ درصد (ابلاغی)",
+    productEn: "30% special deposit certificate",
+    contract: "mudaraba",
+    archetype: "investment-deposit",
+    ceilingToman: 1e10,
+    profitRate: 0.3,
+    tenorMonths: 12,
+    sleepMonths: 1,
+    segmentFa: "تأمین سرمایه پروژه‌های خاص",
+    segmentEn: "Project funding",
+    notesFa:
+      "دستورالعمل گواهی سپرده خاص با سود علی‌الحساب ۳۰٪ ماهانه برای تأمین سرمایه پروژه‌های خاص ابلاغ بانک مرکزی.",
+    sourceType: "regulatory",
+    sourceRef: "donya-e-eqtesad (ابلاغ دستورالعمل گواهی سپرده خاص ۳۰٪)",
+    params: { sleepMonths: 1, tenorMonths: 12, waitingMonths: 0, loanMultiplier: 0.7, blockedRatio: 0.02, closedLoopRetention: 0.25, withdrawalFraction: 0.22, depositRate: 0.25, loanRate: 0.23 },
   },
 ];
 
-export const BENCHMARK_SCHEMES: BenchmarkScheme[] = RAW.map((r) => ({
-  code: r.code,
-  bank: r.bank,
-  productFa: r.productFa,
-  productEn: r.productEn,
-  contractType: r.contract,
-  ceilingToman: r.ceilingToman,
-  feeRate: r.feeRate ?? null,
-  profitRate: r.profitRate ?? null,
-  tenorMonths: r.tenorMonths ?? null,
-  sleepMonths: r.sleepMonths ?? null,
-  waitingDays: r.waitingDays ?? null,
-  loanToDepositRatio: r.ldr ?? null,
-  blockedRatio: r.blocked ?? null,
-  closedLoopRetention: r.gamma ?? null,
-  segmentFa: r.segmentFa,
-  segmentEn: r.segmentEn,
-  notesFa: r.notesFa,
-  multiMode: r.multiMode,
+// Engine-space defaults per archetype; fills any field a source row does not specify.
+export const ARCHETYPE_PARAM_FALLBACK: Record<ModeArchetype, MarketStructuralParams> = {
+  "retail-qarz-average": {
+    sleepMonths: 6, tenorMonths: 36, waitingMonths: 2, loanMultiplier: 1.2,
+    blockedRatio: 0.15, closedLoopRetention: 0.35, withdrawalFraction: 0.4,
+    depositRate: 0.002, loanRate: 0.03,
+  },
+  "investment-deposit": {
+    sleepMonths: 4, tenorMonths: 36, waitingMonths: 1, loanMultiplier: 0.85,
+    blockedRatio: 0.1, closedLoopRetention: 0.3, withdrawalFraction: 0.3,
+    depositRate: 0.17, loanRate: 0.21,
+  },
+  "merchant-pos-accelerator": {
+    sleepMonths: 4, tenorMonths: 18, waitingMonths: 1, loanMultiplier: 1.6,
+    blockedRatio: 0.12, closedLoopRetention: 0.7, withdrawalFraction: 0.32,
+    depositRate: 0.01, loanRate: 0.1,
+  },
+  "corporate-float-anchor": {
+    sleepMonths: 3, tenorMonths: 36, waitingMonths: 1, loanMultiplier: 1.1,
+    blockedRatio: 0.1, closedLoopRetention: 0.65, withdrawalFraction: 0.28,
+    depositRate: 0.04, loanRate: 0.15,
+  },
+  "supply-chain-gam": {
+    sleepMonths: 2, tenorMonths: 15, waitingMonths: 1, loanMultiplier: 1.4,
+    blockedRatio: 0.05, closedLoopRetention: 0.75, withdrawalFraction: 0.2,
+    depositRate: 0.01, loanRate: 0.14,
+  },
+};
+
+export const MARKET_PRODUCTS: MarketProduct[] = RAW.map((raw) => {
+  const fallback = ARCHETYPE_PARAM_FALLBACK[raw.archetype];
+  const params: MarketStructuralParams = {
+    sleepMonths: raw.params?.sleepMonths ?? fallback.sleepMonths,
+    tenorMonths: raw.params?.tenorMonths ?? fallback.tenorMonths,
+    waitingMonths: raw.params?.waitingMonths ?? fallback.waitingMonths,
+    loanMultiplier: raw.params?.loanMultiplier ?? fallback.loanMultiplier,
+    blockedRatio: raw.params?.blockedRatio ?? raw.blocked ?? fallback.blockedRatio,
+    closedLoopRetention: raw.params?.closedLoopRetention ?? raw.gamma ?? fallback.closedLoopRetention,
+    withdrawalFraction: raw.params?.withdrawalFraction ?? fallback.withdrawalFraction,
+    depositRate: raw.params?.depositRate ?? fallback.depositRate,
+    loanRate: raw.params?.loanRate ?? raw.profitRate ?? raw.feeRate ?? fallback.loanRate,
+  };
+  return {
+    code: raw.code,
+    bank: raw.bank,
+    productFa: raw.productFa,
+    productEn: raw.productEn,
+    contract: raw.contract,
+    archetype: raw.archetype,
+    ceilingToman: raw.ceilingToman,
+    feeRate: raw.feeRate ?? null,
+    profitRate: raw.profitRate ?? null,
+    tenorMonths: raw.tenorMonths ?? null,
+    sleepMonths: raw.sleepMonths ?? null,
+    waitingDays: raw.waitingDays ?? null,
+    loanToDepositRatio: raw.ldr ?? null,
+    blockedRatio: raw.blocked ?? null,
+    closedLoopRetention: raw.gamma ?? null,
+    segmentFa: raw.segmentFa,
+    segmentEn: raw.segmentEn,
+    notesFa: raw.notesFa,
+    multiMode: raw.multiMode,
+    sourceType: raw.sourceType,
+    sourceRef: raw.sourceRef,
+    params,
+  };
+});
+
+/** Benchmark view kept for PostgreSQL seeding and the comparison API. */
+export const BENCHMARK_SCHEMES: BenchmarkScheme[] = MARKET_PRODUCTS.map((product) => ({
+  code: product.code,
+  bank: product.bank,
+  productFa: product.productFa,
+  productEn: product.productEn,
+  contractType: product.contract,
+  ceilingToman: product.ceilingToman,
+  feeRate: product.feeRate,
+  profitRate: product.profitRate,
+  tenorMonths: product.tenorMonths,
+  sleepMonths: product.sleepMonths,
+  waitingDays: product.waitingDays,
+  loanToDepositRatio: product.loanToDepositRatio,
+  blockedRatio: product.blockedRatio,
+  closedLoopRetention: product.closedLoopRetention,
+  segmentFa: product.segmentFa,
+  segmentEn: product.segmentEn,
+  notesFa: product.notesFa,
+  multiMode: product.multiMode,
 }));
 
+/** Lexical benchmark search retained for the API/report layers. */
 export function searchBenchmarks(query: string, limit = 12): BenchmarkScheme[] {
-  const tokens = query.toLowerCase().split(/[\s,،.;؛]+/).filter((t) => t.length > 1);
+  const tokens = query.toLowerCase().split(/[\s,،.;؛]+/).filter((token) => token.length > 1);
   if (!tokens.length) return BENCHMARK_SCHEMES.slice(0, limit);
-  const scored = BENCHMARK_SCHEMES.map((b) => {
-    const haystack = `${b.bank} ${b.productFa} ${b.productEn} ${b.segmentFa} ${b.segmentEn} ${b.notesFa} ${b.contractType}`.toLowerCase();
-    const hits = tokens.filter((t) => haystack.includes(t)).length;
-    return { b, hits };
+  const scored = BENCHMARK_SCHEMES.map((benchmark) => {
+    const haystack = `${benchmark.bank} ${benchmark.productFa} ${benchmark.productEn} ${benchmark.segmentFa} ${benchmark.segmentEn} ${benchmark.notesFa} ${benchmark.contractType}`.toLowerCase();
+    const hits = tokens.filter((token) => haystack.includes(token)).length;
+    return { benchmark, hits };
   })
-    .filter((s) => s.hits > 0)
-    .sort((a, b) => b.hits - a.hits)
-    .slice(0, limit);
-  return scored.length ? scored.map((s) => s.b) : BENCHMARK_SCHEMES.slice(0, limit);
+    .filter((item) => item.hits > 0)
+    .sort((a, b) => b.hits - a.hits);
+  const list = scored.length ? scored.map((item) => item.benchmark) : BENCHMARK_SCHEMES;
+  return list.slice(0, limit);
 }

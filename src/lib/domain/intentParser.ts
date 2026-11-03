@@ -69,6 +69,9 @@ const PERSONA_KEYWORDS: { key: string; words: string[] }[] = [
   { key: "industrial-supplier", words: ["زنجیره تامین", "زنجیره تأمین", "تولید", "صنعتی", "کارخانه", "گام", "supply chain", "industrial", "manufactur", "gam"] },
   { key: "gold-jeweller", words: ["طلا", "طلافروش", "شمش", "gold", "jewel", "bullion"] },
   { key: "retail-vulnerable", words: ["آسیب پذیر", "آسیب‌پذیر", "روستا", "روستایی", "سرپرست خانوار", "محروم", "vulnerable", "rural", "low income"] },
+  { key: "student-community", words: ["دانشجو", "دانشجویان", "دانشگاه", "محصل", "student", "university"] },
+  { key: "exporter-importer", words: ["صادرکننده", "صادرات", "واردکننده", "واردات", "تجارت خارجی", "exporter", "export", "import"] },
+  { key: "agri-farmer", words: ["کشاورز", "کشاورزی", "دامدار", "نهاده", "باغدار", "farmer", "agricultur"] },
 ];
 
 const CONTRACT_KEYWORDS: { contract: ContractType; words: string[] }[] = [
@@ -77,8 +80,8 @@ const CONTRACT_KEYWORDS: { contract: ContractType; words: string[] }[] = [
   { contract: "joalah", words: ["جعاله", "joalah", "jua'lah"] },
   { contract: "kharid-deyn", words: ["خرید دین", "خرید‌دین", "factoring", "kharid", "deyn", "طالبی"] },
   { contract: "gam", words: ["گام", "gam certificate", "supply chain bond", "اوراق گام"] },
-  { contract: "mudaraba", words: ["مضاربه", "سپرده سرمایه گذاری", "سپرده سرمایه‌گذاری", "mudaraba", "investment deposit"] },
-  { contract: "bnpl", words: ["bnpl", "اعتبار مصرفی", "خرید اقساطی", "لندتک"] },
+  { contract: "mudaraba", words: ["مضاربه", "سپرده سرمایه گذاری", "سپرده سرمایه‌گذاری", "گواهی سپرده", "اوراق سپرده", "mudaraba", "investment deposit", "deposit certificate"] },
+  { contract: "bnpl", words: ["bnpl", "اعتبار مصرفی", "خرید اقساطی", "لندتک", "فروش اقساطی"] },
 ];
 
 const EMPHASIS_KEYWORDS: { key: string; words: string[] }[] = [
@@ -88,6 +91,11 @@ const EMPHASIS_KEYWORDS: { key: string; words: string[] }[] = [
   { key: "financial-inclusion", words: ["محروم", "آسیب پذیر", "روستایی", "inclusion", "vulnerable"] },
   { key: "merchant-float", words: ["پذیرنده", "merchant", "pos", "درگاه"] },
   { key: "supply-chain", words: ["زنجیره تامین", "زنجیره تأمین", "supply chain", "گام"] },
+  { key: "zero-fee", words: ["بدون کارمزد", "کارمزد صفر", "بدون سود برای مشتری", "no fee", "zero fee"] },
+  { key: "no-blocking", words: ["بدون مسدودی", "مسدودی صفر", "بدون بلوکه", "no blocking", "no block"] },
+  { key: "fast-disbursal", words: ["اولویت اعطا", "اعطای فوری", "پرداخت فوری", "سرعت اعطا", "instant", "fast disbursal"] },
+  { key: "salary-float", words: ["واریز حقوق", "کسر از حقوق", "حقوق‌بگیر", "payroll", "salary"] },
+  { key: "deposit-certificate", words: ["گواهی سپرده", "اوراق سپرده", "سپرده خاص", "deposit certificate"] },
 ];
 
 interface NumericCapture {
@@ -304,6 +312,11 @@ export function parseIntent(rawPrompt: string, overrides: IntentOverrides = {}):
   }
   if (emphases.includes("financial-inclusion") || emphases.includes("closed-loop"))
     lambdas.lambda2Adoption += 0.06;
+  // customer-experience emphases tilt the objective toward adoption and away
+  // from pure margin: zero-fee / instant-disbursal products must stay adoptable.
+  if (emphases.includes("zero-fee") || emphases.includes("fast-disbursal"))
+    lambdas.lambda2Adoption += 0.07;
+  if (emphases.includes("salary-float")) lambdas.lambda3LdrPenalty += 0.03;
   const lsum =
     lambdas.lambda1Irr + lambdas.lambda2Adoption + lambdas.lambda3LdrPenalty + lambdas.lambda4Overturning;
   lambdas.lambda1Irr /= lsum;

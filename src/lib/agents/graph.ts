@@ -36,6 +36,7 @@ import {
 } from "../domain/guildValueChain";
 import { retrieveKnowledge } from "../rag/knowledgeBase";
 import { searchBenchmarks } from "../rag/benchmarks";
+import { analyzeMarket } from "../rag/marketIntel";
 import type { ProductSpec } from "../domain/types";
 import {
   createInitialState,
@@ -43,6 +44,7 @@ import {
   StateGraph,
   type AgentState,
   type Emit,
+  type MarketIntel,
   type SensitivityFrame,
   type TraceEvent,
 } from "./state";
@@ -163,6 +165,67 @@ function regulatoryRagNode(state: AgentState, emit: Emit) {
     titleFa: `${bench.length} بنچمارک بازار ایران برای مقایسه بارگذاری شد: ${bench.map((b) => b.productFa).join("، ")}`,
     titleEn: `Loaded ${bench.length} Iranian market benchmarks: ${bench.map((b) => b.productEn).join(", ")}`,
   });
+
+  // Market intelligence: retrieve the closest real products and derive the
+  // archetype-level structural medians that centre the optimizer sampler.
+  const market = analyzeMarket({
+    prompt: req.prompt,
+    personaKey: req.personaKey,
+    guild: req.guild,
+    preferredContracts: req.preferredContracts,
+    emphases: req.emphases,
+    targetDepositsHemmat: req.targetDepositsHemmat,
+  });
+  const intel: MarketIntel = {
+    analogs: market.analogs.map(({ product, score, reasonsFa }) => ({
+      code: product.code,
+      bank: product.bank,
+      productFa: product.productFa,
+      productEn: product.productEn,
+      contract: product.contract,
+      archetype: product.archetype,
+      segmentFa: product.segmentFa,
+      ceilingToman: product.ceilingToman,
+      feeRate: product.feeRate,
+      profitRate: product.profitRate,
+      tenorMonths: product.tenorMonths,
+      sleepMonths: product.sleepMonths,
+      loanToDepositRatio: product.loanToDepositRatio,
+      blockedRatio: product.blockedRatio,
+      closedLoopRetention: product.closedLoopRetention,
+      sourceType: product.sourceType,
+      sourceRef: product.sourceRef,
+      score: Math.round(score * 100) / 100,
+      reasonsFa,
+      params: { ...product.params },
+    })),
+    priors: market.byArchetype,
+    coverage: market.coverage,
+    analogCount: market.analogCount,
+  };
+  state.marketIntel = intel;
+
+  const priorKeys = Object.keys(market.byArchetype);
+  emit({
+    node: "regulatory_rag",
+    stage: "market:analogs",
+    level: "ok",
+    titleFa: `${intel.analogCount} محصول واقعی هم‌خانواده از ثبت‌نام بازار بازیابی شد (پوشش ${(intel.coverage * 100).toFixed(0)}٪) و میانه ساختاری ${priorKeys.length} الگو به‌عنوان اولویت نمونه‌گیری تزریق شد`,
+    titleEn: `Retrieved ${intel.analogCount} real market analogs (coverage ${(intel.coverage * 100).toFixed(0)}%); structural medians of ${priorKeys.length} archetype(s) injected as sampler priors`,
+    detailFa: intel.analogs
+      .slice(0, 6)
+      .map((a) => `• ${a.bank} — ${a.productFa} (${a.sourceType}) — امتیاز ${a.score} — ${a.reasonsFa.join("، ")}`)
+      .join("\n"),
+    detailEn: intel.analogs
+      .slice(0, 6)
+      .map((a) => `• ${a.bank} — ${a.productEn} (${a.sourceType}) — score ${a.score}`)
+      .join("\n"),
+    metrics: {
+      analogCount: intel.analogCount,
+      coveragePct: Math.round(intel.coverage * 100),
+      archetypesWithPrior: priorKeys.length,
+    },
+  });
 }
 
 /** Node 3 — guild / persona tripartite closed-loop ecosystem. */
@@ -204,6 +267,7 @@ async function mathematicalSynthesizerNode(
   state.iteration += 1;
 
   if (state.iteration === 1 || !state.product) {
+    const priorCount = Object.keys(state.marketIntel?.priors ?? {}).length;
     const solve = await optimizeProduct(req, {
       candidates: options.candidates ?? 26,
       maxIterations: 1,
@@ -216,6 +280,14 @@ async function mathematicalSynthesizerNode(
       forcedArchetypes:
         req.modeCount > 1 ? state.ecosystem?.recommendedModes.slice(0, req.modeCount) : undefined,
       gammaFloor: state.ecosystem ? state.ecosystem.gammaTarget : 0,
+      priors: priorCount
+        ? {
+            byArchetype: state.marketIntel!.priors,
+            analogs: [],
+            coverage: state.marketIntel!.coverage,
+            analogCount: state.marketIntel!.analogCount,
+          }
+        : null,
       onProgress: (p) =>
         emit({
           node: "mathematical_synthesizer",

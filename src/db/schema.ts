@@ -70,6 +70,7 @@ export const generationRuns = pgTable("generation_runs", {
   iterations: integer("iterations").notNull(),
   intent: jsonb("intent").notNull(),
   retrievedConstraints: jsonb("retrieved_constraints").notNull(),
+  marketIntel: jsonb("market_intel"),
   guild: jsonb("guild"),
   persona: jsonb("persona"),
   findings: jsonb("findings").notNull().default([]),

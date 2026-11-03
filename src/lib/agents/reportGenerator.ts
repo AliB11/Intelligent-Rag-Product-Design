@@ -17,7 +17,22 @@ import { ARCHETYPE_LABEL_FA, CONTRACT_LABEL_FA } from "../domain/guildValueChain
 import { effectiveRiskLimits } from "../domain/optimizer";
 import { searchBenchmarks } from "../rag/benchmarks";
 import type { AlmResult, BenchmarkScheme, ModeSpec, ProductSpec, RegulatoryConstraint } from "../domain/types";
-import type { AccountingEntry, AgentState, ComplianceDraftItem } from "./state";
+import type { AccountingEntry, AgentState, ComplianceDraftItem, MarketIntel } from "./state";
+
+/** One-line Persian summary of a synthesized mode vs its market prior median. */
+function modeMarketDeviationFa(mode: ModeSpec, intel: MarketIntel | null): string {
+  const prior = intel?.priors[mode.archetype];
+  if (!prior) return "الگوی هم‌خانواده کافی در بازار یافت نشد؛ طراحی مبتنی بر حدود موتور است.";
+  const m = prior.median;
+  const parts = [
+    `τ_d ${mode.sleepMonths} ماه در برابر میانه ${Number(m.sleepMonths.toFixed(1))}`,
+    `α ${mode.loanMultiplier.toFixed(2)} در برابر ${Number(m.loanMultiplier.toFixed(2))}`,
+    `β ${(mode.blockedRatio * 100).toFixed(0)}٪ در برابر ${(m.blockedRatio * 100).toFixed(0)}٪`,
+    `γ ${(mode.closedLoopRetention * 100).toFixed(0)}٪ در برابر ${(m.closedLoopRetention * 100).toFixed(0)}٪`,
+    `r_l ${(mode.loanRate * 100).toFixed(1)}٪ در برابر ${(m.loanRate * 100).toFixed(1)}٪`,
+  ];
+  return `انحراف از میانه ${prior.analogCount} محصول واقعی (${prior.analogCodes.slice(0, 3).join("، ")}): ${parts.join(" | ")}`;
+}
 
 const bToman = (rial: number) => rial / 1e10; // میلیارد تومان
 const fmtBT = (rial: number, digits = 1) => formatNumberFa(bToman(rial), digits);
@@ -351,7 +366,24 @@ export function buildExecutiveReportFa(state: AgentState): string {
       )
       .join("\n"),
     "",
-    "## ۱۰) ریسک‌های باقیمانده و توصیه‌های اجرا",
+    "## ۱۰) تحلیل تطبیقی بازار (Market Fit)",
+    state.marketIntel
+      ? [
+          `**پوشش بازیابی بازار:** ${(state.marketIntel.coverage * 100).toFixed(0)}٪ — ${state.marketIntel.analogCount} محصول واقعی هم‌خانواده از ثبت‌نام ${state.marketIntel.analogs.length >= 12 ? "کامل" : "منتخب"} بازیابی شد.`,
+          "",
+          ...state.marketIntel.analogs
+            .slice(0, 8)
+            .map(
+              (a) =>
+                `- **${a.bank} — ${a.productFa}** (${a.sourceType === "bank" ? "وب‌سایت بانک" : a.sourceType === "fund" ? "صندوق" : a.sourceType === "fintech" ? "فین‌تک" : a.sourceType === "regulatory" ? "مقررات" : "منابع خبری"}): امتیاز تطابق ${a.score} — ${a.reasonsFa.join("، ") || "—"}`,
+            ),
+          "",
+          "**انحراف طرح سنتزشده از میانه بازار:**",
+          ...product.modes.map((mode) => `- «${mode.nameFa}»: ${modeMarketDeviationFa(mode, state.marketIntel)}`),
+        ]
+      : ["- تحلیل تطبیقی بازار برای این درخواست در دسترس نیست."],
+    "",
+    "## ۱۱) ریسک‌های باقیمانده و توصیه‌های اجرا",
     `- مانیتورینگ ماهانه p95 LDR و p5 LCR در داشبورد ALCO با هشدار خودکار در آستانه ${formatPercent(REGULATORY.ldrWarning)}.`,
     `- فعال‌سازی آزادسازی پلکانی مسدودی تنها پس از تأیید خوش‌حسابی در سامانه اعتبارسنجی.`,
     `- انعقاد قرارداد تسویه مستقیم با تأمین‌کنندگان و پذیرندگان جهت تضمین γ ≥ ${formatPercent(product.blendedClosedLoopRetention, 0)} در عملیات واقعی.`,
@@ -400,6 +432,15 @@ export function buildExecutiveReportEn(state: AgentState): string {
     "",
     "## Retrieved CBI constraints",
     ...state.constraints.map((c) => `- **${c.titleEn}** (${c.authority}) — relevance ${(c.relevance * 100).toFixed(0)}%`),
+    "",
+    "## Market fit",
+    ...(state.marketIntel
+      ? [
+          `Retrieval coverage ${(state.marketIntel.coverage * 100).toFixed(0)}% — ${state.marketIntel.analogCount} real market analogs.`,
+          ...state.marketIntel.analogs.slice(0, 6).map((a) => `- **${a.bank} — ${a.productEn}** (${a.sourceType}) — match score ${a.score}; ${a.reasonsFa.join(", ") || "-"}`),
+          ...product.modes.map((mode) => `- ${mode.nameEn}: ${modeMarketDeviationFa(mode, state.marketIntel)}`),
+        ]
+      : ["- No market-fit analysis for this request."]),
     "",
     "## Self-correction trace",
     ...state.iterations.map(
