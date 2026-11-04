@@ -327,11 +327,11 @@ function unitAssertions(): Assertion[] {
   out.push(
     assert(
       "U-OPT-04",
-      "پوشش پنج کهن‌الگوی ساختاری در موتور سنتز",
-      "Five structural archetypes available to the synthesiser",
-      "5",
+      "پوشش شش کهن‌الگوی ساختاری در موتور سنتز (پنج پایه + اعتبار امتیازی سپرده‌محور)",
+      "Six structural archetypes available to the synthesiser (five base + scored deposit-backed credit)",
+      "6",
       String(blueprintKeys.length),
-      blueprintKeys.length === 5,
+      blueprintKeys.length === 6 && blueprintKeys.includes("scored-deposit-credit"),
     ),
   );
 
@@ -1057,6 +1057,52 @@ export function runMarketIntelCase(): TestCaseResult {
       `equal=${serialise(withPriorsA) === serialise(withPriorsB)}; differs=${serialise(withPriorsA) !== serialise(withoutPriors)}`,
       serialise(withPriorsA) === serialise(withPriorsB) &&
         serialise(withPriorsA) !== serialise(withoutPriors),
+    ),
+  );
+
+  // M-07 — the market-learned coupling of the scored-deposit-credit family
+  // (نیک/نگین/مهربانی matrices) is monotone: α grows with (τ_d, τ_l) patience
+  // and the rate ladder descends as the customer waits longer.
+  const scoredBp = BLUEPRINTS["scored-deposit-credit"];
+  const scoredBase = (over: Record<string, number>): Record<string, number> => ({
+    rr: 0.5, rd: 0.1, rl: 0.5, td: 0.5, tl: 0.5, omega: 0.5, alpha: 0.5,
+    beta: 0.2, gamma: 0.6, delta: 0.4, fee: 0.4, cap: 0.5, adoption: 0.6,
+    pd: 0.4, lgd: 0.4, ...over,
+  });
+  const shortPatience = buildMode(scoredBp, "morabaha", 0.3, 9 * HEMMAT_RIAL, scoredBase({ td: 0.02, tl: 0.0, omega: 0.0 }), null, 0);
+  const longPatience = buildMode(scoredBp, "morabaha", 0.3, 9 * HEMMAT_RIAL, scoredBase({ td: 1.0, tl: 1.0, omega: 1.0 }), null, 0);
+  out.push(
+    assert(
+      "M-07",
+      "اتصال ماتریس امتیازی نیک/نگین: صبر بیشتر (τ_d، τ_l، ω) ضریب اعتبار را بالا و نرخ را پایین می‌برد",
+      "The scored-family market coupling is monotone: longer patience raises the facility multiplier and lowers the rate",
+      `α(long) > 1.5×α(short); r_l(long) < r_l(short)`,
+      `α ${shortPatience.loanMultiplier.toFixed(2)} → ${longPatience.loanMultiplier.toFixed(2)}; r_l ${(shortPatience.loanRate * 100).toFixed(1)}% → ${(longPatience.loanRate * 100).toFixed(1)}%`,
+      longPatience.loanMultiplier > shortPatience.loanMultiplier * 1.5 &&
+        longPatience.loanRate < shortPatience.loanRate,
+    ),
+  );
+
+  // M-08 — the three researched flagship products exist and the Mehraban fee
+  // ladder (0/2/4% by ticket size) is reproduced by the engine.
+  const flagshipCodes = ["MELLAT-NIK-SCORED", "SEPAH-NEGIN-FARAPOUYA", "MELLI-MEHRABAN"];
+  const flagshipsPresent = flagshipCodes.every((code) =>
+    MARKET_PRODUCTS.some((p) => p.code === code && p.archetype === "scored-deposit-credit"),
+  );
+  const feeLadder = [30e6, 60e6, 300e6].map((cap) =>
+    buildMode(scoredBp, "qarz-hasaneh", 0.3, 9 * HEMMAT_RIAL, scoredBase({ capExact: cap }), null, 0).loanRate,
+  );
+  out.push(
+    assert(
+      "M-08",
+      "سه محصول امتیازی شاخص در ثبت‌نام هستند و نردبان کارمزد مهربانی (۰/۲/۴٪) بازتولید می‌شود",
+      "The three flagship scored products exist and the Mehraban 0/2/4% fee ladder is reproduced",
+      "flagships present; ladder ≈ [0, 2%, 4%]",
+      `present=${flagshipsPresent}; ladder=${feeLadder.map((r) => `${(r * 100).toFixed(1)}%`).join("/")}`,
+      flagshipsPresent &&
+        feeLadder[0] === 0 &&
+        Math.abs(feeLadder[1] - 0.02) < 1e-9 &&
+        Math.abs(feeLadder[2] - 0.04) < 1e-9,
     ),
   );
 

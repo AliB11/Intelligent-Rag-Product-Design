@@ -222,6 +222,33 @@ export const BLUEPRINTS: Record<ModeArchetype, ArchetypeBlueprint> = {
     opexRatio: 0.024,
     blockRelease: "end",
   },
+  "scored-deposit-credit": {
+    archetype: "scored-deposit-credit",
+    nameFa: "اعتبار امتیازی سپرده‌محور (الگوی نیک/نگین/مهربانی)",
+    nameEn: "Scored deposit-backed credit (Nik / Negin / Mehraban pattern)",
+    contracts: ["qarz-hasaneh", "morabaha"],
+    capacityShare: 0.32,
+    statutoryReserve: [0.02, 0.1],
+    depositRate: [0.0, 0.05],
+    loanRate: [0.05, 0.23],
+    sleepMonths: [4, 12],
+    tenorMonths: [12, 60],
+    loanMultiplier: [0.6, 3.0],
+    blockedRatio: [0.0, 0.15],
+    waitingMonths: [0, 6],
+    closedLoopRetention: [0.55, 0.9],
+    withdrawalFraction: [0.15, 0.35],
+    sourceKappa: 1.2,
+    feeIncomeRate: [0.002, 0.006],
+    capToman: [150e6, 1e9],
+    avgDepositPerCustomerToman: 60e6,
+    pd: [0.01, 0.022],
+    lgd: [0.15, 0.28],
+    adoption: [0.75, 0.96],
+    liquidityDeduction: 0.012,
+    opexRatio: 0.032,
+    blockRelease: "linear",
+  },
 };
 
 export interface SolveOptions {
@@ -365,7 +392,7 @@ export function buildMode(
   });
 
   const rateCeiling = contractRateCeiling(contract);
-  const loanRate = params.rlExact !== undefined
+  let loanRate = params.rlExact !== undefined
     ? clamp(params.rlExact, 0, rateCeiling)
     : clamp(lerp(blueprint.loanRate, params.rl ?? 0.6), 0, rateCeiling);
 
@@ -380,7 +407,7 @@ export function buildMode(
   const waitingMonths = Math.round(params.omegaExact !== undefined
     ? clamp(params.omegaExact, 0, 12)
     : lerp(blueprint.waitingMonths, params.omega ?? 0.4));
-  const loanMultiplier = params.alphaExact !== undefined
+  let loanMultiplier = params.alphaExact !== undefined
     ? clamp(params.alphaExact, 0, 3)
     : lerp(blueprint.loanMultiplier, params.alpha ?? 0.5);
   const blockedRatio = params.betaExact !== undefined
@@ -404,6 +431,41 @@ export function buildMode(
   const adoptionScore = params.adoptionExact !== undefined
     ? clamp(params.adoptionExact, 0, 1)
     : lerp(blueprint.adoption, params.adoption ?? 0.6);
+
+  // -----------------------------------------------------------------------
+  // Market-learned coupling of the scored-deposit-credit family
+  // (نیک‌وام ملت، نگین پویا/فراپویا سپه، مهربانی ملی). In these schemes the
+  // customer accrues score = money × time, so the marketed matrices encode two
+  // monotone laws that the engine reproduces deterministically:
+  //   (1) α rises with the averaging window and the repayment tenor
+  //       (نیک‌وام: coefficient 10%..320% over τ_d ∈ [4,12] × τ_l ∈ [12,60];
+  //        مهربانی: up to 370% of the deposit);
+  //   (2) for rate-bearing contracts r_l descends the 5%..23% ladder as the
+  //       customer's patience (τ_d + ω) grows (نگین پویا/فراپویا trade-off).
+  //   Qarz tiers reproduce the 0/2/4% fee ladder by ticket size (مهربانی).
+  // -----------------------------------------------------------------------
+  if (blueprint.archetype === "scored-deposit-credit") {
+    const ramp = (value: number, lo: number, hi: number) =>
+      clamp((value - lo) / Math.max(1, hi - lo), 0, 1);
+    const tdRamp = ramp(sleepMonths, 4, 12);
+    const tlRamp = ramp(tenorMonths, 12, 60);
+    // +45% at the long (τ_d, τ_l) corner, −45% at the short corner — centered
+    // so the blueprint-median structure keeps its sampled multiplier.
+    loanMultiplier = clamp(
+      loanMultiplier * (0.55 + 0.9 * (0.5 * tdRamp + 0.5 * tlRamp)),
+      0.3,
+      3,
+    );
+    if (contract === "qarz-hasaneh") {
+      // مهربانی fee ladder: 0% up to 50M, 2% up to 100M, 4% above
+      loanRate = capToman <= 50e6 ? 0 : capToman <= 100e6 ? 0.02 : 0.04;
+    } else {
+      // نگین patience pricing: longer (τ_d + ω) ⇒ visibly cheaper money
+      const patience = 0.5 * tdRamp + 0.5 * ramp(waitingMonths, 0, 6);
+      const floorRate = 0.05;
+      loanRate = clamp(floorRate + (loanRate - floorRate) * (1 - 0.85 * patience), 0, rateCeiling);
+    }
+  }
 
   const avgDepositPerCustomerRial = blueprint.avgDepositPerCustomerToman * TOMAN_RIAL;
   const customers = Math.max(
@@ -1043,7 +1105,13 @@ function pickArchetypes(
     return chosen;
   }
 
+  // The scored deposit-backed credit family (نیک/نگین/مهربانی pattern) is
+  // requested explicitly — an "امتیازی / کارت اعتباری / نگین / مهربانی"
+  // prompt reserves its tier deterministically instead of relying on chance.
+  const scoredRequested = request.emphases.includes("scored-credit");
+
   if (count === 1) {
+    if (scoredRequested) return ["scored-deposit-credit"];
     const contractMatches = request.preferredContracts.length
       ? pool.filter((archetype) => BLUEPRINTS[archetype].contracts.some((contract) =>
           request.preferredContracts.includes(contract),
@@ -1058,6 +1126,10 @@ function pickArchetypes(
   const chosen: ModeArchetype[] = ["retail-qarz-average", "merchant-pos-accelerator"];
   const extras = shuffle(pool.filter((item) => !chosen.includes(item)), rng);
   while (chosen.length < count && extras.length) chosen.push(extras.shift()!);
+  if (scoredRequested) {
+    // replace the lowest-priority extra tier so the scored family always lands
+    chosen[chosen.length - 1] = "scored-deposit-credit";
+  }
   return chosen;
 }
 

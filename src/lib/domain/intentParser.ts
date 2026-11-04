@@ -96,6 +96,7 @@ const EMPHASIS_KEYWORDS: { key: string; words: string[] }[] = [
   { key: "fast-disbursal", words: ["اولویت اعطا", "اعطای فوری", "پرداخت فوری", "سرعت اعطا", "instant", "fast disbursal"] },
   { key: "salary-float", words: ["واریز حقوق", "کسر از حقوق", "حقوق‌بگیر", "payroll", "salary"] },
   { key: "deposit-certificate", words: ["گواهی سپرده", "اوراق سپرده", "سپرده خاص", "deposit certificate"] },
+  { key: "scored-credit", words: ["امتیازی", "امتیاز حساب", "نیک", "نگین", "مهربانی", "کارت اعتباری", "اعتبار سپرده‌محور", "scored", "credit card", "loyalty"] },
 ];
 
 interface NumericCapture {
@@ -317,6 +318,9 @@ export function parseIntent(rawPrompt: string, overrides: IntentOverrides = {}):
   if (emphases.includes("zero-fee") || emphases.includes("fast-disbursal"))
     lambdas.lambda2Adoption += 0.07;
   if (emphases.includes("salary-float")) lambdas.lambda3LdrPenalty += 0.03;
+  // scored-deposit products are adoption anchors: their economics rely on a
+  // wide, loyal deposit base, so weight adoption a little more.
+  if (emphases.includes("scored-credit")) lambdas.lambda2Adoption += 0.05;
   const lsum =
     lambdas.lambda1Irr + lambdas.lambda2Adoption + lambdas.lambda3LdrPenalty + lambdas.lambda4Overturning;
   lambdas.lambda1Irr /= lsum;

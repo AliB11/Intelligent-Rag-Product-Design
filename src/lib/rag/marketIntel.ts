@@ -132,6 +132,14 @@ function scoreAnalog(context: MarketRequestContext, product: MarketProduct): Ana
       score += 1.5;
       reasonsFa.push("زنجیره تأمین");
     }
+    if (emphasis === "scored-credit" && product.archetype === "scored-deposit-credit") {
+      score += 2;
+      reasonsFa.push("خانواده اعتبار امتیازی سپرده‌محور");
+    }
+    if (emphasis === "scored-credit" && /نیک|نگین|مهربانی|امتیاز/.test(`${product.productFa} ${product.notesFa}`)) {
+      score += 1.5;
+      reasonsFa.push("تطابق مستقیم طرح امتیازی");
+    }
     if (emphasis === "profitability" && (product.params.loanRate >= 0.18 || (product.profitRate ?? 0) >= 0.18)) {
       score += 0.75;
       reasonsFa.push("بازده بالای بازار");

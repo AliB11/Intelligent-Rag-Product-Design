@@ -18,7 +18,8 @@ export type ModeArchetype =
   | "investment-deposit"
   | "merchant-pos-accelerator"
   | "corporate-float-anchor"
-  | "supply-chain-gam";
+  | "supply-chain-gam"
+  | "scored-deposit-credit";
 
 export type BlockReleaseSchedule = "linear" | "midpoint" | "end";
 

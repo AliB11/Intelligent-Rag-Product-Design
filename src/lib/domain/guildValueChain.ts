@@ -256,6 +256,11 @@ export function buildGuildEcosystem(
   if (persona.population > 1_000_000 || persona.key === "corporate-payroll")
     recommended.push("corporate-float-anchor");
   if (persona.monthlyNetIncomeToman >= 200e6) recommended.push("investment-deposit");
+  // Scored deposit-backed credit (نیک/نگین/مهربانی pattern) is the natural
+  // anchor for large payroll / student float bases: steady low-cost deposits
+  // feeding a scored, sticky credit limit.
+  if (persona.key === "corporate-payroll" || persona.key === "student-community")
+    recommended.push("scored-deposit-credit");
 
   const suppliers = persona.b2bSuppliersFa.map((name, i) => ({
     name,
@@ -316,4 +321,5 @@ export const ARCHETYPE_LABEL_FA: Record<ModeArchetype, string> = {
   "merchant-pos-accelerator": "شتاب‌دهنده پذیرندگان",
   "corporate-float-anchor": "لنگر شناوری شرکتی",
   "supply-chain-gam": "اوراق گام زنجیره تأمین",
+  "scored-deposit-credit": "اعتبار امتیازی سپرده‌محور (نیک/نگین/مهربانی)",
 };
