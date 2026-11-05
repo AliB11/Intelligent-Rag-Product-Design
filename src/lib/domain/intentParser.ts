@@ -97,6 +97,15 @@ const EMPHASIS_KEYWORDS: { key: string; words: string[] }[] = [
   { key: "salary-float", words: ["واریز حقوق", "کسر از حقوق", "حقوق‌بگیر", "payroll", "salary"] },
   { key: "deposit-certificate", words: ["گواهی سپرده", "اوراق سپرده", "سپرده خاص", "deposit certificate"] },
   { key: "scored-credit", words: ["امتیازی", "امتیاز حساب", "نیک", "نگین", "مهربانی", "کارت اعتباری", "اعتبار سپرده‌محور", "scored", "credit card", "loyalty"] },
+  // Facility-category emphases (rade.ir loan taxonomy)
+  { key: "cat-car", words: ["خودرو", "وام خودرو", "car loan", "خودرویی", "سنگین", "سبک"] },
+  { key: "cat-housing", words: ["مسکن", "رهن", "خرید خانه", "ساخت مسکن", "تعمیرات مسکن", "mortgage", "housing", "جعاله تعمیر"] },
+  { key: "cat-marriage", words: ["ازدواج", "فرزندآوری", "جهیزیه", "marriage", "مهریه"] },
+  { key: "cat-agri", words: ["کشاورزی", "نهاده", "دامداری", "مرغداری", "غلات", "باغداری", "آبیاری", "agri", "farm"] },
+  { key: "cat-energy", words: ["خورشیدی", "نیروگاه", "انرژی تجدیدپذیر", "ساتبا", "solar", "photovoltaic", "فتوولتائیک"] },
+  { key: "cat-retiree", words: ["بازنشسته", "بازنشستگان", "تأمین اجتماعی", "تامین اجتماعی", "retiree", "pension"] },
+  { key: "cat-student", words: ["دانشجویی", "دانشجویان", "تحصیلی", "صندوق رفاه دانشجویان", "student"] },
+  { key: "cat-sme", words: ["خوداشتغالی", "تولیدی", "کسب‌وکار", "کارگاه", " SME", "self-employment", "اشتغال"] },
 ];
 
 interface NumericCapture {

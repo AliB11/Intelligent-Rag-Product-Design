@@ -1084,6 +1084,18 @@ function shuffle<T>(items: T[], rng: Rng): T[] {
   return out;
 }
 
+/** Facility-category emphasis → engine archetype (rade.ir loan taxonomy). */
+const CATEGORY_ARCHETYPE: Record<string, ModeArchetype> = {
+  "cat-car": "corporate-float-anchor",
+  "cat-housing": "investment-deposit",
+  "cat-marriage": "retail-qarz-average",
+  "cat-agri": "supply-chain-gam",
+  "cat-energy": "supply-chain-gam",
+  "cat-retiree": "corporate-float-anchor",
+  "cat-student": "scored-deposit-credit",
+  "cat-sme": "corporate-float-anchor",
+};
+
 function pickArchetypes(
   request: ProductGenerationRequest,
   rng: Rng,
@@ -1097,7 +1109,7 @@ function pickArchetypes(
     "supply-chain-gam",
   ];
   const count = clamp(Math.round(request.modeCount), 1, pool.length);
-  const uniqueForced = [...new Set(forced ?? [])].filter((item) => pool.includes(item));
+  const uniqueForced = [...new Set(forced ?? [])].filter((item) => pool.includes(item) || item === "scored-deposit-credit");
   if (uniqueForced.length) {
     const chosen = uniqueForced.slice(0, count);
     const extra = shuffle(pool.filter((item) => !chosen.includes(item)), rng);
@@ -1109,9 +1121,14 @@ function pickArchetypes(
   // requested explicitly — an "امتیازی / کارت اعتباری / نگین / مهربانی"
   // prompt reserves its tier deterministically instead of relying on chance.
   const scoredRequested = request.emphases.includes("scored-credit");
+  // Facility-category emphases (car/housing/agri/...) bias the anchor tier.
+  const categoryPick = request.emphases
+    .map((emphasis) => CATEGORY_ARCHETYPE[emphasis])
+    .find((archetype): archetype is ModeArchetype => Boolean(archetype));
 
   if (count === 1) {
     if (scoredRequested) return ["scored-deposit-credit"];
+    if (categoryPick) return [categoryPick];
     const contractMatches = request.preferredContracts.length
       ? pool.filter((archetype) => BLUEPRINTS[archetype].contracts.some((contract) =>
           request.preferredContracts.includes(contract),
@@ -1124,9 +1141,18 @@ function pickArchetypes(
   // Retail QH and merchant channels are default anchors for a multi-mode
   // average-balance structure; higher requested counts add distinct segments.
   const chosen: ModeArchetype[] = ["retail-qarz-average", "merchant-pos-accelerator"];
-  const extras = shuffle(pool.filter((item) => !chosen.includes(item)), rng);
+  if (categoryPick && !chosen.includes(categoryPick)) {
+    chosen[0] = categoryPick;
+  }
+  if (scoredRequested && !chosen.includes("scored-deposit-credit")) {
+    chosen.push("scored-deposit-credit");
+  }
+  const extras = shuffle(
+    pool.filter((item) => !chosen.includes(item)),
+    rng,
+  );
   while (chosen.length < count && extras.length) chosen.push(extras.shift()!);
-  if (scoredRequested) {
+  if (scoredRequested && !chosen.includes("scored-deposit-credit")) {
     // replace the lowest-priority extra tier so the scored family always lands
     chosen[chosen.length - 1] = "scored-deposit-credit";
   }

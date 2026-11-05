@@ -22,6 +22,7 @@ import MultiModeMatrixTable from "@/components/MultiModeMatrixTable";
 import ALMCashFlowChart from "@/components/ALMCashFlowChart";
 import GuildEcosystemCanvas from "@/components/GuildEcosystemCanvas";
 import MarketIntelPanel from "@/components/MarketIntelPanel";
+import FacilityCatalog from "@/components/FacilityCatalog";
 import {
   CompliancePanel,
   KnowledgePanel,
@@ -82,6 +83,7 @@ type TabKey =
   | "alm"
   | "guild"
   | "market"
+  | "catalog"
   | "sensitivity"
   | "compliance"
   | "knowledge"
@@ -105,6 +107,8 @@ export default function Home() {
   const [suite, setSuite] = useState<VerificationSuiteResult | null>(null);
   const [suiteBusy, setSuiteBusy] = useState(false);
   const [kbInfo, setKbInfo] = useState<{ benchmarks: number; kbDocuments: number } | null>(null);
+  const [catalogBenchmarks, setCatalogBenchmarks] = useState<BenchmarkScheme[]>([]);
+  const [seededPrompt, setSeededPrompt] = useState<{ text: string; nonce: number } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   const loadRuns = useCallback(async () => {
@@ -133,6 +137,7 @@ export default function Home() {
       if (cancelled) return;
       setRuns(Array.isArray(runsData?.runs) ? runsData.runs : []);
       setKbInfo(benchmarkData?.totals ?? null);
+      setCatalogBenchmarks(Array.isArray(benchmarkData?.benchmarks) ? benchmarkData.benchmarks : []);
     };
     void loadInitialData();
     return () => {
@@ -397,20 +402,44 @@ export default function Home() {
       {/* ---------------------------------------------------------- body */}
       <div className="grid gap-4 xl:grid-cols-[400px_minmax(0,1fr)]">
         <div className="space-y-4">
-          <PromptComposer busy={busy} onSubmit={submit} onCancel={cancel} />
+          <PromptComposer
+            key={seededPrompt?.nonce ?? "composer"}
+            busy={busy}
+            onSubmit={submit}
+            onCancel={cancel}
+            initialPrompt={seededPrompt?.text}
+          />
           <AgentReasoningStream events={events} running={busy} />
           <RunHistory runs={runs} onPick={openRun} onRefresh={loadRuns} />
         </div>
 
         <div className="space-y-4">
           {!result ? (
-            <Panel>
-              <EmptyState
-                title="هنوز محصولی سنتز نشده است"
-                hint={`یک درخواست راهبردی وارد کنید یا یکی از الگوهای آماده را انتخاب کنید. نمونه: «${EXAMPLE_PROMPTS[0].label}». سامانه قصد شما را به تابع هدف و قیود صوری ترجمه می‌کند، مقررات بانک مرکزی را از پایگاه دانش برمی‌گیرد، ساختار بهینه را با حل‌کننده MILP/MINLP می‌سازد و آن را در دوقلوی دیجیتال ALM با ${fmtNum(1000)} مسیر مونت‌کارلو آزمون تنش می‌کند.`}
-                icon={<IconNetwork className="h-7 w-7" />}
-              />
-            </Panel>
+            <>
+              <Panel>
+                <EmptyState
+                  title="هنوز محصولی سنتز نشده است"
+                  hint={`یک درخواست راهبردی وارد کنید، از راهنمای دسته‌بندی استفاده کنید یا یکی از الگوهای آماده را انتخاب کنید. نمونه: «${EXAMPLE_PROMPTS[0].label}». سامانه قصد شما را به تابع هدف و قیود صوری ترجمه می‌کند، مقررات و تسهیلات واقعی بازار را از پایگاه دانش برمی‌گیرد، ساختار بهینه را با حل‌کننده MILP/MINLP می‌سازد و آن را در دوقلوی دیجیتال ALM با ${fmtNum(1000)} مسیر مونت‌کارلو آزمون تنش می‌کند.`}
+                  icon={<IconNetwork className="h-7 w-7" />}
+                />
+              </Panel>
+              {catalogBenchmarks.length ? (
+                <FacilityCatalog
+                  benchmarks={catalogBenchmarks}
+                  onUse={(b) => {
+                    const rate = b.profitRate ?? b.feeRate;
+                    const text =
+                      `یک محصول مشابه «${b.productFa}» (${b.bank}) طراحی کن: سقف ${Math.round(b.ceilingToman / 1e6)} میلیون تومان` +
+                      `${rate ? `، ${b.profitRate ? "نرخ" : "کارمزد"} ${(rate * 100).toFixed(1)}٪` : ""}` +
+                      `${b.tenorMonths ? `، سررسید ${b.tenorMonths} ماه` : ""}` +
+                      `${b.segmentFa ? `، بخش هدف ${b.segmentFa}` : ""}` +
+                      `؛ ۸ همت منبع، IRR هدف حداقل ۲۳٪، سقف LDR ۸۵٪، کف LCR ۱٫۰۵ و حداکثر ریسک واژگونی ۵٪`;
+                    setSeededPrompt({ text, nonce: Date.now() });
+                    window.scrollTo({ top: 0, behavior: "smooth" });
+                  }}
+                />
+              ) : null}
+            </>
           ) : (
             <>
               {/* summary strip */}
@@ -453,6 +482,7 @@ export default function Home() {
                     { key: "alm", label: "جریان نقد ALM", icon: <IconChart className="h-3.5 w-3.5" /> },
                     { key: "guild", label: "بوم زیست‌بوم صنفی", icon: <IconNetwork className="h-3.5 w-3.5" /> },
                     { key: "market", label: "تحلیل بازار", icon: <IconDatabase className="h-3.5 w-3.5" /> },
+                    { key: "catalog", label: "کاتالوگ تسهیلات", icon: <IconDatabase className="h-3.5 w-3.5" /> },
                     { key: "sensitivity", label: "حساسیت‌سنجی", icon: <IconFlask className="h-3.5 w-3.5" /> },
                     { key: "compliance", label: "انطباق و حسابداری", icon: <IconShield className="h-3.5 w-3.5" /> },
                     { key: "knowledge", label: "RAG و بنچمارک", icon: <IconDatabase className="h-3.5 w-3.5" /> },
@@ -484,6 +514,21 @@ export default function Home() {
                     />
                   ) : null}
                   {tab === "market" ? <MarketIntelPanel intel={result.marketIntel} /> : null}
+                  {tab === "catalog" ? (
+                    <FacilityCatalog
+                      benchmarks={catalogBenchmarks.length ? catalogBenchmarks : []}
+                      onUse={(b) => {
+                        const rate = b.profitRate ?? b.feeRate;
+                        const text =
+                          `یک محصول مشابه «${b.productFa}» (${b.bank}) طراحی کن: سقف ${Math.round(b.ceilingToman / 1e6)} میلیون تومان` +
+                          `${rate ? `، ${b.profitRate ? "نرخ" : "کارمزد"} ${(rate * 100).toFixed(1)}٪` : ""}` +
+                          `${b.tenorMonths ? `، سررسید ${b.tenorMonths} ماه` : ""}` +
+                          `${b.segmentFa ? `، بخش هدف ${b.segmentFa}` : ""}` +
+                          `؛ ۸ همت منبع، IRR هدف حداقل ۲۳٪، سقف LDR ۸۵٪، کف LCR ۱٫۰۵ و حداکثر ریسک واژگونی ۵٪`;
+                        setSeededPrompt({ text, nonce: Date.now() });
+                      }}
+                    />
+                  ) : null}
                   {tab === "sensitivity" ? <SensitivityDashboard sensitivity={result.sensitivity} /> : null}
                   {tab === "compliance" ? (
                     <CompliancePanel

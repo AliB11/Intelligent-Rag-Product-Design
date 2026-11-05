@@ -78,6 +78,18 @@ export interface MarketRequestContext {
 const MIN_ANALOGS_FOR_PRIOR = 2;
 const MAX_ANALOGS = 14;
 
+/** Facility-category → Persian text hints used to score analog relevance. */
+const CATEGORY_TEXT_HINTS: Record<string, string[]> = {
+  "cat-car": ["خودرو", "خودرویی", "car", "سنگین", "سبک"],
+  "cat-housing": ["مسکن", "رهن", "housing", "تعمیر", "ساخت"],
+  "cat-marriage": ["ازدواج", "فرزندآوری", "marriage", "جهیزیه"],
+  "cat-agri": ["کشاورز", "نهاده", "دام", "مرغ", "غله", "farm", "agri"],
+  "cat-energy": ["خورشیدی", "نیروگاه", "solar", "ساتبا", "انرژی"],
+  "cat-retiree": ["بازنشسته", "retiree", "pension", "تأمین اجتماعی"],
+  "cat-student": ["دانشجو", "student", "تحصیلی"],
+  "cat-sme": ["خوداشتغال", "تولیدی", "اشتغال", "SME", "کارگاه"],
+};
+
 /** Median of a numeric list. */
 function median(values: number[]): number {
   if (!values.length) return 0;
@@ -139,6 +151,16 @@ function scoreAnalog(context: MarketRequestContext, product: MarketProduct): Ana
     if (emphasis === "scored-credit" && /نیک|نگین|مهربانی|امتیاز/.test(`${product.productFa} ${product.notesFa}`)) {
       score += 1.5;
       reasonsFa.push("تطابق مستقیم طرح امتیازی");
+    }
+    // Facility-category emphases (rade.ir loan taxonomy) — match the product's
+    // segment/notes text against the category that triggered the emphasis.
+    if (emphasis.startsWith("cat-")) {
+      const categoryText = `${product.segmentFa} ${product.segmentEn} ${product.notesFa} ${product.productFa}`;
+      const categoryHit = CATEGORY_TEXT_HINTS[emphasis]?.some((hint) => categoryText.includes(hint));
+      if (categoryHit) {
+        score += 2;
+        reasonsFa.push("تطابق دسته تسهیلاتی");
+      }
     }
     if (emphasis === "profitability" && (product.params.loanRate >= 0.18 || (product.profitRate ?? 0) >= 0.18)) {
       score += 0.75;

@@ -135,6 +135,13 @@ export const IconCheck = ({ className = base }: IconProps) => (
   </svg>
 );
 
+export const IconSearch = ({ className = base }: IconProps) => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className={className}>
+    <circle cx="11" cy="11" r="6.5" />
+    <path d="m16 16 4.5 4.5" strokeLinecap="round" />
+  </svg>
+);
+
 export const IconCoins = ({ className = base }: IconProps) => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" className={className}>
     <ellipse cx="9" cy="7" rx="5.5" ry="2.6" />
