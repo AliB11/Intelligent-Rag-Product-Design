@@ -169,6 +169,17 @@ export interface ProductGenerationRequest {
   };
   /** Free-form strategic emphasis detected by the intent agent. */
   emphases: string[];
+  /** Product-identification agent result: best real facility for this need. */
+  matchedFacility: {
+    code: string;
+    productFa: string;
+    productEn: string;
+    bank: string;
+    contract: ContractType;
+    confidence: number;
+    matchedOnFa: string[];
+    alternativesFa: { productFa: string; bank: string; confidence: number }[];
+  } | null;
   parsedTokens: { raw: string; kind: string; value: number | string }[];
 }
 

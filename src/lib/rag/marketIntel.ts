@@ -73,6 +73,8 @@ export interface MarketRequestContext {
   preferredContracts: ContractType[];
   emphases: string[];
   targetDepositsHemmat: number;
+  /** Code of the product-identification agent's best match — force-ranked #1. */
+  forcedCode?: string | null;
 }
 
 const MIN_ANALOGS_FOR_PRIOR = 2;
@@ -186,7 +188,16 @@ function scoreAnalog(context: MarketRequestContext, product: MarketProduct): Ana
  */
 export function analyzeMarket(context: MarketRequestContext): MarketPriors {
   const scored = MARKET_PRODUCTS
-    .map((product) => scoreAnalog(context, product))
+    .map((product) => {
+      const item = scoreAnalog(context, product);
+      // The product-identification agent's winner is the design basis: boost it
+      // to the top so the archetype priors centre on that exact real facility.
+      if (context.forcedCode && product.code === context.forcedCode) {
+        item.score += 6;
+        item.reasonsFa.unshift("محصول مرجع شناسایی‌شده از درخواست کاربر");
+      }
+      return item;
+    })
     .sort((a, b) => b.score - a.score);
   const maxScore = scored[0]?.score ?? 0;
   const relevant = scored.filter((item) => item.score > 0);

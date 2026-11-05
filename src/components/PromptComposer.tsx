@@ -259,7 +259,7 @@ export default function PromptComposer({ busy, onSubmit, onCancel, initialPrompt
   return (
     <Panel
       title="آهنگساز درخواست راهبردی (Goal-Seeking Prompt Composer)"
-      subtitle="اهداف کلان، حجم منابع، حدود سودآوری و تحمل ریسک را به زبان طبیعی وارد کنید؛ سامانه قیود و تابع هدف را خودش استخراج می‌کند."
+      subtitle="فقط چند کلمه بنویسید — «وام ازدواج»، «ماشین»، «نیروگاه خورشیدی» — تا عامل شناساگر محصول واقعی بازار را پیدا کند و بهترین نسخه‌اش را طراحی کند؛ یا اهداف کلان را با اسلایدرها دقیق کنید."
       icon={<IconBrain className="h-4 w-4" />}
       actions={
         busy ? (

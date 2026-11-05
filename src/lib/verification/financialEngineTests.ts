@@ -37,6 +37,7 @@ import { runAlmSimulation, runAlmSimulationAsync } from "../domain/almSimulator"
 import { runPipeline } from "../agents/graph";
 import { createInitialState, makeEmitter, StateGraph } from "../agents/state";
 import { analyzeMarket } from "../rag/marketIntel";
+import { resolveFacility } from "../rag/facilityResolver";
 import { MARKET_PRODUCTS } from "../rag/benchmarks";
 import {
   HEMMAT_RIAL,
@@ -1103,6 +1104,45 @@ export function runMarketIntelCase(): TestCaseResult {
         feeLadder[0] === 0 &&
         Math.abs(feeLadder[1] - 0.02) < 1e-9 &&
         Math.abs(feeLadder[2] - 0.04) < 1e-9,
+    ),
+  );
+
+  // M-09/M-10 — product-identification agent: a few-word need resolves to the
+  // right real facility, and the engine request auto-inherits its contract.
+  const terseCases: { prompt: string; expectCodes: string[]; expectContract: string }[] = [
+    { prompt: "وام ازدواج", expectCodes: ["MARITAL-QH-STATE", "FUND-SBB-MARRIAGE"], expectContract: "qarz-hasaneh" },
+    { prompt: "ماشین میخوام", expectCodes: ["MELLI-TEACHER-CAR"], expectContract: "morabaha" },
+    { prompt: "نیروگاه خورشیدی خانگی", expectCodes: ["MELLAT-SOLAR-HOME"], expectContract: "morabaha" },
+  ];
+  const resolverResults = terseCases.map((c) => {
+    const resolution = resolveFacility(c.prompt);
+    const intent = parseIntent(c.prompt).request;
+    return {
+      c,
+      bestCode: resolution.best?.product.code ?? "-",
+      bestConfidence: resolution.best?.confidence ?? 0,
+      intentContract: intent.matchedFacility?.contract ?? intent.preferredContracts[0] ?? "-",
+      intentConfidence: intent.matchedFacility?.confidence ?? 0,
+    };
+  });
+  out.push(
+    assert(
+      "M-09",
+      "عامل شناساگر با پرامپت چندکلمه‌ای، محصول واقعی درست را پیدا می‌کند",
+      "The identification agent maps terse needs (marriage / car / solar) to the right real facility",
+      "expected best-match family for each terse prompt",
+      resolverResults.map((r) => `${r.c.prompt}→${r.bestCode}@${(r.bestConfidence * 100).toFixed(0)}%`).join(" | "),
+      resolverResults.every((r) => r.c.expectCodes.includes(r.bestCode) && r.bestConfidence >= 0.35),
+    ),
+  );
+  out.push(
+    assert(
+      "M-10",
+      "درخواست موتور از محصول شناسایی‌شده، عقد و اطمینان را به‌ارث می‌برد",
+      "The engine request inherits contract and confidence from the identified facility",
+      "intent contract == facility contract for every terse case",
+      resolverResults.map((r) => `${r.c.prompt}→${r.intentContract}@${(r.intentConfidence * 100).toFixed(0)}%`).join(" | "),
+      resolverResults.every((r) => r.intentContract === r.c.expectContract && r.intentConfidence > 0),
     ),
   );
 

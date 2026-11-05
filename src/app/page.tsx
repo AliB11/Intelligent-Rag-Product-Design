@@ -473,6 +473,27 @@ export default function Home() {
                   </div>
                 }
               >
+                {/* identified reference facility */}
+                {request?.matchedFacility ? (
+                  <div className="panel-tight mb-4 flex flex-wrap items-center gap-2 px-3 py-2.5">
+                    <span className="rounded-md border border-teal/40 bg-teal/10 px-2 py-1 text-[10px] text-teal">
+                      محصول مرجع شناسایی‌شده
+                    </span>
+                    <span className="text-[12px] font-semibold text-chalk">
+                      {request.matchedFacility.productFa}
+                    </span>
+                    <span className="text-[10.5px] text-mist">— {request.matchedFacility.bank}</span>
+                    <Badge tone={request.matchedFacility.confidence >= 0.7 ? "teal" : request.matchedFacility.confidence >= 0.4 ? "gold" : "rose"}>
+                      اطمینان {fmtNum(request.matchedFacility.confidence * 100, 0)}٪
+                    </Badge>
+                    {request.matchedFacility.alternativesFa.length ? (
+                      <span className="text-[10px] text-mist/70">
+                        جایگزین‌ها: {request.matchedFacility.alternativesFa.slice(0, 3).map((a) => `${a.productFa} (${fmtNum(a.confidence * 100, 0)}٪)`).join(" · ")}
+                      </span>
+                    ) : null}
+                  </div>
+                ) : null}
+
                 <Tabs<TabKey>
                   active={tab}
                   onChange={setTab}

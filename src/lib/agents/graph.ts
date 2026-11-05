@@ -105,6 +105,28 @@ function intentAnalyzerNode(state: AgentState, emit: Emit, options: PipelineOpti
       titleEn: w,
     }),
   );
+
+  // Product-identification agent: announce the resolved real facility.
+  const matched = request.matchedFacility;
+  if (matched) {
+    emit({
+      node: "intent_analyzer",
+      stage: "intent:facility-identified",
+      level: "ok",
+      titleFa: `محصول مرجع شناسایی شد: «${matched.productFa}» — ${matched.bank} (اطمینان ${(matched.confidence * 100).toFixed(0)}٪)`,
+      titleEn: `Reference facility identified: "${matched.productEn}" — ${matched.bank} (confidence ${(matched.confidence * 100).toFixed(0)}%)`,
+      detailFa:
+        `دلایل تطبیق: ${matched.matchedOnFa.join("، ")}` +
+        (matched.alternativesFa.length
+          ? `\nجایگزین‌های نزدیک: ${matched.alternativesFa.map((a) => `${a.productFa} (${a.bank}، ${(a.confidence * 100).toFixed(0)}٪)`).join(" · ")}`
+          : ""),
+      detailEn: `Matched on: ${matched.matchedOnFa.join(", ")}`,
+      metrics: {
+        confidence: matched.confidence,
+        alternatives: matched.alternativesFa.length,
+      },
+    });
+  }
 }
 
 /** Node 2 — RAG retrieval of CBI directives and Islamic contract rules. */
@@ -175,6 +197,7 @@ function regulatoryRagNode(state: AgentState, emit: Emit) {
     preferredContracts: req.preferredContracts,
     emphases: req.emphases,
     targetDepositsHemmat: req.targetDepositsHemmat,
+    forcedCode: req.matchedFacility?.code ?? null,
   });
   const intel: MarketIntel = {
     analogs: market.analogs.map(({ product, score, reasonsFa }) => ({

@@ -16,6 +16,7 @@ import {
 } from "./constants";
 import { clamp } from "./financial";
 import { PERSONAS } from "./guildValueChain";
+import { resolveFacility } from "../rag/facilityResolver";
 import type { ContractType, Language, ProductGenerationRequest } from "./types";
 
 const FA_DIGITS = "۰۱۲۳۴۵۶۷۸۹";
@@ -277,7 +278,7 @@ export function parseIntent(rawPrompt: string, overrides: IntentOverrides = {}):
   const personaKey = personaHit?.key ?? null;
   const persona = PERSONAS.find((p) => p.key === personaKey) ?? null;
 
-  const targetIrr = clamp(
+  let targetIrr = clamp(
     overrides.targetIrr ?? parsePercent(text, /irr|بازده داخلی|نرخ بازده داخلی|internal rate/i) ?? (persona ? 0.27 : 0.26),
     0.01,
     1.0,
@@ -307,6 +308,76 @@ export function parseIntent(rawPrompt: string, overrides: IntentOverrides = {}):
   const contracts = detectContracts(text);
   const emphases = detectEmphases(text);
   const modeCount = detectModeCount(text);
+
+  // ---- Product-identification agent -------------------------------------
+  // A few-word need ("وام ازدواج", "ماشین", "خونه") is resolved to the single
+  // best-matching REAL facility from the researched registry; its contract and
+  // category vocabulary are merged into the request so the optimizer designs
+  // the best version of that exact product. The agent steps aside for
+  // fully-specified strategic prompts (explicit resource volume): those are
+  // power-user requests where forcing one facility's priors would over-constrain.
+  const resolution = resolveFacility(prompt);
+  const hasExplicitResource = deposits.rial > 0;
+  const attachFacility = !hasExplicitResource && !!resolution.best && resolution.best.confidence >= 0.35;
+  const matchedFacility: ProductGenerationRequest["matchedFacility"] = attachFacility && resolution.best
+    ? {
+        code: resolution.best.product.code,
+        productFa: resolution.best.product.productFa,
+        productEn: resolution.best.product.productEn,
+        bank: resolution.best.product.bank,
+        contract: resolution.best.product.contract,
+        confidence: Math.round(resolution.best.confidence * 100) / 100,
+        matchedOnFa: resolution.best.matchedOnFa,
+        alternativesFa: resolution.alternatives.map((alt) => ({
+          productFa: alt.product.productFa,
+          bank: alt.product.bank,
+          confidence: Math.round(alt.confidence * 100) / 100,
+        })),
+      }
+    : null;
+  if (matchedFacility && !contracts.includes(matchedFacility.contract)) {
+    contracts.push(matchedFacility.contract);
+  }
+  // map the resolved need-category to engine emphases so routing/priors follow
+  const CATEGORY_EMPHASIS: Record<string, string> = {
+    marriage: "cat-marriage",
+    car: "cat-car",
+    housing: "cat-housing",
+    student: "cat-student",
+    retiree: "cat-retiree",
+    solar: "cat-energy",
+    goods: "merchant-float",
+    instant: "fast-disbursal",
+    "no-guarantor": "financial-inclusion",
+    qh: "zero-fee",
+    merchant: "merchant-float",
+    payroll: "salary-float",
+    agri: "cat-agri",
+    sme: "cat-sme",
+    "supply-chain": "supply-chain",
+    scored: "scored-credit",
+    "deposit-certificate": "deposit-certificate",
+  };
+  if (attachFacility) {
+    for (const category of resolution.categories) {
+      const emphasis = CATEGORY_EMPHASIS[category];
+      if (emphasis && !emphases.includes(emphasis)) emphases.push(emphasis);
+    }
+  }
+
+  // Return-objective inference: when the user asked for a specific product
+  // class ("وام ازدواج") without stating an IRR, the target must come from the
+  // economics of THAT class — a 4%-commission QH marriage loan cannot carry a
+  // generic 26% objective, while a rate-bearing facility can. This keeps the
+  // self-correction loop honest instead of labelling realistic designs
+  // not_validated against an imported target.
+  const irrMentioned = /irr|بازده داخلی|internal rate/i.test(text);
+  if (attachFacility && resolution.best && overrides.targetIrr === undefined && !irrMentioned) {
+    const facility = resolution.best.product;
+    targetIrr = facility.contract === "qarz-hasaneh"
+      ? clamp(0.06 + facility.params.loanRate * 1.5, 0.08, 0.16)
+      : clamp(facility.params.loanRate + 0.03, 0.18, 0.28);
+  }
 
   const horizonMatch = /([0-9]{2,3})\s*(?:ماه|month)/i.exec(text);
   const horizonMonths = horizonMatch
@@ -374,8 +445,17 @@ export function parseIntent(rawPrompt: string, overrides: IntentOverrides = {}):
     horizonMonths,
     lambdas,
     emphases,
+    matchedFacility,
     parsedTokens,
   };
+
+  if (matchedFacility) {
+    parsedTokens.push({
+      raw: `${matchedFacility.productFa} (${matchedFacility.bank})`,
+      kind: "matched-facility",
+      value: matchedFacility.confidence,
+    });
+  }
 
   return { request, warnings };
 }
