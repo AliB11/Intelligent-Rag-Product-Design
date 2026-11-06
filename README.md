@@ -10,7 +10,7 @@ MILP/MINLP · مونت‌کارلو ۶۰ ماهه · خط لوله هفت‌گر
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](tsconfig.json)
 [![Next.js](https://img.shields.io/badge/Next.js-16_App_Router-000000?logo=nextdotjs&logoColor=white)](https://nextjs.org)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16_%2B_Drizzle-4169E1?logo=postgresql&logoColor=white)](src/db)
-[![Tests](https://img.shields.io/badge/verification-55%2F55_passing-2EA043)](src/lib/verification/financialEngineTests.ts)
+[![Tests](https://img.shields.io/badge/verification-67%2F67_passing-2EA043)](src/lib/verification/financialEngineTests.ts)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 </div>
@@ -73,6 +73,17 @@ MILP/MINLP · مونت‌کارلو ۶۰ ماهه · خط لوله هفت‌گر
 
 خروجی در تب «تحلیل بازار»، بخش ۱۰ گزارش مدیریتی و ستون `market_intel` پایگاه
 داده قابل بازبینی است. روش‌شناسی کامل در [docs/MARKET_RESEARCH.md](docs/MARKET_RESEARCH.md).
+
+### آزمایشگاه سیمرغ (ادغام موتور شبیه‌ساز اعتباری)
+
+لایه `src/lib/simorgh/*` قابلیت‌های شبیه‌ساز سیمرغ را روی همین موتور قطعی سوار
+می‌کند: **جمعیت مصنوعی مشتریان** (شغل/منطقه/درآمد/رتبه اعتباری ۰–۹۰۰)، **سیاست
+اعتبار و قیمت‌گذاری پله‌ای** (DTI + ۶ پله رتبه)، **۷ سناریوی کلان** (رکودتورمی،
+شوک ارزی، تنگنای نقدینگی…)، **سنجه‌های پیشرفته** (APR مؤثر، NPL فصلی، VaR95،
+سرمایه IRB بازل، بازده واقعی پس از تورم، شمول مالی و شکاف دهکی)، **کتاب مقررات
+پیکربندی‌شدنی** (`/api/regulations` با کف‌های سخت CBI)، **مشاور بینش‌محور**،
+**محاسبه‌گر چهارکلاسه مشتری** و **۱۷ قالب آغازین + ایده تصادفی 🎲**.
+نگاشت کامل: [docs/SIMORGH-INTEGRATION.md](docs/SIMORGH-INTEGRATION.md).
 
 ### قاعده بنیادین معماری
 

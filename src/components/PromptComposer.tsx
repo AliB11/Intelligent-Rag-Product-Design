@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import type { IntentOverrides } from "@/lib/domain/intentParser";
+import { randomIdea } from "@/lib/simorgh/randomIdea";
 import { IconPlay, IconStop, IconBrain, Panel, Badge, fmtNum } from "./ui";
 
 export interface ComposerOptions {
@@ -216,6 +217,18 @@ export default function PromptComposer({ busy, onSubmit, onCancel, initialPrompt
     setOverturn(category.controls.overturn);
   };
 
+  /** Simorgh random-idea 🎲 — seeded draw over 17 templates × personas. */
+  const rollIdea = () => {
+    const idea = randomIdea();
+    setPrompt(idea.prompt);
+    setIntentOverrides({});
+    setHemmat(idea.controls.hemmat);
+    setIrr(idea.controls.irr);
+    setLdr(idea.controls.ldr);
+    setLcr(idea.controls.lcr);
+    setOverturn(idea.controls.overturn);
+  };
+
   const compose = () => {
     onSubmit(prompt, {
       candidates,
@@ -273,6 +286,19 @@ export default function PromptComposer({ busy, onSubmit, onCancel, initialPrompt
       }
     >
       <div className="space-y-3">
+        {/* Simorgh random-idea */}
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={rollIdea}
+            className="rounded-lg border border-violet/40 bg-violet/10 px-3 py-1.5 text-[11px] text-violet transition hover:bg-violet/20 disabled:opacity-40"
+          >
+            🎲 ایده تصادفی (۱۷ قالب سیمرغ)
+          </button>
+          <span className="text-[9.5px] text-mist/50">قلمرو ایده‌ها از ۶۶ محصول واقعی بازار گرفته شده است</span>
+        </div>
+
         {/* Facility-category wayfinder (rade.ir loan taxonomy over 60+ products) */}
         <div>
           <p className="mb-1.5 text-[10px] text-mist/70">

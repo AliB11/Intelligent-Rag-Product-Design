@@ -156,6 +156,7 @@ export async function POST(request: Request) {
           warnings: state.warnings,
           constraints: state.constraints,
           marketIntel: state.marketIntel,
+          simorgh: state.simorgh,
           persona: state.persona,
           ecosystem: state.ecosystem,
           product: state.product,

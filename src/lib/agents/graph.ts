@@ -37,6 +37,13 @@ import {
 import { retrieveKnowledge } from "../rag/knowledgeBase";
 import { searchBenchmarks } from "../rag/benchmarks";
 import { analyzeMarket } from "../rag/marketIntel";
+import { resolveFacility } from "../rag/facilityResolver";
+import { generatePopulation, empiricalShares, scoreTiers, tierIndexOf } from "../simorgh/population";
+import { portfolioUnderwriting } from "../simorgh/creditPolicy";
+import { computeSimorghMetrics } from "../simorgh/metrics";
+import { runStressSuite } from "../simorgh/stress";
+import { buildAdvisorReport } from "../simorgh/advisor";
+import { templatesForCategories } from "../simorgh/templates";
 import type { ProductSpec } from "../domain/types";
 import {
   createInitialState,
@@ -444,6 +451,100 @@ async function almStressTesterNode(state: AgentState, emit: Emit, options: Pipel
       severeOverturning: severe.metrics.overturningShock,
     },
   });
+
+  // ---- Simorgh lab: 7-scenario stress + synthetic population + metrics ----
+  try {
+    const labSeed = seedFromString(options.seed ?? state.prompt) + state.iteration * 104729;
+    const stress = runStressSuite(product, req, labSeed, 90, req.horizonMonths);
+    emit({
+      node: "alm_stress_tester",
+      stage: "alm:stress-suite",
+      level: stress.feasibleInAll ? "ok" : "warn",
+      titleFa: `آزمون ۷ سناریوی کلان سیمرغ: ${stress.feasibleInAll ? "همه موجه" : `ضعیف‌ترین «${stress.runs.find((r) => r.scenario.id === stress.worstScenario)?.scenario.labelFa ?? stress.worstScenario}»`} (${stress.pathsPerScenario} مسیر هر سناریو)`,
+      titleEn: `Simorgh 7-scenario macro stress: ${stress.feasibleInAll ? "all feasible" : `weakest "${stress.worstScenario}"`} (${stress.pathsPerScenario} paths each)`,
+      metrics: { scenarios: stress.runs.length, feasible: stress.feasibleInAll ? 1 : 0 },
+    });
+
+    // synthetic population underwriting against the blended representative mode
+    const POP_N = 400;
+    const population = generatePopulation(POP_N, labSeed);
+    const totalLoans = Math.max(1, product.modes.reduce((a, m) => a + m.loanBookRial, 0));
+    const blendedRate = product.modes.reduce((a, m) => a + m.loanBookRial * m.loanRate, 0) / totalLoans;
+    const blendedTenor =
+      product.modes.reduce((a, m) => a + m.loanBookRial * m.tenorMonths, 0) / totalLoans;
+    const blendedPd = product.modes.reduce((a, m) => a + m.loanBookRial * m.pd, 0) / totalLoans;
+    const blendedLgd = product.modes.reduce((a, m) => a + m.loanBookRial * m.lgd, 0) / totalLoans;
+    const perCustomer = (product.modes.reduce((a, m) => a + m.loanBookRial, 0) /
+      Math.max(1, product.modes.reduce((a, m) => a + m.customers, 0))) / 10;
+    const uw = portfolioUnderwriting(population, {
+      annualRate: blendedRate,
+      tenorMonths: blendedTenor,
+      amountMillionToman: perCustomer,
+    });
+    const tiers = scoreTiers();
+    const shares = empiricalShares(population, tiers);
+    const metrics = computeSimorghMetrics({
+      alm: alm,
+      blendedAnnualRate: blendedRate,
+      blendedTenorMonths: blendedTenor,
+      blendedPd,
+      blendedLgd,
+      population,
+      approvedIds: new Set(Array.from(uw.decisions.entries()).filter(([, d]) => d.approved).map(([id]) => id)),
+    });
+    const categories = req.emphases.filter((e) => e.startsWith("cat-")).map((e) => e.slice(4));
+    const tpl = templatesForCategories(categories)[0];
+    state.simorgh = {
+      metrics,
+      population: {
+        size: POP_N,
+        seed: labSeed,
+        approvalRate: uw.approvalRate,
+        weightedPd: uw.weightedPd,
+        weightedRate: uw.weightedRate,
+        tiers: tiers.map((t, i) => ({
+          labelFa: t.label,
+          share: shares[i],
+          approval: uw.tierApproval[i],
+          pd: t.pd,
+          pricingIndex: t.pricingIndex,
+        })),
+        medianIncomeMillionToman:
+          population.map((c) => c.income).sort((a, b) => a - b)[Math.floor(POP_N / 2)] ?? 0,
+      },
+      stress: {
+        feasibleInAll: stress.feasibleInAll,
+        worstScenario: stress.worstScenario,
+        pathsPerScenario: stress.pathsPerScenario,
+        runs: stress.runs.map((r) => ({
+          id: r.scenario.id,
+          labelFa: r.scenario.labelFa,
+          irrBankAnnual: r.irrBankAnnual,
+          p95Ldr: r.p95Ldr,
+          p5Lcr: r.p5Lcr,
+          overturningShock: r.overturningShock,
+          feasible: r.feasible,
+        })),
+      },
+      advisor: { health: "healthy", insights: [] },
+      template: tpl ? { id: tpl.id, nameFa: tpl.nameFa, emoji: tpl.emoji } : null,
+    };
+    emit({
+      node: "alm_stress_tester",
+      stage: "alm:simorgh-population",
+      level: "info",
+      titleFa: `شبیه‌سازی ${POP_N} مشتری مصنوعی: نرخ پذیرش ${(uw.approvalRate * 100).toFixed(0)}٪ · APR مؤثر ${metrics.aprPct.toFixed(1)}٪ · سرمایه IRB ${(metrics.irbCapitalRate * 100).toFixed(1)}٪`,
+      titleEn: `Synthetic population of ${POP_N}: approval ${(uw.approvalRate * 100).toFixed(0)}% · APR ${metrics.aprPct.toFixed(1)}% · IRB capital ${(metrics.irbCapitalRate * 100).toFixed(1)}%`,
+      metrics: {
+        approvalRate: uw.approvalRate,
+        aprPct: metrics.aprPct,
+        nplRatio: metrics.nplRatio,
+        inclusionScore: metrics.inclusionScore,
+      },
+    });
+  } catch {
+    // lab is additive: never fail the pipeline on lab errors
+  }
 }
 
 /** Node 6 — critic auditor with mathematical adjustment directives. */
@@ -470,6 +571,41 @@ function criticAuditorNode(state: AgentState, emit: Emit, options: PipelineOptio
   const existingIndex = state.iterations.findIndex((item) => item.iteration === state.iteration);
   if (existingIndex >= 0) state.iterations[existingIndex] = iterationRecord;
   else state.iterations.push(iterationRecord);
+
+  // Simorgh advisor: merge critic + regulation + stress + metrics insights
+  if (state.simorgh) {
+    try {
+      state.simorgh.advisor = buildAdvisorReport(product, req, alm, findings, {
+        runs: state.simorgh.stress.runs.map((r) => ({
+          scenario: { id: r.id as import("../simorgh/stress").ScenarioId, labelFa: r.labelFa, factors: { outflow: 1, adoption: 1, delta: 1, rate: 1 }, z: 0 },
+          irrBankAnnual: r.irrBankAnnual,
+          p95Ldr: r.p95Ldr,
+          p5Lcr: r.p5Lcr,
+          overturningShock: r.overturningShock,
+          monthsInBreachLdr: 0,
+          monthsInBreachLcr: 0,
+          feasible: r.feasible,
+        })),
+        worstScenario: state.simorgh.stress.worstScenario,
+        feasibleInAll: state.simorgh.stress.feasibleInAll,
+        seed: state.simorgh.population.seed,
+        pathsPerScenario: state.simorgh.stress.pathsPerScenario,
+      });
+      const top = state.simorgh.advisor.insights.slice(0, 3);
+      if (top.length) {
+        emit({
+          node: "critic_auditor",
+          stage: "critic:advisor",
+          level: state.simorgh.advisor.health === "critical" ? "warn" : "info",
+          titleFa: `مشاور سیمرغ (${state.simorgh.advisor.health === "healthy" ? "سالم" : state.simorgh.advisor.health === "watch" ? "پایش" : "بحرانی"}): ${top.map((i) => i.titleFa).join(" | ")}`,
+          titleEn: `Simorgh advisor (${state.simorgh.advisor.health}): top insights emitted`,
+          metrics: { insights: state.simorgh.advisor.insights.length },
+        });
+      }
+    } catch {
+      // advisory is additive
+    }
+  }
 
   if (!blockers.length) {
     emit({

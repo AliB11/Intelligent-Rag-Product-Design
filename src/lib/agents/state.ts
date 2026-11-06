@@ -61,6 +61,54 @@ export interface ComplianceDraftItem {
 
 export type ValidationStatus = "pending" | "constraints_passed" | "not_validated";
 
+/** Simorgh lab report — 7-scenario stress, synthetic population, metrics, advisor. */
+export interface SimorghReport {
+  metrics: {
+    aprPct: number;
+    nplRatio: number;
+    var95NetIncomeRial: number;
+    irbCapitalRate: number;
+    realReturnAnnual: number;
+    inclusionScore: number;
+    decileGap: number;
+  };
+  population: {
+    size: number;
+    seed: number;
+    approvalRate: number;
+    weightedPd: number;
+    weightedRate: number;
+    tiers: { labelFa: string; share: number; approval: number; pd: number; pricingIndex: number }[];
+    medianIncomeMillionToman: number;
+  };
+  stress: {
+    feasibleInAll: boolean;
+    worstScenario: string;
+    pathsPerScenario: number;
+    runs: {
+      id: string;
+      labelFa: string;
+      irrBankAnnual: number;
+      p95Ldr: number;
+      p5Lcr: number;
+      overturningShock: number;
+      feasible: boolean;
+    }[];
+  };
+  advisor: {
+    health: "healthy" | "watch" | "critical";
+    insights: {
+      id: string;
+      level: "critical" | "warning" | "info" | "good";
+      titleFa: string;
+      detailFa: string;
+      actionFa: string;
+      source: string;
+    }[];
+  };
+  template: { id: string; nameFa: string; emoji: string } | null;
+}
+
 /** Market-research intelligence snapshot produced by the RAG node. */
 export interface MarketIntel {
   /** Closest real market products with match scores and reasons. */
@@ -112,6 +160,7 @@ export interface AgentState {
   ecosystem: GuildEcosystem | null;
   product: ProductSpec | null;
   alm: AlmResult | null;
+  simorgh: SimorghReport | null;
   findings: CriticFinding[];
   iterations: OptimizerIteration[];
   iteration: number;
@@ -151,6 +200,7 @@ export function createInitialState(prompt: string): AgentState {
     ecosystem: null,
     product: null,
     alm: null,
+    simorgh: null,
     findings: [],
     iterations: [],
     iteration: 0,

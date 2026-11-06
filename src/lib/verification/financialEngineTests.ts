@@ -39,6 +39,15 @@ import { createInitialState, makeEmitter, StateGraph } from "../agents/state";
 import { analyzeMarket } from "../rag/marketIntel";
 import { resolveFacility } from "../rag/facilityResolver";
 import { MARKET_PRODUCTS } from "../rag/benchmarks";
+import { generatePopulation, scoreTiers, empiricalShares, populationPd } from "../simorgh/population";
+import { portfolioUnderwriting } from "../simorgh/creditPolicy";
+import { irbRetailK, vasicekPd, effectiveAprPct, unitSchedule, normInv } from "../simorgh/quant";
+import { computeSimorghMetrics } from "../simorgh/metrics";
+import { runStressSuite } from "../simorgh/stress";
+import { PRODUCT_TEMPLATES, templatesForCategories } from "../simorgh/templates";
+import { getRegulations, setRegulations, resetRegulations, checkModeCompliance } from "../simorgh/regulations";
+import { estimate } from "../simorgh/calculator";
+import { randomIdea } from "../simorgh/randomIdea";
 import {
   HEMMAT_RIAL,
   MAX_MONTE_CARLO_RUNS,
@@ -1162,11 +1171,215 @@ export function runMarketIntelCase(): TestCaseResult {
   };
 }
 
+/** Simorgh lab layer — quant, population, policy, metrics, stress, templates, regulations. */
+export function runSimorghCase(): TestCaseResult {
+  const started = Date.now();
+  const out: Assertion[] = [];
+
+  // S-01 — quant primitives
+  const k = irbRetailK(0.02, 0.25, "other");
+  const pdUp = vasicekPd(0.02, 2);
+  const pdDown = vasicekPd(0.02, -2);
+  out.push(
+    assert(
+      "S-01",
+      "اصول کمّی سیمرغ: سرمایه IRB مثبت، PD واشیکس یکنوا در شوک سیستماتیک",
+      "Simorgh quant: IRB K positive; Vasicek PD monotone in the systematic factor",
+      "K>0; PD(z=2) > PD(z=0) > PD(z=-2); normInv(0.5)==0",
+      `K=${k.toFixed(4)}; ${pdUp.toFixed(4)}/${vasicekPd(0.02, 0).toFixed(4)}/${pdDown.toFixed(4)}; z0=${normInv(0.5).toFixed(3)}`,
+      k > 0 && pdUp > vasicekPd(0.02, 0) && vasicekPd(0.02, 0) > pdDown && Math.abs(normInv(0.5)) < 1e-6,
+    ),
+  );
+
+  // S-02 — APR of an annuity schedule is finite, ordered and above the nominal rate
+  const schedule = unitSchedule(23, 36, "annuity");
+  const apr = effectiveAprPct(schedule, 2);
+  const aprZeroFee = effectiveAprPct(unitSchedule(23, 36, "annuity"), 0);
+  out.push(
+    assert(
+      "S-02",
+      "APR مؤثر جدول اقساطی متناهی، صعودی با کارمزد و بالاتر از نرخ اسمی",
+      "Effective APR of the annuity schedule is finite, rises with upfront fee, and exceeds the nominal rate",
+      "apr(fee=2%) >= apr(fee=0) > 23",
+      `${apr.toFixed(2)}٪ vs ${aprZeroFee.toFixed(2)}٪`,
+      Number.isFinite(apr) && apr >= aprZeroFee - 1e-9 && aprZeroFee > 23 && apr <= 999,
+    ),
+  );
+
+  // S-03 — population determinism, score bounds, tier shares sum to 1
+  const popA = generatePopulation(300, 4242);
+  const popB = generatePopulation(300, 4242);
+  const tiers = scoreTiers();
+  const shares = empiricalShares(popA, tiers);
+  const shareSum = shares.reduce((a, b) => a + b, 0);
+  const scoresValid = popA.every((c) => c.score >= 250 && c.score <= 900);
+  const same = JSON.stringify(popA) === JSON.stringify(popB);
+  out.push(
+    assert(
+      "S-03",
+      "جمعیت مصنوعی قطعی، رتبه‌ها در بازه ۲۵۰–۹۰۰ و سهم پله‌ها جمعاً ۱",
+      "Synthetic population is deterministic, scores within 250..900, tier shares sum to 1",
+      "identical replay; scores valid; Σshares==1",
+      `same=${same}; scores=${scoresValid}; Σ=${shareSum.toFixed(4)}`,
+      same && scoresValid && Math.abs(shareSum - 1) < 1e-9,
+    ),
+  );
+
+  // S-04 — credit policy: DTI gate rejects low-income borrowers, tier pricing monotone
+  const uw = portfolioUnderwriting(popA, { annualRate: 0.23, tenorMonths: 36, amountMillionToman: 300 });
+  const pricingMonotone = tiers.every((t, i) => i === 0 || tiers[i - 1].pricingIndex <= t.pricingIndex);
+  out.push(
+    assert(
+      "S-04",
+      "سیاست اعتبار: نرخ پذیرش بین ۰ تا ۱ و قیمت‌گذاری پله‌ها یکنوای صعودی",
+      "Credit policy: approval rate within (0,1); tier pricing indices monotone non-decreasing",
+      "0<approval<1; pricing monotone",
+      `approval=${(uw.approvalRate * 100).toFixed(0)}%; pricing=[${tiers.map((t) => t.pricingIndex).join(",")}]`,
+      uw.approvalRate > 0 && uw.approvalRate < 1 && pricingMonotone,
+    ),
+  );
+
+  // S-05 — 7-scenario stress suite is deterministic and produces distinct runs
+  const request = parseIntent(
+    "یک بسته بانکی ۴ طرحی میانگین حساب برای جذب ۱۰ همت منبع با IRR حداقل ۲۴٪ طراحی کن",
+  ).request;
+  const refProduct = buildReferenceProduct();
+  const stressA = runStressSuite(refProduct, request, 777, 60, 60);
+  const stressB = runStressSuite(refProduct, request, 777, 60, 60);
+  const distinct = new Set(stressA.runs.map((r) => r.irrBankAnnual.toFixed(6))).size >= 3;
+  const sameStress = JSON.stringify(stressA.runs.map((r) => r.irrBankAnnual)) === JSON.stringify(stressB.runs.map((r) => r.irrBankAnnual));
+  out.push(
+    assert(
+      "S-05",
+      "آزمون ۷ سناریوی کلان قطعی است و سناریوها نتایج متمایز می‌دهند",
+      "The 7-scenario stress suite is deterministic and scenarios produce distinct outcomes",
+      "same seed => identical; >=3 distinct IRRs across scenarios",
+      `same=${sameStress}; distinct=${distinct}`,
+      sameStress && distinct && stressA.runs.length === 7,
+    ),
+  );
+
+  // S-06 — metrics: APR/NPL/VaR/IRB/real-return within sane bounds
+  const almRef = runAlmSimulation({ product: refProduct, runs: 40, seed: 99 });
+  const simorghMetrics = computeSimorghMetrics({
+    alm: almRef,
+    blendedAnnualRate: 0.2,
+    blendedTenorMonths: 36,
+    blendedPd: 0.022,
+    blendedLgd: 0.25,
+    population: popA,
+    approvedIds: new Set(Array.from(uw.decisions.entries()).filter(([, d]) => d.approved).map(([id]) => id)),
+  });
+  out.push(
+    assert(
+      "S-06",
+      "سنجه‌های پیشرفته سیمرغ در محدوده منطقی: APR، NPL، VaR، IRB، بازده واقعی، شمول",
+      "Simorgh metrics within sane bounds: APR finite, NPL in (0,0.5], IRB>0, real return finite, inclusion in [0,1]",
+      "APR>20 (nominal input); NPL∈(0,0.5]; K>0; |real|<3; inclusion∈[0,1]",
+      `APR=${simorghMetrics.aprPct.toFixed(1)}; NPL=${simorghMetrics.nplRatio.toFixed(3)}; K=${simorghMetrics.irbCapitalRate.toFixed(3)}; real=${simorghMetrics.realReturnAnnual.toFixed(2)}; incl=${simorghMetrics.inclusionScore.toFixed(2)}`,
+      simorghMetrics.aprPct > 20 &&
+        simorghMetrics.nplRatio > 0 && simorghMetrics.nplRatio <= 0.5 &&
+        simorghMetrics.irbCapitalRate > 0 &&
+        Math.abs(simorghMetrics.realReturnAnnual) < 3 &&
+        simorghMetrics.inclusionScore >= 0 && simorghMetrics.inclusionScore <= 1,
+    ),
+  );
+
+  // S-07 — 17 templates exist, category lookup works, random idea is coherent
+  const agri = templatesForCategories(["agri"]);
+  const idea = randomIdea(1234);
+  const ideaReplay = randomIdea(1234);
+  out.push(
+    assert(
+      "S-07",
+      "۱۷ قالب آغازین، نگاشت دسته‌ای (کشاورزی→خرید دین) و ایده تصادفی قطعی و منسجم",
+      "17 starting templates; category lookup hits the agri factoring family; random idea deterministic with control ranges",
+      "17 templates; agri→kharid-deyn; idea replay identical; hemmat∈[2,14]",
+      `n=${PRODUCT_TEMPLATES.length}; agri=${agri[0].contract}; idea=${idea.templateId}@${idea.controls.hemmat}همت; replay=${ideaReplay.prompt === idea.prompt ? "equal" : "diff"}`,
+      PRODUCT_TEMPLATES.length === 17 &&
+        agri[0].contract === "kharid-deyn" &&
+        ideaReplay.prompt === idea.prompt &&
+        idea.controls.hemmat >= 2 && idea.controls.hemmat <= 14,
+    ),
+  );
+
+  // S-08 — configurable regulations: patch, hard floors, compliance, reset
+  const before = getRegulations();
+  setRegulations({ loanRateCap: 0.5, dtiCap: 0.8 });
+  const after = getRegulations();
+  const clampedOk = after.loanRateCap <= 0.23 + 1e-9 && after.dtiCap <= 0.4 + 1e-9;
+  const violation = checkModeCompliance(
+    { nameFa: "تست", contract: "morabaha", loanRate: 0.25, installmentToIncome: 0.2, blockedRatio: 0.1 },
+    getRegulations(),
+  );
+  const failCount = violation.failed;
+  resetRegulations();
+  const restored = getRegulations().loanRateCap === before.loanRateCap;
+  out.push(
+    assert(
+      "S-08",
+      "کتاب مقررات پیکربندی‌شدنی با کف‌های سخت بانک مرکزی و گزارش انطباق فعال",
+      "Configurable rulebook enforces hard CBI floors on patch; compliance flags a 25% Murabaha breach; reset restores defaults",
+      "patch clamped; 1 fail on breach; restored",
+      `cap=${after.loanRateCap}; dti=${after.dtiCap}; fails=${failCount}; restored=${restored}`,
+      clampedOk && failCount === 1 && restored,
+    ),
+  );
+
+  // S-09 — customer calculator: QH instalment, revolving APR, points limit
+  const qh = estimate({ productClass: "qh", annualRate: 0.04, tenorMonths: 36, amountMillionToman: 300, monthlyIncomeMillionToman: 40, upfrontFeePct: 4 });
+  const revolving = estimate({ productClass: "revolving", annualRate: 0.23, tenorMonths: 12, amountMillionToman: 200, monthlyIncomeMillionToman: 40 });
+  const points = estimate({ productClass: "points", annualRate: 0.04, tenorMonths: 12, amountMillionToman: 100, depositBalance: 200, holdingMonths: 8 });
+  const pointsLimitExpected = 0.35 * 200 * (8 / 12);
+  out.push(
+    assert(
+      "S-09",
+      "محاسبه‌گر مشتری: اقساط قرض‌الحسنه، APR گردشی و سقف امتیازی L=k×B×H/N",
+      "Customer calculator: QH instalment, revolving APR, points limit L=k×B×H/N",
+      "QH monthly = P/36 + fee share; revolving APR>23; points==formula",
+      `QH=${qh.kind}:${(qh as { monthlyPayment: number }).monthlyPayment.toFixed(1)}م.ت · rev APR=${(revolving as { aprPct: number }).aprPct.toFixed(1)}٪ · pts=${(points as { estimatedLimit: number }).estimatedLimit.toFixed(1)} vs ${pointsLimitExpected.toFixed(1)}`,
+      Math.abs((qh as { monthlyPayment: number }).monthlyPayment - (300 / 36 + 300 * 0.04 / 36)) < 0.5 &&
+        (revolving as { aprPct: number }).aprPct > 23 &&
+        Math.abs((points as { estimatedLimit: number }).estimatedLimit - pointsLimitExpected) < 1e-9,
+    ),
+  );
+
+  // S-10 — population PD under shock rises (portfolio-level Vasicek)
+  const pdBase = populationPd(popA, 0);
+  const pdShock = populationPd(popA, 2);
+  out.push(
+    assert(
+      "S-10",
+      "PD جمعیت تحت شوک واشیکس افزایش می‌یابد (مدل نظام‌مند ریسک)",
+      "Population PD rises under a positive Vasicek systematic shock",
+      "PD(z=2) > PD(z=0)",
+      `${pdShock.toFixed(4)} > ${pdBase.toFixed(4)}`,
+      pdShock > pdBase && pdBase > 0,
+    ),
+  );
+
+  return {
+    id: "TC-SIMORGH",
+    titleFa: "آزمون لایه سیمرغ — کمّ، جمعیت، اعتبار، سناریو، قالب، مقررات، محاسبه‌گر",
+    titleEn: "Simorgh layer — quant, population, policy, stress, templates, regulations, calculator",
+    assertions: out,
+    passed: out.every((item) => item.passed),
+    durationMs: Date.now() - started,
+    summary: {
+      population: 300,
+      templates: PRODUCT_TEMPLATES.length,
+      scenarios: 7,
+      apr: Number(simorghMetrics.aprPct.toFixed(1)),
+    },
+  };
+}
+
 export async function runVerificationSuite(fast = false): Promise<VerificationSuiteResult> {
   const started = Date.now();
   const cases: TestCaseResult[] = [runDeterminismCase(), runCorrectionCase()];
   cases.push(await runStateGraphCase());
   cases.push(runMarketIntelCase());
+  cases.push(runSimorghCase());
   cases.push(await runTestCase1(fast));
   cases.push(await runTestCase2(fast));
   const all = cases.flatMap((c) => c.assertions);

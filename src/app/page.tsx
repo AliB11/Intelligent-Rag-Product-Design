@@ -23,6 +23,8 @@ import ALMCashFlowChart from "@/components/ALMCashFlowChart";
 import GuildEcosystemCanvas from "@/components/GuildEcosystemCanvas";
 import MarketIntelPanel from "@/components/MarketIntelPanel";
 import FacilityCatalog from "@/components/FacilityCatalog";
+import SimorghLab from "@/components/SimorghLab";
+import type { SimorghReport } from "@/lib/agents/state";
 import {
   CompliancePanel,
   KnowledgePanel,
@@ -61,6 +63,7 @@ interface GenerationResult {
   warnings: string[];
   constraints: RegulatoryConstraint[];
   marketIntel: MarketIntel | null;
+  simorgh: SimorghReport | null;
   persona: PersonaSpec | null;
   ecosystem: GuildEcosystem | null;
   product: ProductSpec | null;
@@ -84,6 +87,7 @@ type TabKey =
   | "guild"
   | "market"
   | "catalog"
+  | "simorgh"
   | "sensitivity"
   | "compliance"
   | "knowledge"
@@ -271,6 +275,7 @@ export default function Home() {
         warnings: [],
         constraints: run.retrievedConstraints ?? [],
         marketIntel: (run.marketIntel as MarketIntel | null) ?? null,
+        simorgh: null,
         persona: run.persona ?? null,
         ecosystem: run.guild ?? null,
         product: run.productSpec,
@@ -504,6 +509,7 @@ export default function Home() {
                     { key: "guild", label: "بوم زیست‌بوم صنفی", icon: <IconNetwork className="h-3.5 w-3.5" /> },
                     { key: "market", label: "تحلیل بازار", icon: <IconDatabase className="h-3.5 w-3.5" /> },
                     { key: "catalog", label: "کاتالوگ تسهیلات", icon: <IconDatabase className="h-3.5 w-3.5" /> },
+                    { key: "simorgh", label: "آزمایشگاه سیمرغ", icon: <IconFlask className="h-3.5 w-3.5" /> },
                     { key: "sensitivity", label: "حساسیت‌سنجی", icon: <IconFlask className="h-3.5 w-3.5" /> },
                     { key: "compliance", label: "انطباق و حسابداری", icon: <IconShield className="h-3.5 w-3.5" /> },
                     { key: "knowledge", label: "RAG و بنچمارک", icon: <IconDatabase className="h-3.5 w-3.5" /> },
@@ -547,6 +553,14 @@ export default function Home() {
                           `${b.segmentFa ? `، بخش هدف ${b.segmentFa}` : ""}` +
                           `؛ ۸ همت منبع، IRR هدف حداقل ۲۳٪، سقف LDR ۸۵٪، کف LCR ۱٫۰۵ و حداکثر ریسک واژگونی ۵٪`;
                         setSeededPrompt({ text, nonce: Date.now() });
+                      }}
+                    />
+                  ) : null}
+                  {tab === "simorgh" ? (
+                    <SimorghLab
+                      report={result.simorgh}
+                      estimate={({ prompt }) => {
+                        setSeededPrompt({ text: prompt, nonce: Date.now() });
                       }}
                     />
                   ) : null}
