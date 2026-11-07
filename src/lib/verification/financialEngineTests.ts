@@ -38,6 +38,8 @@ import { runPipeline } from "../agents/graph";
 import { createInitialState, makeEmitter, StateGraph } from "../agents/state";
 import { analyzeMarket } from "../rag/marketIntel";
 import { resolveFacility } from "../rag/facilityResolver";
+import { normalizeFaText, HybridRagIndex } from "../rag/hybridRag";
+import { recommendProducts, estimateMonthlyPayment, parseRecommendationQuery, topsis } from "../domain/recommendation";
 import { MARKET_PRODUCTS } from "../rag/benchmarks";
 import { generatePopulation, scoreTiers, empiricalShares, populationPd } from "../simorgh/population";
 import { portfolioUnderwriting } from "../simorgh/creditPolicy";
@@ -337,14 +339,34 @@ function unitAssertions(): Assertion[] {
   out.push(
     assert(
       "U-OPT-04",
-      "پوشش شش کهن‌الگوی ساختاری در موتور سنتز (پنج پایه + اعتبار امتیازی سپرده‌محور)",
-      "Six structural archetypes available to the synthesiser (five base + scored deposit-backed credit)",
-      "6",
+      "پوشش هشت کهن‌الگوی ساختاری در موتور سنتز",
+      "Eight structural archetypes available to the synthesiser",
+      "8",
       String(blueprintKeys.length),
-      blueprintKeys.length === 6 && blueprintKeys.includes("scored-deposit-credit"),
+      blueprintKeys.length === 8 && blueprintKeys.includes("scored-deposit-credit"),
     ),
   );
 
+  const index = new HybridRagIndex([{ id: "a", title: "وام قرض‌الحسنه", entity: "بانک", tags: "", body: "تسهیلات ازدواج", item: 1 }, { id: "b", title: "وام خودرو", entity: "بانک", tags: "", body: "خرید خودرو", item: 2 }]);
+  const hybrid = index.search("وام قرض الحسنه");
+  out.push(assert("U-RAG-01", "یکسان‌سازی نیم‌فاصله و بازیابی ترکیبی", "ZWNJ normalization and hybrid retrieval", "equivalent / a", `${normalizeFaText("قرض‌الحسنه") === normalizeFaText("قرض الحسنه")} / ${hybrid[0]?.id}`, normalizeFaText("قرض‌الحسنه") === normalizeFaText("قرض الحسنه") && hybrid[0]?.id === "a"));
+  const rec = recommendProducts({ query: "نیروگاه خورشیدی خانگی", amountToman: 100e6, monthlyIncomeToman: 1e6 });
+  out.push(assert("U-REC-01", "پیشنهاد مستند با هشدار توان بازپرداخت", "Grounded recommendation and affordability warning", "source and warning", `${rec.results[0]?.code} / ${rec.results[0]?.warnings.length}`, rec.results.some((r) => r.code === "MELLAT-SOLAR-HOME" && !!r.sourceRef && r.warnings.length > 0)));
+  out.push(assert("U-REC-02", "قسط صفر درصد", "Zero-rate payment calculation", "100", String(estimateMonthlyPayment(1200, 0, 12)), estimateMonthlyPayment(1200, 0, 12) === 100));
+  out.push(assert("U-RAG-02", "جست‌وجوی بدون واژه معنادار نتیجه ساختگی ندارد", "Empty meaningful query yields no hits", "0", String(index.search("برای من").length), index.search("برای من").length === 0));
+
+  const profile = parseRecommendationQuery("وام ۱٫۵ میلیارد با درآمد ماهانه ۵۰ میلیون");
+  out.push(assert("U-REC-03", "استخراج مبلغ فارسی با اعشار", "Persian decimal and income extraction", "1.5B / 50M", `${profile.amountToman} / ${profile.monthlyIncomeToman}`, profile.amountToman === 1.5e9 && profile.monthlyIncomeToman === 50e6));
+  const choices = topsis([[1, 2], [0, 3]], [0.5, 0.5], [true, false]);
+  out.push(assert("U-REC-04", "رتبه‌بندی تاپسیس معیار مثبت و منفی", "TOPSIS benefit and cost criteria", "first > second", choices.join(" / "), choices[0] > choices[1]));
+  const blue = recommendProducts({ query: "وام به جا بلوبانک", amountToman: 100e6, availableDepositToman: 1e6, alternativeYield: 0.24, availableGuarantees: ["none"] }).results.find((r) => r.code === "BLUBANK-BEJA-GUAR");
+  out.push(assert("U-REC-05", "هشدار تضامین و حداقل سپرده و سناریوی هزینه فرصت", "Guarantee and minimum deposit warning with opportunity scenario", "two conflicts / 60000", `${blue?.conflicts} / ${blue?.opportunityCostToman}`, Boolean(blue && blue.conflicts >= 2 && blue.opportunityCostToman === 60000)));
+  const override = recommendProducts({ query: "وام ۱۰۰ میلیون بلوبانک", amountToman: 50e6 });
+  out.push(assert("U-REC-06", "اولویت مقدار صریح فرم", "Explicit form amount overrides parsed query", "50M", String(override.profile.amountToman), override.profile.amountToman === 50e6));
+  out.push(assert("U-REC-07", "توصیه بازتولیدپذیر", "Recommendation is deterministic", "same JSON", "replay", JSON.stringify(override) === JSON.stringify(recommendProducts({ query: "وام ۱۰۰ میلیون بلوبانک", amountToman: 50e6 }))));
+
+  const snap = recommendProducts({ query: "وام نقدی اسنپ پی" }).results.find((r) => r.code === "SNAPPPAY-CREDIT-400");
+  out.push(assert("U-REC-08", "تشخیص اعتبار خرید در درخواست وجه نقد", "Purchase credit is flagged for a cash request", "cash restriction warning", snap?.warnings.join(" / ") ?? "missing", Boolean(snap && snap.warnings.some((w) => w.includes("وجه نقد")))));
   return out;
 }
 
