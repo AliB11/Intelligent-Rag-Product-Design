@@ -17,7 +17,7 @@
  * researched registry, not from a language model.
  */
 
-import { MARKET_PRODUCTS, type MarketProduct, type MarketStructuralParams } from "./benchmarks";
+import { MARKET_INDEX, MARKET_PRODUCTS, type MarketProduct, type MarketStructuralParams } from "./benchmarks";
 import type { ContractType, ModeArchetype } from "../domain/types";
 
 export type {
@@ -187,9 +187,12 @@ function scoreAnalog(context: MarketRequestContext, product: MarketProduct): Ana
  * real products and archetype-level medians usable as optimizer priors.
  */
 export function analyzeMarket(context: MarketRequestContext): MarketPriors {
+  const hybridHits = new Map(MARKET_INDEX.search(context.prompt, { topK: 20 }).filter((hit) => hit.matchedTerms.length > 0).map((hit) => [hit.id, hit]));
   const scored = MARKET_PRODUCTS
     .map((product) => {
       const item = scoreAnalog(context, product);
+      const hit = hybridHits.get(product.code);
+      if (hit) { item.score += hit.score; item.reasonsFa.push(`بازیابی ترکیبی: ${hit.matchedTerms.slice(0, 3).join("، ")}`); }
       // The product-identification agent's winner is the design basis: boost it
       // to the top so the archetype priors centre on that exact real facility.
       if (context.forcedCode && product.code === context.forcedCode) {
@@ -254,15 +257,6 @@ export function analyzeMarket(context: MarketRequestContext): MarketPriors {
 
 /** Best matching real products for a free-text query (used by the API layer). */
 export function searchMarketProducts(query: string, limit = 12): MarketProduct[] {
-  const tokens = query.toLowerCase().split(/[\s,،.;؛]+/).filter((token) => token.length > 1);
-  if (!tokens.length) return MARKET_PRODUCTS.slice(0, limit);
-  const scored = MARKET_PRODUCTS.map((product) => {
-    const haystack = `${product.bank} ${product.productFa} ${product.productEn} ${product.segmentFa} ${product.segmentEn} ${product.notesFa} ${product.contract}`.toLowerCase();
-    const hits = tokens.filter((token) => haystack.includes(token)).length;
-    return { product, hits };
-  })
-    .filter((item) => item.hits > 0)
-    .sort((a, b) => b.hits - a.hits);
-  const list = scored.length ? scored.map((item) => item.product) : MARKET_PRODUCTS;
-  return list.slice(0, limit);
+  if (!query.trim()) return MARKET_PRODUCTS.slice(0, limit);
+  return MARKET_INDEX.search(query, { topK: limit }).filter((hit) => hit.matchedTerms.length > 0).map((hit) => hit.item);
 }

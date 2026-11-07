@@ -234,6 +234,57 @@ export const PERSONAS: PersonaSpec[] = [
     lgd: 0.3,
     preferredContracts: ["kharid-deyn", "qarz-hasaneh", "gam"],
   },
+  {
+    key: "tech-freelancer",
+    titleFa: "فریلنسرها، متخصصان فناوری و اقتصاد دیجیتال",
+    titleEn: "Tech specialists, freelancers & digital economy",
+    monthlyNetIncomeToman: 65e6,
+    population: 1_450_000,
+    cashFlowBottleneckFa:
+      "فقدان فیش حقوقی رسمی و ضامن کارمند علی‌رغم گردش حساب بالا و دارایی در صندوق‌های درآمد ثابت و طلا",
+    b2bSuppliersFa: ["فروشگاه‌های تجهیزات دیجیتال و لپ‌تاپ", "فضاهای کار اشتراکی و زیرساخت ابری", "پلتفرم‌های آموزشی"],
+    b2cClientsFa: ["متخصصان نرم‌افزار و فریلنسرها", "استارتاپ‌ها", "تولیدکنندگان محتوا"],
+    settlementRailsFa: ["نئوبانک‌ها (بلو/ویپاد/توبانک)", "توثیق واحدهای صندوق درآمد ثابت و طلا", "سفته الکترونیک و چک صیادی"],
+    closedLoopPotential: 0.74,
+    sourceKappa: 1.25,
+    pd: 0.017,
+    lgd: 0.12,
+    preferredContracts: ["morabaha", "bnpl", "qarz-hasaneh"],
+  },
+  {
+    key: "young-couple",
+    titleFa: "زوج‌های جوان، متقاضیان جهیزیه و مسکن اولی",
+    titleEn: "Newlyweds, dowry & first-time homebuyers",
+    monthlyNetIncomeToman: 38e6,
+    population: 1_900_000,
+    cashFlowBottleneckFa:
+      "همزمان‌شدن هزینه رهن مسکن، خرید جهیزیه و صف انتظار طولانی وام ازدواج دولتی",
+    b2bSuppliersFa: ["تولیدکنندگان لوازم خانگی ایرانی", "فروشگاه‌های زنجیره‌ای جهیزیه", "موجران و بازار مسکن"],
+    b2cClientsFa: ["زوج‌های جوان", "خانواده‌های دارای فرزند جدید"],
+    settlementRailsFa: ["سامانه وام ازدواج و فرزندآوری", "کالاکارت و BNPL جهیزیه", "اوراق تسه مسکن"],
+    closedLoopPotential: 0.72,
+    sourceKappa: 1.15,
+    pd: 0.018,
+    lgd: 0.2,
+    preferredContracts: ["qarz-hasaneh", "morabaha", "bnpl"],
+  },
+  {
+    key: "wealth-investor",
+    titleFa: "سرمایه‌گذاران بازار سرمایه، صندوق‌های درآمد ثابت و طلا",
+    titleEn: "Capital market, fixed-income fund & gold investors",
+    monthlyNetIncomeToman: 120e6,
+    population: 2_800_000,
+    cashFlowBottleneckFa:
+      "عدم تمایل به فروش دارایی‌های طلایی یا واحدهای صندوق هنگام نیاز به نقدینگی کوتاه‌مدت (تله مالیات و از دست دادن بازده)",
+    b2bSuppliersFa: ["کارگزاری‌ها و سبدگردان‌ها (مفید، آگاه، کاریزما)", "پلتفرم‌های طلای آنلاین (طلاین، طلاسی، ملی‌گلد)", "بانک‌های امین"],
+    b2cClientsFa: ["دارندگان واحدهای صندوق سرمایه‌گذاری", "دارندگان سهام عدالت و گواهی شمش"],
+    settlementRailsFa: ["سامانه توثیق برخط سجام/سمات", "خط اعتباری پشتوانه صندوق", "کیف پول اعتباری لندتک"],
+    closedLoopPotential: 0.83,
+    sourceKappa: 1.35,
+    pd: 0.009,
+    lgd: 0.08,
+    preferredContracts: ["morabaha", "mudaraba", "bnpl"],
+  },
 ];
 
 export const personaByKey = (key: string | null): PersonaSpec | null =>
@@ -259,8 +310,12 @@ export function buildGuildEcosystem(
   // Scored deposit-backed credit (نیک/نگین/مهربانی pattern) is the natural
   // anchor for large payroll / student float bases: steady low-cost deposits
   // feeding a scored, sticky credit limit.
-  if (persona.key === "corporate-payroll" || persona.key === "student-community")
+  if (persona.key === "corporate-payroll" || persona.key === "student-community" || persona.key === "young-couple")
     recommended.push("scored-deposit-credit");
+  if (persona.key === "tech-freelancer" || persona.key === "student-community")
+    recommended.push("neobank-behavioral-credit");
+  if (persona.key === "wealth-investor" || persona.key === "gold-jeweller" || persona.key === "tech-freelancer")
+    recommended.push("wealth-collateral-credit");
 
   const suppliers = persona.b2bSuppliersFa.map((name, i) => ({
     name,
@@ -322,4 +377,6 @@ export const ARCHETYPE_LABEL_FA: Record<ModeArchetype, string> = {
   "corporate-float-anchor": "لنگر شناوری شرکتی",
   "supply-chain-gam": "اوراق گام زنجیره تأمین",
   "scored-deposit-credit": "اعتبار امتیازی سپرده‌محور (نیک/نگین/مهربانی)",
+  "neobank-behavioral-credit": "اعتبار رفتاری نئوبانکی بدون ضامن (الگوی بلو/ویپاد/توبانک)",
+  "wealth-collateral-credit": "اعتبار به پشتوانه دارایی هوشمند (صندوق درآمد ثابت/طلا/سهام)",
 };

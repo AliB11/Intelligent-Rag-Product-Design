@@ -7,6 +7,7 @@
  */
 
 import type { RegulatoryConstraint } from "../domain/types";
+import { HybridRagIndex } from "./hybridRag";
 
 export const EMBEDDING_DIM = 128;
 
@@ -358,6 +359,7 @@ export const KB_SEED: KbDocumentSeed[] = [
       { field: "blockedRatio", op: "<=", value: 0.35 },
     ],
   },
+
 ];
 
 export interface KbVectorDocument extends KbDocumentSeed {
@@ -376,32 +378,62 @@ export const KB_DOCUMENTS: KbVectorDocument[] = KB_SEED.map((doc) => {
   };
 });
 
-/** Hybrid hashed-vector + lexical retrieval over the local sample knowledge base. */
+const KB_HYBRID_INDEX = new HybridRagIndex<KbVectorDocument>(
+  KB_DOCUMENTS.map((doc) => ({
+    id: doc.id,
+    title: `${doc.titleFa} ${doc.titleEn}`,
+    entity: doc.authority,
+    tags: `${doc.code} ${doc.category} ${doc.constraints.map((c) => c.field).join(" ")}`,
+    body: `${doc.bodyFa} ${doc.bodyEn} ${doc.citation}`,
+    item: doc,
+  })),
+);
+
+/** Hybrid BM25+ + 256D Subword Dense + RRF retrieval over the regulatory KB. */
 export function retrieveKnowledge(
   query: string,
   topK = 6,
   boostCategories: string[] = [],
 ): RegulatoryConstraint[] {
-  const queryEmbedding = embed(query);
-  const queryTokens = new Set(tokenise(query));
   const limit = Math.max(1, Math.min(20, Math.floor(topK)));
-  const scored = KB_DOCUMENTS.map((doc) => {
-    const semantic = Math.max(0, cosine(queryEmbedding, doc.embedding));
-    const overlap = doc.tokens.reduce((count, token) => count + Number(queryTokens.has(token)), 0);
-    const lexical = queryTokens.size && doc.tokens.length
-      ? overlap / Math.sqrt(queryTokens.size * doc.tokens.length)
-      : 0;
-    const boost = boostCategories.includes(doc.category) ? 0.08 : 0;
-    return {
-      doc,
-      relevance: Math.min(1, 0.55 * semantic + 0.45 * lexical + boost),
-    };
-  })
-    .filter((item) => item.relevance > 0.04)
-    .sort((a, b) => b.relevance - a.relevance)
-    .slice(0, limit);
+  const hits = KB_HYBRID_INDEX.search(query, {
+    topK: limit,
+    minScore: 0.04,
+    boostFn: (doc) => (boostCategories.includes(doc.category) ? 0.08 : 0),
+  });
 
-  return scored.map(({ doc, relevance }) => ({
+  // Fallback to classic cosine+lexical if query had only stop words
+  if (!hits.length) {
+    const queryEmbedding = embed(query);
+    const queryTokens = new Set(tokenise(query));
+    return KB_DOCUMENTS.map((doc) => {
+      const semantic = Math.max(0, cosine(queryEmbedding, doc.embedding));
+      const overlap = doc.tokens.reduce((count, token) => count + Number(queryTokens.has(token)), 0);
+      const lexical = queryTokens.size && doc.tokens.length
+        ? overlap / Math.sqrt(queryTokens.size * doc.tokens.length)
+        : 0;
+      const boost = boostCategories.includes(doc.category) ? 0.08 : 0;
+      return { doc, relevance: Math.min(1, 0.55 * semantic + 0.45 * lexical + boost) };
+    })
+      .filter((item) => item.relevance > 0.04)
+      .sort((a, b) => b.relevance - a.relevance)
+      .slice(0, limit)
+      .map(({ doc, relevance }) => ({
+        id: doc.id,
+        code: doc.code,
+        titleFa: doc.titleFa,
+        titleEn: doc.titleEn,
+        authority: doc.authority,
+        category: doc.category,
+        bodyFa: doc.bodyFa,
+        bodyEn: doc.bodyEn,
+        citation: doc.citation,
+        relevance,
+        binding: doc.constraints,
+      }));
+  }
+
+  return hits.map(({ item: doc, score }) => ({
     id: doc.id,
     code: doc.code,
     titleFa: doc.titleFa,
@@ -411,7 +443,7 @@ export function retrieveKnowledge(
     bodyFa: doc.bodyFa,
     bodyEn: doc.bodyEn,
     citation: doc.citation,
-    relevance,
+    relevance: Number(score.toFixed(4)),
     binding: doc.constraints,
   }));
 }

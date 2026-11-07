@@ -224,6 +224,18 @@ async function json(path, init) {
   );
 }
 
+// Customer recommendation endpoint: source-grounded retrieval and input validation.
+{
+  const { status, body } = await json("/api/recommend", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "وام به جا بلوبانک", amountToman: 100e6, availableDepositToman: 1e6, alternativeYield: 0.24, availableGuarantees: ["none"] }),
+  });
+  const blue = body.results?.find((item) => item.code === "BLUBANK-BEJA-GUAR");
+  check("POST /api/recommend returns grounded results and constraint warnings", status === 200 && blue?.conflicts >= 2 && blue?.sourceRef?.includes("rade.ir"), `status ${status}, ${body.results?.length ?? 0} results`);
+  const invalid = await json("/api/recommend", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: "وام", alternativeYield: -1 }) });
+  check("POST /api/recommend rejects invalid inputs", invalid.status === 400, `status ${invalid.status}`);
+}
+
 // 9) verification suite endpoint
 {
   const { status, body } = await json("/api/selftest?fast=1");

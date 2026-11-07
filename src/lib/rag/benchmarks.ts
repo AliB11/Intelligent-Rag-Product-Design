@@ -12,7 +12,15 @@
  * current Money & Credit Council directives before operational use.
  */
 
-import type { BenchmarkScheme, ContractType, ModeArchetype } from "../domain/types";
+import type {
+  BenchmarkScheme,
+  ContractType,
+  GuaranteeType,
+  IcsCreditGrade,
+  ModeArchetype,
+  ProviderCategory,
+} from "../domain/types";
+import { HybridRagIndex } from "./hybridRag";
 
 export type MarketSourceType = "bank" | "fund" | "fintech" | "regulatory" | "press";
 
@@ -63,6 +71,16 @@ export interface MarketProduct {
   sourceRef: string;
   /** Engine-space parameters used for prior derivation. */
   params: MarketStructuralParams;
+  /** Rade.ir ecosystem classification & eligibility metadata. */
+  providerCategory?: ProviderCategory;
+  minCreditGrade?: IcsCreditGrade;
+  guaranteesAccepted?: GuaranteeType[];
+  digitalOnboarding?: boolean;
+  effectiveAprHint?: number | null;
+  transferableRight?: boolean;
+  minimumDepositToman?: number;
+  observedAt?: string;
+  useType?: "cash" | "purchase";
 }
 
 interface Raw {
@@ -89,6 +107,15 @@ interface Raw {
   sourceRef: string;
   /** Engine-space parameters; missing fields fall back to the archetype default. */
   params?: Partial<MarketStructuralParams>;
+  providerCategory?: ProviderCategory;
+  minCreditGrade?: IcsCreditGrade;
+  guaranteesAccepted?: GuaranteeType[];
+  digitalOnboarding?: boolean;
+  effectiveAprHint?: number | null;
+  transferableRight?: boolean;
+  minimumDepositToman?: number;
+  observedAt?: string;
+  useType?: "cash" | "purchase";
 }
 
 const RAW: Raw[] = [
@@ -1404,6 +1431,56 @@ const RAW: Raw[] = [
     sourceRef: "rade.ir/loan-interest-free-loan/706845 (وام بازنشستگان تأمین اجتماعی رفاه)",
     params: { sleepMonths: 0, tenorMonths: 24, waitingMonths: 0, loanMultiplier: 1.0, blockedRatio: 0, closedLoopRetention: 0.65, withdrawalFraction: 0.2, depositRate: 0, loanRate: 0.04 },
   },
+  // Direct Rade product pages, observed 2026-11-07. Conditions can change.
+  {
+    code: "BLUBANK-BEJA-GUAR", bank: "بلوبانک سامان", productFa: "وام به‌جا با ضامن بلوبانک", productEn: "BluBank Beja with guarantor",
+    contract: "morabaha", archetype: "neobank-behavioral-credit", ceilingToman: 400e6, profitRate: 0.20, tenorMonths: 12, sleepMonths: 3,
+    segmentFa: "مشتریان بلوبانک با رتبه اعتباری و میانگین موجودی واجد شرایط", segmentEn: "Eligible BluBank customers",
+    notesFa: "میانگین مانده سه‌ماهه حداقل ۳ میلیون تومان و سقف وام وابسته به میانگین موجودی و سابقه پرداخت است. ضامن باید رتبه B2 یا بالاتر داشته باشد. افزون بر سود ۲۰٪، کارمزد ۴٪ و هزینه تمبر اعلام شده است.",
+    sourceType: "bank", sourceRef: "https://www.rade.ir/loan-instant-loan/706908-وام-بهجا-بلوبانک/", providerCategory: "neobank", useType: "cash", guaranteesAccepted: ["official-guarantor"], digitalOnboarding: true, minimumDepositToman: 3e6, observedAt: "2026-11-07",
+    params: { loanRate: 0.20, sleepMonths: 3, tenorMonths: 12, loanMultiplier: 1 },
+  },
+  {
+    code: "BLUBANK-BEJA-NOGUAR", bank: "بلوبانک سامان", productFa: "وام به‌جا بدون ضامن بلوبانک", productEn: "BluBank Beja no guarantor",
+    contract: "morabaha", archetype: "neobank-behavioral-credit", ceilingToman: 200e6, profitRate: 0.20, tenorMonths: 12, sleepMonths: 3,
+    segmentFa: "مشتریان واجد شرایط با رتبه اعتباری مناسب", segmentEn: "Eligible customers with strong credit",
+    notesFa: "میانگین مانده سه‌ماهه حداقل ۳ میلیون تومان؛ سقف ۲۰۰ میلیون مختص دارندگان رتبه A1 تا B2 با بیش از ۱۲ قسط به‌موقع است. سایر گروه‌ها سقف پایین‌تری دارند؛ کارمزد و هزینه‌های جانبی را بررسی کنید.",
+    sourceType: "bank", sourceRef: "https://www.rade.ir/loan-instant-loan/706908-وام-بهجا-بلوبانک/", providerCategory: "neobank", useType: "cash", guaranteesAccepted: ["none"], digitalOnboarding: true, minimumDepositToman: 3e6, observedAt: "2026-11-07",
+    params: { loanRate: 0.20, sleepMonths: 3, tenorMonths: 12, loanMultiplier: 1 },
+  },
+  {
+    code: "AZKIVAM-300", bank: "ازکی‌وام", productFa: "اعتبار خرید بلندمدت ازکی‌وام", productEn: "Azki Vam instalment purchase credit",
+    contract: "bnpl", archetype: "neobank-behavioral-credit", ceilingToman: 300e6, profitRate: 0.23, tenorMonths: 24,
+    segmentFa: "خرید کالا و خدمات از فروشگاه‌های طرف قرارداد", segmentEn: "Merchant network purchase credit",
+    notesFa: "اعتبار خرید است و الزاماً نقدی نیست؛ برای مبالغ بالای ۱۰۰ میلیون علاوه بر چک صیادی، مدارک شغلی لازم است. هزینه اشتراک و اعتبارسنجی را بررسی کنید.",
+    sourceType: "fintech", sourceRef: "https://www.rade.ir/installment/694692-ازکی-وام/", providerCategory: "lendtech", useType: "purchase", guaranteesAccepted: ["sayad-cheque"], digitalOnboarding: true, observedAt: "2026-11-07",
+    params: { loanRate: 0.23, tenorMonths: 24 },
+  },
+  {
+    code: "SNAPPPAY-CREDIT-400", bank: "اسنپ‌پی", productFa: "اعتبار بانکی خرید اقساطی اسنپ‌پی", productEn: "SnappPay instalment purchase credit",
+    contract: "bnpl", archetype: "neobank-behavioral-credit", ceilingToman: 400e6, profitRate: 0.23, tenorMonths: 18,
+    segmentFa: "خرید کالا از فروشگاه‌های طرف قرارداد", segmentEn: "Merchant network purchase credit",
+    notesFa: "اعتبار کیف پول برای خرید کالا است، نه وجه نقد. نرخ مؤثر و هزینه اشتراک وابسته به مبلغ، مدت و شرایط است؛ رده ۵۲٫۲۶۱٪ را صرفاً برای مثال ۱۰۰ میلیون و ۱۲ ماه گزارش کرده است.",
+    sourceType: "fintech", sourceRef: "https://www.rade.ir/installment/694682-اسنپ-پی/", providerCategory: "lendtech", useType: "purchase", guaranteesAccepted: ["sayad-cheque"], digitalOnboarding: true, effectiveAprHint: 0.52261, observedAt: "2026-11-07",
+    params: { loanRate: 0.23, tenorMonths: 18 },
+  },
+  {
+    code: "TARA-CHEQUE-200", bank: "تارا", productFa: "اعتبار خرید تارا با چک صیادی", productEn: "Tara purchase credit against cheque",
+    contract: "bnpl", archetype: "neobank-behavioral-credit", ceilingToman: 200e6, profitRate: 0.23, tenorMonths: 24,
+    segmentFa: "خرید اقساطی کالا با چک صیادی", segmentEn: "Instalment purchases with Sayad cheque",
+    notesFa: "اعتبار خرید از فروشگاه‌های طرف قرارداد و مشروط به چک صیادی و اعتبارسنجی است؛ هزینه اشتراک جداگانه را بررسی کنید.",
+    sourceType: "fintech", sourceRef: "https://www.rade.ir/installment/694681-تارا/", providerCategory: "lendtech", useType: "purchase", guaranteesAccepted: ["sayad-cheque"], digitalOnboarding: true, observedAt: "2026-11-07",
+    params: { loanRate: 0.23, tenorMonths: 24 },
+  },
+  {
+    code: "TARA-WEALTH-300", bank: "تارا", productFa: "اعتبار خرید تارا با وثیقه دارایی دیجیتال", productEn: "Tara purchase credit against digital assets",
+    contract: "bnpl", archetype: "wealth-collateral-credit", ceilingToman: 300e6, profitRate: 0.23, tenorMonths: 24,
+    segmentFa: "دارندگان دارایی دیجیتال واجد شرایط برای خرید اقساطی", segmentEn: "Eligible digital asset holders",
+    notesFa: "اعتبار خرید با توثیق دارایی دیجیتال؛ شرایط دارایی پذیرفته‌شده و هزینه اشتراک را بررسی کنید. نقدی نیست.",
+    sourceType: "fintech", sourceRef: "https://www.rade.ir/installment/694681-تارا/", providerCategory: "lendtech", useType: "purchase", guaranteesAccepted: ["wealth-collateral"], digitalOnboarding: true, observedAt: "2026-11-07",
+    params: { loanRate: 0.23, tenorMonths: 24 },
+  },
+
 ];
 
 // Engine-space defaults per archetype; fills any field a source row does not specify.
@@ -1437,6 +1514,16 @@ export const ARCHETYPE_PARAM_FALLBACK: Record<ModeArchetype, MarketStructuralPar
     sleepMonths: 6, tenorMonths: 48, waitingMonths: 2, loanMultiplier: 1.8,
     blockedRatio: 0.03, closedLoopRetention: 0.75, withdrawalFraction: 0.28,
     depositRate: 0.001, loanRate: 0.09,
+  },
+  "neobank-behavioral-credit": {
+    sleepMonths: 3, tenorMonths: 12, waitingMonths: 0, loanMultiplier: 1,
+    blockedRatio: 0, closedLoopRetention: 0.5, withdrawalFraction: 0.35,
+    depositRate: 0, loanRate: 0.2,
+  },
+  "wealth-collateral-credit": {
+    sleepMonths: 0, tenorMonths: 12, waitingMonths: 0, loanMultiplier: 0.7,
+    blockedRatio: 0, closedLoopRetention: 0.4, withdrawalFraction: 0.35,
+    depositRate: 0, loanRate: 0.23,
   },
 };
 
@@ -1475,6 +1562,15 @@ export const MARKET_PRODUCTS: MarketProduct[] = RAW.map((raw) => {
     multiMode: raw.multiMode,
     sourceType: raw.sourceType,
     sourceRef: raw.sourceRef,
+    providerCategory: raw.providerCategory,
+    minCreditGrade: raw.minCreditGrade,
+    guaranteesAccepted: raw.guaranteesAccepted,
+    digitalOnboarding: raw.digitalOnboarding,
+    effectiveAprHint: raw.effectiveAprHint,
+    transferableRight: raw.transferableRight,
+    minimumDepositToman: raw.minimumDepositToman,
+    observedAt: raw.observedAt,
+    useType: raw.useType,
     params,
   };
 });
@@ -1499,19 +1595,25 @@ export const BENCHMARK_SCHEMES: BenchmarkScheme[] = MARKET_PRODUCTS.map((product
   segmentEn: product.segmentEn,
   notesFa: product.notesFa,
   multiMode: product.multiMode,
+  providerCategory: product.providerCategory,
+  minCreditGrade: product.minCreditGrade,
+  guaranteesAccepted: product.guaranteesAccepted,
+  digitalOnboarding: product.digitalOnboarding,
+  effectiveAprHint: product.effectiveAprHint,
+  sourceRef: product.sourceRef,
 }));
 
-/** Lexical benchmark search retained for the API/report layers. */
+/** Hybrid retrieval exposes lexical and feature-hash evidence for each hit. */
+export const MARKET_INDEX = new HybridRagIndex<MarketProduct>(MARKET_PRODUCTS.map((p) => ({
+  id: p.code, title: `${p.productFa} ${p.productEn}`, entity: p.bank,
+  tags: `${p.contract} ${p.archetype} ${p.segmentFa} ${p.segmentEn}`,
+  body: p.notesFa, item: p,
+})));
+
 export function searchBenchmarks(query: string, limit = 12): BenchmarkScheme[] {
-  const tokens = query.toLowerCase().split(/[\s,،.;؛]+/).filter((token) => token.length > 1);
-  if (!tokens.length) return BENCHMARK_SCHEMES.slice(0, limit);
-  const scored = BENCHMARK_SCHEMES.map((benchmark) => {
-    const haystack = `${benchmark.bank} ${benchmark.productFa} ${benchmark.productEn} ${benchmark.segmentFa} ${benchmark.segmentEn} ${benchmark.notesFa} ${benchmark.contractType}`.toLowerCase();
-    const hits = tokens.filter((token) => haystack.includes(token)).length;
-    return { benchmark, hits };
-  })
-    .filter((item) => item.hits > 0)
-    .sort((a, b) => b.hits - a.hits);
-  const list = scored.length ? scored.map((item) => item.benchmark) : BENCHMARK_SCHEMES;
-  return list.slice(0, limit);
+  if (!query.trim()) return BENCHMARK_SCHEMES.slice(0, limit);
+  const byCode = new Map(BENCHMARK_SCHEMES.map((item) => [item.code, item]));
+  return MARKET_INDEX.search(query, { topK: limit })
+    .map((hit) => byCode.get(hit.id))
+    .filter((item): item is BenchmarkScheme => item !== undefined);
 }

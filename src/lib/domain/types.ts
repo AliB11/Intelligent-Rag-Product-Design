@@ -19,7 +19,68 @@ export type ModeArchetype =
   | "merchant-pos-accelerator"
   | "corporate-float-anchor"
   | "supply-chain-gam"
-  | "scored-deposit-credit";
+  | "scored-deposit-credit"
+  | "neobank-behavioral-credit"
+  | "wealth-collateral-credit";
+
+export type AgentIntentMode = "hybrid" | "recommend" | "design";
+
+export type IcsCreditGrade =
+  | "A1" | "A2" | "A3"
+  | "B1" | "B2" | "B3"
+  | "C1" | "C2" | "C3"
+  | "D1" | "D2" | "D3"
+  | "E1" | "E2" | "E3";
+
+export type GuaranteeType =
+  | "none"
+  | "sana-safteh"
+  | "sayad-cheque"
+  | "payroll-deduction"
+  | "official-guarantor"
+  | "deposit-block"
+  | "wealth-collateral"
+  | "property-deed"
+  | "vehicle-pledge"
+  | "pos-turnover";
+
+export type ProviderCategory =
+  | "bank"
+  | "neobank"
+  | "lendtech"
+  | "housing"
+  | "wealth"
+  | "fund"
+  | "regulatory";
+
+/** Structured customer/applicant profile extracted from NL prompt + UI controls. */
+export interface CustomerProfile {
+  intentMode: AgentIntentMode;
+  requestedAmountToman: number | null;
+  monthlyIncomeToman: number;
+  existingDebtInstallmentToman: number;
+  maxMonthlyInstallmentToman: number | null;
+  availableDepositToman: number | null;
+  maxSleepMonths: number | null;
+  creditScore: number;
+  creditGrade: IcsCreditGrade;
+  availableGuarantees: GuaranteeType[];
+  urgency: "instant" | "short" | "flexible";
+  needCategories: string[];
+  preferZeroInterest: boolean;
+  preferDigitalOnly: boolean;
+}
+
+export interface CustomerProfileOverrides {
+  intentMode?: AgentIntentMode;
+  requestedAmountMillionToman?: number;
+  monthlyIncomeMillionToman?: number;
+  availableDepositMillionToman?: number;
+  maxSleepMonths?: number;
+  creditGrade?: IcsCreditGrade;
+  availableGuarantees?: GuaranteeType[];
+  urgency?: "instant" | "short" | "flexible";
+}
 
 export type BlockReleaseSchedule = "linear" | "midpoint" | "end";
 
@@ -180,6 +241,8 @@ export interface ProductGenerationRequest {
     matchedOnFa: string[];
     alternativesFa: { productFa: string; bank: string; confidence: number }[];
   } | null;
+  /** Structured customer financial profile (Rade-grade applicant intelligence). */
+  customerProfile?: CustomerProfile;
   parsedTokens: { raw: string; kind: string; value: number | string }[];
 }
 
@@ -332,4 +395,10 @@ export interface BenchmarkScheme {
   segmentEn: string;
   notesFa: string;
   multiMode?: string[];
+  providerCategory?: ProviderCategory;
+  minCreditGrade?: IcsCreditGrade;
+  guaranteesAccepted?: GuaranteeType[];
+  digitalOnboarding?: boolean;
+  effectiveAprHint?: number | null;
+  sourceRef?: string;
 }

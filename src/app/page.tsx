@@ -23,6 +23,7 @@ import ALMCashFlowChart from "@/components/ALMCashFlowChart";
 import GuildEcosystemCanvas from "@/components/GuildEcosystemCanvas";
 import MarketIntelPanel from "@/components/MarketIntelPanel";
 import FacilityCatalog from "@/components/FacilityCatalog";
+import ProductRecommendationPanel from "@/components/ProductRecommendationPanel";
 import SimorghLab from "@/components/SimorghLab";
 import type { SimorghReport } from "@/lib/agents/state";
 import {
@@ -419,6 +420,7 @@ export default function Home() {
         </div>
 
         <div className="space-y-4">
+          <ProductRecommendationPanel onDesign={(text) => { setSeededPrompt({ text, nonce: Date.now() }); window.scrollTo({ top: 0, behavior: "smooth" }); }} />
           {!result ? (
             <>
               <Panel>
