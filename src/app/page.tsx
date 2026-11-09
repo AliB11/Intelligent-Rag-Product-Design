@@ -25,6 +25,8 @@ import MarketIntelPanel from "@/components/MarketIntelPanel";
 import FacilityCatalog from "@/components/FacilityCatalog";
 import ProductRecommendationPanel from "@/components/ProductRecommendationPanel";
 import SimorghLab from "@/components/SimorghLab";
+import ProductDossierPanel from "@/components/ProductDossierPanel";
+import type { ProductDossier } from "@/lib/dossier/productDossier";
 import type { SimorghReport } from "@/lib/agents/state";
 import {
   CompliancePanel,
@@ -78,6 +80,7 @@ interface GenerationResult {
   benchmarks: BenchmarkScheme[];
   reportFa: string;
   reportEn: string;
+  dossier: ProductDossier | null;
   elapsedMs: number;
 }
 
@@ -85,6 +88,7 @@ type TabKey =
   | "overview"
   | "matrix"
   | "alm"
+  | "dossier"
   | "guild"
   | "market"
   | "catalog"
@@ -97,9 +101,9 @@ type TabKey =
 const STAGES = [
   { n: 1, fa: "تجزیه قصد طبیعی به تابع هدف و قیود صوری" },
   { n: 2, fa: "بازیابی مقررات بانک مرکزی و قواعد عقود اسلامی (RAG)" },
-  { n: 3, fa: "سنتز MILP/MINLP ساختار تک‌طرحی یا چندطرحی" },
-  { n: 4, fa: "آزمون تنش مونت‌کارلو در دوقلوی دیجیتال ALM (۶۰ ماه)" },
-  { n: 5, fa: "صدور مشخصات محصول، ماتریس، داشبورد حساسیت و پیش‌نویس انطباق" },
+  { n: 3, fa: "سنتز MILP/MINLP و حل معکوس هفت‌متغیره با پوسته مقرراتی" },
+  { n: 4, fa: "نگهبان استرس (پایه + سه شوک) و دوقلوی دیجیتال ALM مونت‌کارلو" },
+  { n: 5, fa: "ممیزی ربا پنهان، حلقه نقد ساخت‌یافته و صدور دوسیه محصول" },
 ];
 
 export default function Home() {
@@ -290,6 +294,7 @@ export default function Home() {
         benchmarks: Array.isArray(run.benchmarks) ? run.benchmarks : [],
         reportFa: run.reportFa,
         reportEn: run.reportEn ?? "",
+        dossier: null,
         elapsedMs: 0,
       });
       setEvents(Array.isArray(run.trace) ? run.trace : []);
@@ -508,6 +513,7 @@ export default function Home() {
                     { key: "overview", label: "سنجه‌ها و ممیزی", icon: <IconScale className="h-3.5 w-3.5" /> },
                     { key: "matrix", label: "ماتریس چندطرحی", icon: <IconLayers className="h-3.5 w-3.5" />, badge: fmtNum(result.product?.modes.length ?? 0) },
                     { key: "alm", label: "جریان نقد ALM", icon: <IconChart className="h-3.5 w-3.5" /> },
+                    { key: "dossier", label: "دوسیه محصول", icon: <IconDoc className="h-3.5 w-3.5" /> },
                     { key: "guild", label: "بوم زیست‌بوم صنفی", icon: <IconNetwork className="h-3.5 w-3.5" /> },
                     { key: "market", label: "تحلیل بازار", icon: <IconDatabase className="h-3.5 w-3.5" /> },
                     { key: "catalog", label: "کاتالوگ تسهیلات", icon: <IconDatabase className="h-3.5 w-3.5" /> },
@@ -535,6 +541,7 @@ export default function Home() {
                     <MultiModeMatrixTable product={result.product} findings={result.findings} />
                   ) : null}
                   {tab === "alm" ? <ALMCashFlowChart alm={result.alm} request={request} /> : null}
+                  {tab === "dossier" ? <ProductDossierPanel dossier={result.dossier} /> : null}
                   {tab === "guild" ? (
                     <GuildEcosystemCanvas
                       ecosystem={result.ecosystem}

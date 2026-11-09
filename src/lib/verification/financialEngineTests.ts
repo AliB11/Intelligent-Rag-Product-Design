@@ -13,14 +13,15 @@
  *                gamma_m >= 0.65 and near-zero net liquidity drain
  */
 
-import { costOfFunds, depositRateForTargetCoF } from "../domain/costOfFunds";
+import { blendedCostOfFunds, costOfFunds, depositRateForTargetCoF } from "../domain/costOfFunds";
+import { earlyWithdrawalSettlement } from "../domain/depositPenalty";
 import {
   bankProductNpv,
   blockedReleaseSchedule,
   installmentAffordability,
   weightedAverageBalance,
 } from "../domain/pointEngine";
-import { irr, npv, pmt, percentile, createRng, sampleBeta } from "../domain/financial";
+import { irr, npv, pmt, percentile, createRng, sampleBeta, solveIrr } from "../domain/financial";
 import {
   allocateWeights,
   applyDirectives,
@@ -51,7 +52,9 @@ import { getRegulations, setRegulations, resetRegulations, checkModeCompliance }
 import { estimate } from "../simorgh/calculator";
 import { randomIdea } from "../simorgh/randomIdea";
 import {
+  CB_REWARD_RATE,
   HEMMAT_RIAL,
+  LIQUIDITY_DEDUCTION_DEFAULT,
   MAX_MONTE_CARLO_RUNS,
   MC_RUNS,
   REGULATORY,
@@ -59,6 +62,29 @@ import {
   OPEX_RATIO_DEFAULT,
   contractRateCeiling,
 } from "../domain/constants";
+import {
+  formatZodIssues,
+  generateRequestSchema,
+  pipelineOptionsSchema,
+  recommendRequestSchema,
+} from "../validation/schemas";
+import {
+  applyReserveFloor,
+  clampBlockedRatioToConstraints,
+  clampFeeRateToConstraints,
+  clampLoanRateToConstraints,
+  defaultRegulatoryConstraints,
+  regulatoryConstraintsSchema,
+  type RegulatoryConstraints,
+} from "../domain/regulatory";
+import { extractRegulatoryConstraints } from "../rag/regulatoryConstraintExtractor";
+import { computeCannibalization } from "../domain/cannibalization";
+import { projectCohortLiquidity, type CohortInput } from "../domain/cohortModel";
+import { solveInverseProduct, type InverseSolverInput } from "../domain/inverseSolver";
+import { buildProductDossier, productDossierSchema } from "../dossier/productDossier";
+import { isChunkActiveAt, regulatoryChunkMetaSchema } from "../rag/governance";
+import { allBindings, KB_DOCUMENTS, KB_SEED, retrieveKnowledge } from "../rag/knowledgeBase";
+import type { RegulatoryChunkMeta, RegulatoryConstraint } from "../domain/types";
 import type { ModeArchetype } from "../domain/types";
 
 export interface Assertion {
@@ -1396,12 +1422,1622 @@ export function runSimorghCase(): TestCaseResult {
   };
 }
 
+/**
+ * Test case — numerical & boundary edge cases: hardened IRR root-finding,
+ * Qard-al-Hasan (zero-interest) flows, high blocked-deposit ratios, early
+ * withdrawal penalties, cost-of-funds guards and Zod schema boundaries.
+ */
+function runEdgeCaseCase(): TestCaseResult {
+  const started = Date.now();
+  const out: Assertion[] = [];
+
+  // --- IRR: closed-form certification within 1e-6 --------------------------
+  // Single 12-month lump sum repaid at 1%/month: flows at t=0 and t=12 only.
+  const exactMonthly = Math.pow(1.01, 12);
+  const closedForm = irr([-100, ...new Array<number>(11).fill(0), 100 * exactMonthly]);
+  out.push(
+    assert(
+      "U-IRR-01",
+      "گواهی ریشه بسته IRR با دقت کمتر از ۱۰⁻⁶",
+      "Closed-form IRR root certified inside 1e-6 tolerance",
+      "|r − 0.01| < 1e-6",
+      Number.isFinite(closedForm) ? Math.abs(closedForm - 0.01).toExponential(2) : String(closedForm),
+      Number.isFinite(closedForm) && Math.abs(closedForm - 0.01) < 1e-6,
+    ),
+  );
+
+  // --- IRR: scale invariance (regression: 1e300 flows used to overflow) ---
+  const baseFlows = [-1000, 300, 400, 500];
+  const rBase = irr(baseFlows);
+  const rBig = irr(baseFlows.map((x) => x * 1e300));
+  const rSmall = irr(baseFlows.map((x) => x * 1e-300));
+  out.push(
+    assert(
+      "U-IRR-02",
+      "تغییر مقیاس جریان‌های نقد (۱۰³۰۰±) بدون NaN و با همان ریشه",
+      "Scale invariance across 1e±300 flows without NaN, same root",
+      "finite roots within 1e-6 of 0.0890",
+      [rBase, rBig, rSmall].map((r) => (Number.isFinite(r) ? r.toFixed(6) : String(r))).join(" / "),
+      [rBase, rBig, rSmall].every(
+        (r) => Number.isFinite(r) && Math.abs(r - rBase) < 1e-6 && Math.abs(r - 0.089) < 0.002,
+      ),
+    ),
+  );
+
+  // --- IRR: root below the legacy −0.9 bracket floor ----------------------
+  // npv(r) = −1 + 1e-4/(1+r) has its unique root at r = −0.9999.
+  const deepRoot = irr([-1, 1e-4]);
+  out.push(
+    assert(
+      "U-IRR-03",
+      "ریشه IRR پایین‌تر از کف قدیمی −۰٫۹ (نزدیک به −۱) پیدا می‌شود",
+      "IRR root below the legacy −0.9 floor (near −1) is bracketed",
+      "−0.9999 ± 1e-6",
+      Number.isFinite(deepRoot) ? deepRoot.toFixed(6) : String(deepRoot),
+      Number.isFinite(deepRoot) && Math.abs(deepRoot + 0.9999) < 1e-6,
+    ),
+  );
+
+  // --- IRR: Qard zero-rate schedule + documented degenerate reasons -------
+  const qardIrr = irr([-1000, 250, 250, 250, 250]);
+  const zeroStream = solveIrr([0, 0, 0, 0]);
+  const noSign = solveIrr([1, 2, 3]);
+  const noRoot = solveIrr([1, -1, 1]);
+  const tooShort = solveIrr([100]);
+  const nonFinite = solveIrr([Infinity, 1]);
+  out.push(
+    assert(
+      "U-IRR-04",
+      "جریان قرض‌الحسنه بدون بهره صفر و دلایل مستند نامعین‌بودن",
+      "Zero-interest Qard stream solves to 0; undefined cases carry reasons",
+      "qard≈0 finite; reasons documented; no Infinity anywhere",
+      `qard=${Number.isFinite(qardIrr) ? qardIrr.toFixed(8) : qardIrr}; ` +
+        `${zeroStream.method}/${noSign.reason}/${noRoot.reason}/${tooShort.reason}/${nonFinite.reason}`,
+      Number.isFinite(qardIrr) &&
+        Math.abs(qardIrr) < 1e-6 &&
+        zeroStream.converged &&
+        zeroStream.rate === 0 &&
+        zeroStream.method === "closed_form" &&
+        !noSign.converged &&
+        noSign.reason === "no_sign_change" &&
+        !noRoot.converged &&
+        noRoot.reason === "no_bracket" &&
+        tooShort.reason === "insufficient_flows" &&
+        nonFinite.reason === "non_finite_flows" &&
+        [qardIrr, zeroStream.rate, noSign.rate, noRoot.rate].every(
+          (v) => v !== Infinity && v !== -Infinity,
+        ),
+    ),
+  );
+
+  // --- IRR: property — seeded single-root streams vs an independent
+  //     dense-scan + bisection reference, all within 1e-6. ------------------
+  const referenceRoot = (flows: number[]): number | null => {
+    const f = (r: number) => npv(r, flows, true);
+    // Independent deterministic scan (deliberately different grid from the
+    // production solver): dense linear band + logarithmic tail.
+    const probes: number[] = [];
+    for (let i = 0; i <= 1500; i += 1) probes.push(-0.999999 + (i * (101)) / 1500);
+    for (let i = 1; i <= 600; i += 1) probes.push(Math.pow(10, -3 + (i * 10) / 600));
+    let prevR = probes[0];
+    let prevF = f(prevR);
+    if (prevF === 0) return prevR;
+    for (let i = 1; i < probes.length; i += 1) {
+      const r = probes[i];
+      const fr = f(r);
+      if (fr === 0) return r;
+      if (Number.isFinite(prevF) && Number.isFinite(fr) && Math.sign(fr) !== Math.sign(prevF)) {
+        let lo = prevR;
+        let hi = r;
+        for (let k = 0; k < 120; k += 1) {
+          const mid = (lo + hi) / 2;
+          const fm = f(mid);
+          if (!Number.isFinite(fm)) break;
+          if (fm === 0) return mid;
+          if (Math.sign(fm) === Math.sign(prevF)) lo = mid;
+          else hi = mid;
+        }
+        return (lo + hi) / 2;
+      }
+      prevR = r;
+      prevF = fr;
+    }
+    return null;
+  };
+  const propRng = createRng(20261109);
+  let matched = 0;
+  let total = 0;
+  let worstError = 0;
+  for (let k = 0; k < 40; k += 1) {
+    // Exactly-one-root families: −1 then non-negative flows (bank side), or
+    // +1 then non-positive flows (borrower side) — monotone in x = 1/(1+r).
+    const n = 3 + Math.floor(propRng() * 8);
+    const borrowerSide = propRng() < 0.5;
+    const flows: number[] = [borrowerSide ? 1 : -1];
+    for (let t = 1; t < n; t += 1) {
+      const magnitude = Math.pow(10, -3 + propRng() * 6); // 1e-3 .. 1e3
+      flows.push(borrowerSide ? -magnitude : magnitude);
+    }
+    const ref = referenceRoot(flows);
+    if (ref === null) continue;
+    total += 1;
+    const solved = solveIrr(flows, 0.02);
+    if (!solved.converged || !Number.isFinite(solved.rate)) continue;
+    const err = Math.abs(solved.rate - ref);
+    worstError = Math.max(worstError, err);
+    if (err <= 1e-6) matched += 1;
+  }
+  out.push(
+    assert(
+      "U-IRR-06",
+      "ویژگی: ۴۰ جریان تصادفی قطعی با یک ریشه، تطبیق با مرجع تراکمی در ۱۰⁻⁶",
+      "Property: 40 seeded single-root streams match a dense-scan reference within 1e-6",
+      `${total}/${total} matched, worst error < 1e-6`,
+      `${matched}/${total} matched, worst ${worstError.toExponential(2)}`,
+      total === 40 && matched === total && worstError < 1e-6,
+    ),
+  );
+
+  // --- Qard-al-Hasan point engine: zero-interest, zero-commission ----------
+  const qhNpv = bankProductNpv({
+    averageBalanceRial: 1e12,
+    loanAmountRial: 5e11,
+    sleepMonths: 6,
+    waitingMonths: 0,
+    tenorMonths: 36,
+    loanRate: 0,
+    blockedRatio: 0.1,
+    closedLoopRetention: 0.3,
+    statutoryReserve: 0.15,
+    costOfFunds: 0.19,
+    annuity: false,
+    upfrontCommissionRate: 0,
+    blockRelease: "linear",
+  });
+  out.push(
+    assert(
+      "U-QH-01",
+      "قرض‌الحسنه بدون بهره: قسط برابر اصل تقسیمی و NPV متناهی",
+      "Zero-interest Qard: exact equal-principal instalment, finite NPV",
+      `${(5e11 / 36).toExponential(6)} / finite`,
+      `${qhNpv.monthlyInstallmentRial.toExponential(6)} / ${qhNpv.npvBankRial.toExponential(3)}`,
+      qhNpv.monthlyInstallmentRial === 5e11 / 36 &&
+        Number.isFinite(qhNpv.npvBankRial) &&
+        typeof qhNpv.actuariallyEquivalent === "boolean",
+    ),
+  );
+
+  // --- PMT guards: zero rate and overflow ----------------------------------
+  const pmtZero = pmt(0, 36, 5e11);
+  const pmtOverflow = pmt(50, 400, 1e6); // (51)^400 overflows double
+  out.push(
+    assert(
+      "U-QH-02",
+      "پرداخت با نرخ صفر و سرریز توان (بی‌نهایت‌شدن ضریب) هر دو متناهی",
+      "PMT at zero rate and under power overflow both stay finite",
+      `${(5e11 / 36).toExponential(6)} / 5.000e+7`,
+      `${pmtZero.toExponential(6)} / ${pmtOverflow.toExponential(3)}`,
+      pmtZero === 5e11 / 36 && Number.isFinite(pmtOverflow) && pmtOverflow === 1e6 * 50,
+    ),
+  );
+
+  // --- High blocked-deposit ratios -----------------------------------------
+  let blockSumsOk = true;
+  for (const beta of [0.9, 0.95, 1]) {
+    const target = beta * 1e9;
+    const releases = blockedReleaseSchedule("linear", target, 36);
+    const totalReleased = releases.reduce((a, b) => a + b, 0);
+    if (Math.abs(totalReleased - target) > target * 1e-9 || releases.some((x) => x < 0)) {
+      blockSumsOk = false;
+    }
+  }
+  const fullBlock = bankProductNpv({
+    averageBalanceRial: 1e12,
+    loanAmountRial: 1e12,
+    sleepMonths: 3,
+    waitingMonths: 0,
+    tenorMonths: 60,
+    loanRate: 0.23,
+    blockedRatio: 1,
+    closedLoopRetention: 0.5,
+    statutoryReserve: 0.15,
+    costOfFunds: 0.19,
+  });
+  out.push(
+    assert(
+      "U-BLOCK-01",
+      "نسبت مسدودی بالا (۹۰–۱۰۰٪): جمع آزادسازی دقیق و بدون تخلیه نقدینگی",
+      "High blocked ratios (90–100%): exact release sums, zero liquidity drain",
+      "sums ±1e-9 rel; drain leg = 0; finite NPV",
+      `sums=${blockSumsOk}; drain=${fullBlock.liquidityDrainLegRial}; npv=${Number.isFinite(fullBlock.npvBankRial)}`,
+      blockSumsOk &&
+        fullBlock.liquidityDrainLegRial === 0 &&
+        Number.isFinite(fullBlock.npvBankRial),
+    ),
+  );
+
+  const bullet = blockedReleaseSchedule("end", 1e9, 60);
+  const midpoint = blockedReleaseSchedule("midpoint", 1e9, 60);
+  out.push(
+    assert(
+      "U-BLOCK-02",
+      "آزادسازی گلوله‌ای و وسطی: تنها یک قسط، مبلغ کامل، بدون کسری",
+      "Bullet & midpoint release: single full-payment instalment, no shortfall",
+      "bullet: last only; midpoint: index 29; both sum to 1e9",
+      `bullet=${bullet.filter((x) => x > 0).length}@${bullet[59] === 1e9}; ` +
+        `mid=${midpoint.filter((x) => x > 0).length}@${midpoint[29] === 1e9}`,
+      bullet[59] === 1e9 &&
+        bullet.slice(0, 59).every((x) => x === 0) &&
+        midpoint[29] === 1e9 &&
+        midpoint.filter((x) => x > 0).length === 1,
+    ),
+  );
+
+  // --- Early withdrawal penalties ------------------------------------------
+  const principal = 1e9;
+  const contractedRate = 0.18;
+  const proRata = earlyWithdrawalSettlement({
+    principalRial: principal,
+    annualRate: contractedRate,
+    contractedMonths: 24,
+    withdrawnMonth: 6,
+  });
+  const forfeit = earlyWithdrawalSettlement({
+    principalRial: principal,
+    annualRate: contractedRate,
+    contractedMonths: 24,
+    withdrawnMonth: 6,
+    policy: "forfeit_accrued",
+  });
+  const partial = earlyWithdrawalSettlement({
+    principalRial: principal,
+    annualRate: contractedRate,
+    contractedMonths: 24,
+    withdrawnMonth: 6,
+    policy: "penalty_fraction",
+    penaltyFraction: 0.25,
+  });
+  const expectedAccrued = principal * (contractedRate / 12) * 6;
+  out.push(
+    assert(
+      "U-WD-01",
+      "سه سیاست برداشت پیش‌ازموعد: تمام‌سهم، اسقاط تمام سود، و جزئی ۲۵٪",
+      "Three early-withdrawal policies: pro-rata, full forfeit, 25% penalty",
+      `accrued=${expectedAccrued.toExponential(6)}; eff 0.18 / 0 / 0.135`,
+      `acc=${proRata.accruedProfitRial.toExponential(6)}; eff=` +
+        `${proRata.effectiveAnnualRate.toFixed(6)}/${forfeit.effectiveAnnualRate.toFixed(6)}/${partial.effectiveAnnualRate.toFixed(6)}`,
+      near(proRata.accruedProfitRial, expectedAccrued, 1e-3) &&
+        proRata.penaltyRial === 0 &&
+        near(proRata.effectiveAnnualRate, contractedRate, 1e-9) &&
+        forfeit.penaltyRial === forfeit.accruedProfitRial &&
+        forfeit.depositorPayoutRial === principal &&
+        forfeit.effectiveAnnualRate === 0 &&
+        near(partial.penaltyRial, expectedAccrued * 0.25, 1e-3) &&
+        near(partial.effectiveAnnualRate, contractedRate * 0.75, 1e-9),
+    ),
+  );
+
+  const monthZero = earlyWithdrawalSettlement({
+    principalRial: principal,
+    annualRate: contractedRate,
+    contractedMonths: 24,
+    withdrawnMonth: 0,
+  });
+  const monthOver = earlyWithdrawalSettlement({
+    principalRial: principal,
+    annualRate: contractedRate,
+    contractedMonths: 24,
+    withdrawnMonth: 999,
+    policy: "forfeit_accrued",
+  });
+  const qardDeposit = earlyWithdrawalSettlement({
+    principalRial: principal,
+    annualRate: 0,
+    contractedMonths: 12,
+    withdrawnMonth: 3,
+  });
+  out.push(
+    assert(
+      "U-WD-02",
+      "لبه‌های برداشت: ماه صفر بدون تقسیم بر صفر، ماه فراتر از سررسید به کف سررسید، سپرده قرض‌الحسنه",
+      "Edge months: m=0 no division-by-zero, m>N clamped, zero-rate Qard deposit",
+      "m=0 → 0/0-safe; m>N → full term; Qard → payout = principal",
+      `m0=${monthZero.effectiveAnnualRate}/${monthZero.depositorPayoutRial}; ` +
+        `over=${monthOver.accruedProfitRial === monthOver.fullTermProfitRial}; ` +
+        `qh=${qardDeposit.depositorPayoutRial === principal}`,
+      monthZero.effectiveAnnualRate === 0 &&
+        monthZero.depositorPayoutRial === principal &&
+        Number.isFinite(monthZero.penaltyRial) &&
+        monthOver.accruedProfitRial === monthOver.fullTermProfitRial &&
+        qardDeposit.depositorPayoutRial === principal &&
+        qardDeposit.accruedProfitRial === 0 &&
+        qardDeposit.effectiveAnnualRate === 0,
+    ),
+  );
+
+  const penRng = createRng(777);
+  let invariantsOk = true;
+  const policies = ["pro_rata", "forfeit_accrued", "penalty_fraction"] as const;
+  for (let k = 0; k < 200; k += 1) {
+    const p = penRng() * 1e12;
+    const rate = penRng() * 0.3;
+    const n = 1 + Math.floor(penRng() * 60);
+    const m = Math.floor(penRng() * (n + 5));
+    const policy = policies[Math.floor(penRng() * 3)];
+    const res = earlyWithdrawalSettlement({
+      principalRial: p,
+      annualRate: rate,
+      contractedMonths: n,
+      withdrawnMonth: m,
+      policy,
+      penaltyFraction: penRng(),
+    });
+    const slack = Math.max(1e-9, 8 * Number.EPSILON * Math.max(p, res.fullTermProfitRial, 1));
+    const ok =
+      Number.isFinite(res.depositorPayoutRial) &&
+      Number.isFinite(res.penaltyRial) &&
+      Number.isFinite(res.effectiveAnnualRate) &&
+      // Magnitude-aware slack: doubles carry ~1e-16 relative error, which at
+      // 1e12 Rial is ~1e-4 absolute — the invariants are checked to 8 ulp.
+      res.depositorPayoutRial >= p - slack &&
+      res.depositorPayoutRial <= p + res.fullTermProfitRial + slack &&
+      res.penaltyRial >= 0 &&
+      res.penaltyRial <= res.accruedProfitRial + slack &&
+      res.effectiveAnnualRate >= -1e-12 &&
+      res.effectiveAnnualRate <= rate + 1e-9;
+    if (!ok) invariantsOk = false;
+  }
+  out.push(
+    assert(
+      "U-WD-03",
+      "ویژگی: ۲۰۰ نمونه قطعی — سود پرداختی بین اصل و سود کامل، کارمزد بین صفر و سود انباشته",
+      "Property: 200 seeded draws keep payout within [P, P+full], penalty within [0, accrued]",
+      "200/200 invariants hold",
+      invariantsOk ? "200/200 invariants hold" : "invariant violation",
+      invariantsOk,
+    ),
+  );
+
+  // --- Cost of funds: zero-rate Qard + division-by-zero guards -------------
+  const zeroRateCof = costOfFunds({ depositRate: 0, statutoryReserve: 0.15 });
+  const expectedCof =
+    (0 - 0.15 * CB_REWARD_RATE) / (1 - 0.15 - LIQUIDITY_DEDUCTION_DEFAULT) +
+    OPEX_RATIO_DEFAULT;
+  let reserveGuard = false;
+  try {
+    costOfFunds({ depositRate: 0.1, statutoryReserve: 0.99, liquidityDeduction: 0.02 });
+  } catch (error) {
+    reserveGuard = error instanceof RangeError;
+  }
+  out.push(
+    assert(
+      "U-COF-01",
+      "بهای تأمین سپرده صفربه‌فرمول دقیق و نگهبان تقسیم بر صفر ذخیره قانونی",
+      "Zero-rate cost of funds matches the closed form; reserve-sum guard throws",
+      `${expectedCof.toFixed(10)} / RangeError / blended([]) = 0`,
+      `${zeroRateCof.costOfFunds.toFixed(10)} / ${reserveGuard} / ${blendedCostOfFunds([])}`,
+      near(zeroRateCof.costOfFunds, expectedCof, 1e-12) &&
+        zeroRateCof.costOfFunds < 0.05 &&
+        reserveGuard &&
+        blendedCostOfFunds([]) === 0,
+    ),
+  );
+
+  // --- Zod boundaries: generate / recommend / engine options ----------------
+  const genOk = generateRequestSchema.safeParse({ prompt: "  طراحی محصول  " });
+  const genBadRuns = generateRequestSchema.safeParse({ prompt: "x", runs: 99999 });
+  const genBadOverride = generateRequestSchema.safeParse({
+    prompt: "x",
+    intentOverrides: { lcrFloor: 0.5 },
+  });
+  const genTypo = generateRequestSchema.safeParse({ prompt: "x", run: 5 });
+  const genEmpty = generateRequestSchema.safeParse({ prompt: "   " });
+  out.push(
+    assert(
+      "U-SCHEMA-01",
+      "درخواست تولید: پیش‌فرض‌ها، رد محدوده‌ها، رد کلید ناشناخته، و پیام دقیق کلید",
+      "Generate schema: defaults, range rejection, unknown-key rejection, exact key in message",
+      "ok+defaults; 'runs' in msg; 'lcrFloor' in msg; strict; 'prompt is required'",
+      [
+        genOk.success ? "ok" : "fail",
+        genBadRuns.success ? "" : formatZodIssues(genBadRuns.error),
+        genBadOverride.success ? "" : formatZodIssues(genBadOverride.error),
+        genTypo.success ? "typo-accepted" : "strict",
+        genEmpty.success ? "" : formatZodIssues(genEmpty.error),
+      ].join(" | "),
+      genOk.success &&
+        genOk.data.prompt === "طراحی محصول" &&
+        genOk.data.runs === MC_RUNS &&
+        genOk.data.withSensitivity === true &&
+        !genBadRuns.success &&
+        formatZodIssues(genBadRuns.error).includes("runs") &&
+        !genBadOverride.success &&
+        formatZodIssues(genBadOverride.error).includes("lcrFloor") &&
+        !genTypo.success &&
+        !genEmpty.success &&
+        formatZodIssues(genEmpty.error).includes("prompt is required"),
+    ),
+  );
+
+  const recOk = recommendRequestSchema.safeParse({
+    query: "  وام خرید  ",
+    amountToman: 1e8,
+    alternativeYield: 0.24,
+    availableGuarantees: ["none"],
+  });
+  const recLong = recommendRequestSchema.safeParse({ query: "x".repeat(2001) });
+  const recYield = recommendRequestSchema.safeParse({ query: "وام", alternativeYield: 1.5 });
+  const recGuarantee = recommendRequestSchema.safeParse({
+    query: "وام",
+    availableGuarantees: ["not-a-guarantee"],
+  });
+  out.push(
+    assert(
+      "U-SCHEMA-02",
+      "درخواست توصیه: برش عبارت، سقف بازده، و نوع ضمانت نامعتبر",
+      "Recommend schema: query trim, yield cap, invalid guarantee rejected",
+      "ok+trimmed; long/fraction/bad-guarantee rejected",
+      [recOk.success, !recLong.success, !recYield.success, !recGuarantee.success].join("/"),
+      recOk.success &&
+        recOk.data.query === "وام خرید" &&
+        recOk.data.amountToman === 1e8 &&
+        !recLong.success &&
+        !recYield.success &&
+        !recGuarantee.success,
+    ),
+  );
+
+  const optsOk = pipelineOptionsSchema.safeParse({
+    runs: 220,
+    candidates: 18,
+    withSensitivity: false,
+  });
+  const optsRuns = pipelineOptionsSchema.safeParse({ runs: 2001 });
+  const optsTypo = pipelineOptionsSchema.safeParse({ runs: 10, foo: 1 });
+  const optsSignalOk = pipelineOptionsSchema.safeParse({
+    signal: new AbortController().signal,
+  });
+  const optsSignalBad = pipelineOptionsSchema.safeParse({ signal: "not-a-signal" });
+  out.push(
+    assert(
+      "U-SCHEMA-03",
+      "مرز موتور مالی: گزینه‌های معتبر، رد فراتر از سقف، سخت‌گیری کلید، AbortSignal",
+      "Engine boundary: valid options, over-cap runs, strict keys, AbortSignal check",
+      "2001 rejected w/ 'runs'; strict; signal typed",
+      [
+        optsOk.success,
+        optsRuns.success ? "" : formatZodIssues(optsRuns.error),
+        optsTypo.success ? "loose" : "strict",
+        optsSignalOk.success,
+        optsSignalBad.success ? "bad-signal-accepted" : "bad-rejected",
+      ].join(" | "),
+      optsOk.success &&
+        !optsRuns.success &&
+        formatZodIssues(optsRuns.error).includes("runs") &&
+        !optsTypo.success &&
+        optsSignalOk.success &&
+        !optsSignalBad.success,
+    ),
+  );
+
+  return {
+    id: "TC-EDGE",
+    titleFa: "آزمون لبه‌ها — IRR سخت‌شده، قرض‌الحسنه، نسبت مسدودی بالا، برداشت پیش‌ازموعد، مرزهای Zod",
+    titleEn: "Edge cases — hardened IRR, Qard zero-interest, high blocked ratios, early withdrawal, Zod boundaries",
+    assertions: out,
+    passed: out.every((item) => item.passed),
+    durationMs: Date.now() - started,
+    summary: {
+      assertions: out.length,
+      irrReferenceMatched: matched,
+      worstIrrError: Number(worstError.toExponential(2)),
+      withdrawalSamples: 200,
+    },
+  };
+}
+
+/**
+ * Test case — temporal & regulatory governance: chunk metadata, retrieval
+ * pre-filtering, the regulatory-constraint extractor and the hard-boundary
+ * enforcement inside the financial-engine.
+ */
+function runGovernanceCase(): TestCaseResult {
+  const started = Date.now();
+  const out: Assertion[] = [];
+
+  const govHit = (
+    id: string,
+    governance: RegulatoryChunkMeta,
+    citation = `clause-of-${id}`,
+  ): RegulatoryConstraint => ({
+    id,
+    code: id,
+    titleFa: `سند ${id}`,
+    titleEn: `Document ${id}`,
+    authority: "بانک مرکزی",
+    category: "cbi-directive",
+    bodyFa: "متن",
+    bodyEn: "body",
+    citation,
+    relevance: 0.9,
+    binding: [],
+    governance,
+  });
+
+  const activeMeta = (
+    regulatory_caps?: RegulatoryChunkMeta["regulatory_caps"],
+    overrides: Partial<RegulatoryChunkMeta> = {},
+  ): RegulatoryChunkMeta => ({
+    effective_date: "2022-01-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+    ...(regulatory_caps ? { regulatory_caps } : {}),
+    ...overrides,
+  });
+
+  const at = new Date("2026-06-01T00:00:00.000Z");
+
+  // --- GOV-01: extraction produces the executable envelope -----------------
+  const extracted = extractRegulatoryConstraints(
+    [
+      govHit("CBI-MORABAHA-RATE-23", activeMeta({ maxLoanInterestRate: 0.23, effectiveRateCap: 0.23 })),
+      govHit("CBI-QH-COMMISSION-04", activeMeta({ maxFeeRate: 0.04 })),
+      govHit("CBI-STATUTORY-RESERVE", activeMeta({ minReserveRatio: 0.1 })),
+      govHit("CBI-BLOCKED-DEPOSIT-COLLATERAL", activeMeta({ allowBlockedDepositCollateral: true })),
+    ],
+    { at },
+  );
+  const schemaCheck = regulatoryConstraintsSchema.safeParse(extracted);
+  out.push(
+    assert(
+      "GOV-01",
+      "استخراج پاکت مقرراتی اجراپذیر با citations مستند و اعتبارسنجی Zod",
+      "Extractor yields the executable envelope with grounded citations, Zod-valid",
+      "0.23 / 0.04 / 0.10 / true / 0.23 + 4 citations",
+      `${extracted.max_loan_interest_rate} / ${extracted.max_fee_rate} / ` +
+        `${extracted.min_reserve_ratio} / ${extracted.allow_blocked_deposit_collateral} / ` +
+        `${extracted.effective_rate_cap} + ${extracted.citations.length} citations`,
+      schemaCheck.success &&
+        extracted.max_loan_interest_rate === 0.23 &&
+        extracted.max_fee_rate === 0.04 &&
+        extracted.min_reserve_ratio === 0.1 &&
+        extracted.allow_blocked_deposit_collateral === true &&
+        extracted.effective_rate_cap === 0.23 &&
+        extracted.citations.length === 4 &&
+        extracted.citations.every(
+          (c) => c.doc_id.length > 0 && c.clause.length > 0 && c.summary.length > 0,
+        ),
+    ),
+  );
+
+  // --- GOV-02: conservative merge algebra ---------------------------------
+  const looseAndTight = extractRegulatoryConstraints(
+    [
+      // Looser than the statutory fallback: must NOT widen the envelope.
+      govHit("LOOSE-RATE", activeMeta({ maxLoanInterestRate: 0.25, effectiveRateCap: 0.25 })),
+      govHit("LOOSE-RESERVE", activeMeta({ minReserveRatio: 0.08 })),
+      // Tighter: must bind.
+      govHit("TIGHT-FEE", activeMeta({ maxFeeRate: 0.02 })),
+      govHit("TIGHT-RESERVE", activeMeta({ minReserveRatio: 0.15 })),
+      govHit("NO-COLLATERAL", activeMeta({ allowBlockedDepositCollateral: false })),
+    ],
+    { at },
+  );
+  out.push(
+    assert(
+      "GOV-02",
+      "ادغام محافظه‌کارانه: سقف‌های سست باز نمی‌شوند، سخت‌ها بسته می‌شوند",
+      "Conservative merge: loose caps never widen, tight caps always bind",
+      "rate stays 0.23; fee 0.02; reserve 0.15; collateral false",
+      `rate=${looseAndTight.max_loan_interest_rate}; fee=${looseAndTight.max_fee_rate}; ` +
+        `reserve=${looseAndTight.min_reserve_ratio}; collateral=${looseAndTight.allow_blocked_deposit_collateral}`,
+      looseAndTight.max_loan_interest_rate === 0.23 &&
+        looseAndTight.effective_rate_cap === 0.23 &&
+        looseAndTight.max_fee_rate === 0.02 &&
+        looseAndTight.min_reserve_ratio === 0.15 &&
+        looseAndTight.allow_blocked_deposit_collateral === false,
+    ),
+  );
+
+  // --- GOV-03: non-ACTIVE hits are ignored even if injected directly -------
+  const baseHits = [
+    govHit("CBI-MORABAHA-RATE-23", activeMeta({ maxLoanInterestRate: 0.23, effectiveRateCap: 0.23 })),
+    govHit("CBI-QH-COMMISSION-04", activeMeta({ maxFeeRate: 0.04 })),
+  ];
+  const polluted = extractRegulatoryConstraints(
+    [
+      ...baseHits,
+      govHit(
+        "CBI-BLOCKED-COLLATERAL-OLD",
+        activeMeta(
+          { allowBlockedDepositCollateral: false },
+          { status: "SUPERSEDED", expiration_date: "2023-01-01T00:00:00.000Z" },
+        ),
+      ),
+      govHit(
+        "CBI-RATE-CAP-20-AMENDED",
+        activeMeta({ maxLoanInterestRate: 0.2, effectiveRateCap: 0.2 }, { status: "AMENDED" }),
+      ),
+      govHit(
+        "CBI-PANDEMIC-RELIEF-2020",
+        activeMeta(
+          { maxFeeRate: 0.02 },
+          { expiration_date: "2021-12-21T00:00:00.000Z" },
+        ),
+      ),
+      govHit(
+        "CBI-FUTURE-REVIEW-2099",
+        activeMeta(
+          { maxLoanInterestRate: 0.15, effectiveRateCap: 0.15 },
+          { effective_date: "2099-01-01T00:00:00.000Z" },
+        ),
+      ),
+    ],
+    { at },
+  );
+  out.push(
+    assert(
+      "GOV-03",
+      "دروازه دوم: ضربه‌های منسوخ/بازنگری‌شده/منقضی/آینده حتی مستقیم هم نادیده گرفته می‌شوند",
+      "Second gate: superseded/amended/expired/future hits are ignored even when injected",
+      "rate 0.23, fee 0.04, collateral true, citations = 2",
+      `rate=${polluted.max_loan_interest_rate}; fee=${polluted.max_fee_rate}; ` +
+        `collateral=${polluted.allow_blocked_deposit_collateral}; citations=${polluted.citations.length}`,
+      polluted.max_loan_interest_rate === 0.23 &&
+        polluted.effective_rate_cap === 0.23 &&
+        polluted.max_fee_rate === 0.04 &&
+        polluted.allow_blocked_deposit_collateral === true &&
+        polluted.citations.length === 2,
+    ),
+  );
+
+  // --- GOV-04: hard-boundary helpers (incl. NaN safety) --------------------
+  const env = extracted;
+  const forbidden: RegulatoryConstraints = { ...env, allow_blocked_deposit_collateral: false };
+  out.push(
+    assert(
+      "GOV-04",
+      "بندهای سخت موتور: سقف نرخ/کارمزد، کف ذخیره، مسدودی ممنوع، ورودی نامعتبر",
+      "Engine hard bounds: rate/fee caps, reserve floor, collateral ban, invalid input",
+      "0.23 / 0.04 / 0.10 / 0 / safe-NaN",
+      [
+        clampLoanRateToConstraints(0.27, env),
+        clampFeeRateToConstraints(0.06, env),
+        applyReserveFloor(0.02, env),
+        clampBlockedRatioToConstraints(0.35, forbidden),
+        clampLoanRateToConstraints(NaN, env),
+      ].join(" / "),
+      clampLoanRateToConstraints(0.27, env) === 0.23 &&
+        clampLoanRateToConstraints(0.19, env) === 0.19 &&
+        clampFeeRateToConstraints(0.06, env) === 0.04 &&
+        applyReserveFloor(0.02, env) === 0.1 &&
+        applyReserveFloor(0.15, env) === 0.15 &&
+        clampBlockedRatioToConstraints(0.35, forbidden) === 0 &&
+        clampBlockedRatioToConstraints(0.35, env) === 0.35 &&
+        Number.isFinite(clampLoanRateToConstraints(NaN, env)),
+    ),
+  );
+
+  // --- GOV-05: temporal window boundaries ----------------------------------
+  const windowMeta: RegulatoryChunkMeta = {
+    effective_date: "2023-01-01T00:00:00.000Z",
+    expiration_date: "2025-01-01T00:00:00.000Z",
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  };
+  out.push(
+    assert(
+      "GOV-05",
+      "پنجره زمانی: لحظه شروع شامل، لحظه انقضا حذف، وضعیت غیرفعال همیشه حذف",
+      "Window: inclusive start, exclusive expiry, non-ACTIVE always excluded",
+      "true / false / true / false / false",
+      [
+        isChunkActiveAt(windowMeta, new Date("2023-01-01T00:00:00.000Z")),
+        isChunkActiveAt(windowMeta, new Date("2025-01-01T00:00:00.000Z")),
+        isChunkActiveAt(windowMeta, new Date("2024-06-01T00:00:00.000Z")),
+        isChunkActiveAt({ ...windowMeta, status: "SUPERSEDED" }, new Date("2024-06-01T00:00:00.000Z")),
+        isChunkActiveAt({ ...windowMeta, status: "AMENDED" }, new Date("2024-06-01T00:00:00.000Z")),
+      ].join(" / "),
+      isChunkActiveAt(windowMeta, new Date("2023-01-01T00:00:00.000Z")) === true &&
+        isChunkActiveAt(windowMeta, new Date("2025-01-01T00:00:00.000Z")) === false &&
+        isChunkActiveAt(windowMeta, new Date("2024-06-01T00:00:00.000Z")) === true &&
+        isChunkActiveAt({ ...windowMeta, status: "SUPERSEDED" }, new Date("2024-06-01T00:00:00.000Z")) === false &&
+        isChunkActiveAt({ ...windowMeta, status: "AMENDED" }, new Date("2024-06-01T00:00:00.000Z")) === false,
+    ),
+  );
+
+  // --- GOV-06: end-to-end retrieval pre-filter -----------------------------
+  const nowHits = retrieveKnowledge("CBI-BLOCKED-COLLATERAL-OLD", 10, [], at);
+  const amendedHits = retrieveKnowledge("CBI-RATE-CAP-20-AMENDED", 10, [], at);
+  const expiredNow = retrieveKnowledge("CBI-PANDEMIC-RELIEF-2020", 10, [], at);
+  const expiredPast = retrieveKnowledge("CBI-PANDEMIC-RELIEF-2020", 10, [], new Date("2021-01-01T00:00:00.000Z"));
+  const futureNow = retrieveKnowledge("CBI-FUTURE-REVIEW-2099", 10, [], at);
+  const futureLater = retrieveKnowledge("CBI-FUTURE-REVIEW-2099", 10, [], new Date("2100-01-01T00:00:00.000Z"));
+  const activeNow = retrieveKnowledge("CBI-BLOCKED-DEPOSIT-COLLATERAL", 10, [], at);
+  const everyActive = (hits: RegulatoryConstraint[]) =>
+    hits.every((h) => h.governance?.status === "ACTIVE" && isChunkActiveAt(h.governance, at));
+  out.push(
+    assert(
+      "GOV-06",
+      "پیش‌فیلتر بازیابی: نامعتبرها هرگز سطح نمی‌آیند؛ فعال‌ها و پنجره‌های زمانی درست کار می‌کنند",
+      "Retrieval pre-filter: invalid chunks never surface; active + time windows behave",
+      "superseded/amended/expired/future absent now; present only in their windows; active present",
+      `old=${nowHits.some((h) => h.code === "CBI-BLOCKED-COLLATERAL-OLD")}; ` +
+        `amended=${amendedHits.some((h) => h.code === "CBI-RATE-CAP-20-AMENDED")}; ` +
+        `expiredNow=${expiredNow.some((h) => h.code === "CBI-PANDEMIC-RELIEF-2020")}; ` +
+        `expiredPast=${expiredPast.some((h) => h.code === "CBI-PANDEMIC-RELIEF-2020")}; ` +
+        `futureNow=${futureNow.some((h) => h.code === "CBI-FUTURE-REVIEW-2099")}; ` +
+        `futureLater=${futureLater.some((h) => h.code === "CBI-FUTURE-REVIEW-2099")}; ` +
+        `active=${activeNow.some((h) => h.code === "CBI-BLOCKED-DEPOSIT-COLLATERAL")}`,
+      everyActive(nowHits) &&
+        everyActive(amendedHits) &&
+        everyActive(expiredNow) &&
+        everyActive(futureNow) &&
+        !nowHits.some((h) => h.code === "CBI-BLOCKED-COLLATERAL-OLD") &&
+        !amendedHits.some((h) => h.code === "CBI-RATE-CAP-20-AMENDED") &&
+        !expiredNow.some((h) => h.code === "CBI-PANDEMIC-RELIEF-2020") &&
+        expiredPast.some((h) => h.code === "CBI-PANDEMIC-RELIEF-2020") &&
+        !futureNow.some((h) => h.code === "CBI-FUTURE-REVIEW-2099") &&
+        futureLater.some((h) => h.code === "CBI-FUTURE-REVIEW-2099") &&
+        activeNow.some((h) => h.code === "CBI-BLOCKED-DEPOSIT-COLLATERAL"),
+    ),
+  );
+
+  // --- GOV-07: filterFn excludes BEFORE scoring ----------------------------
+  const miniIndex = new HybridRagIndex<{ tag: string }>([
+    {
+      id: "a",
+      title: "zebraquark directive",
+      entity: "authority-a",
+      tags: "zebraquark",
+      body: "zebraquark exclusive clause about rates",
+      item: { tag: "a" },
+    },
+    {
+      id: "b",
+      title: "flibbertigibbet rule",
+      entity: "authority-b",
+      tags: "flibbertigibbet",
+      body: "flibbertigibbet general rule about reserves",
+      item: { tag: "b" },
+    },
+  ]);
+  const controlHits = miniIndex.search("zebraquark", { minScore: 0.01 });
+  const filteredHits = miniIndex.search("zebraquark", {
+    minScore: 0.01,
+    filterFn: (item) => item.tag !== "a",
+  });
+  const bothHits = miniIndex.search("zebraquark flibbertigibbet", {
+    minScore: 0.01,
+    filterFn: (item) => item.tag !== "a",
+  });
+  out.push(
+    assert(
+      "GOV-07",
+      "filterFn قبل از امتیازدهی BM25/_dense حذف می‌کند: مستندِ فیلترشده حتی با تطابق کامل برنمی‌گردد",
+      "filterFn drops records before BM25/dense scoring: a perfect match cannot resurface",
+      "control finds a; filtered empty; mixed returns only b",
+      `control=${controlHits.map((h) => h.id).join(",") || "none"}; ` +
+        `filtered=${filteredHits.length}; both=${bothHits.map((h) => h.id).join(",") || "none"}`,
+      controlHits.some((h) => h.id === "a") &&
+        filteredHits.length === 0 &&
+        bothHits.length > 0 &&
+        bothHits.every((h) => h.id === "b"),
+    ),
+  );
+
+  // --- GOV-08: engine applies the envelope as hard bounds -------------------
+  const blueprint = BLUEPRINTS[Object.keys(BLUEPRINTS)[0] as keyof typeof BLUEPRINTS];
+  const tightEnv: RegulatoryConstraints = {
+    ...defaultRegulatoryConstraints(),
+    max_loan_interest_rate: 0.19,
+    effective_rate_cap: 0.19,
+    citations: [{ doc_id: "TEST", clause: "clause", summary: "summary" }],
+  };
+  const extremeParams = { rlExact: 0.27, rrExact: 0.02, betaExact: 0.4, feeExact: 0.09 };
+  const unconstrained = buildMode(blueprint, "morabaha", 0.1, 1e13, extremeParams, null, 0);
+  const constrained = buildMode(
+    blueprint,
+    "morabaha",
+    0.1,
+    1e13,
+    extremeParams,
+    null,
+    0,
+    0,
+    undefined,
+    tightEnv,
+  );
+  const collateralBanned = buildMode(
+    blueprint,
+    "morabaha",
+    0.1,
+    1e13,
+    extremeParams,
+    null,
+    0,
+    0,
+    undefined,
+    { ...tightEnv, allow_blocked_deposit_collateral: false },
+  );
+  out.push(
+    assert(
+      "GOV-08",
+      "موتور مالی: کف/سقف‌های پاکت روی نرخ، کارمزد، ذخیره و مسدودی اعمال می‌شود",
+      "Financial-engine enforces envelope caps/floors on rate, fee, reserve and blocking",
+      "0.19 rate / 0.04 fee / 0.10 reserve / 0 blocked; control keeps pre-envelope sampling",
+      `rate=${constrained.loanRate}; fee=${constrained.feeIncomeRate}; ` +
+        `reserve=${constrained.statutoryReserve}; blocked=${collateralBanned.blockedRatio}; ` +
+        `controlRate=${unconstrained.loanRate}; controlBlocked=${unconstrained.blockedRatio}`,
+      constrained.loanRate === 0.19 &&
+        constrained.feeIncomeRate === 0.04 &&
+        constrained.statutoryReserve === 0.1 &&
+        collateralBanned.blockedRatio === 0 &&
+        unconstrained.loanRate === 0.23 &&
+        unconstrained.feeIncomeRate === 0.09 &&
+        unconstrained.statutoryReserve === 0.02 &&
+        unconstrained.blockedRatio === 0.4,
+    ),
+  );
+
+  // --- GOV-09: corpus governance completeness + allBindings hygiene ---------
+  const statuses = new Set(KB_SEED.map((d) => d.governance.status));
+  const bindingsNow = allBindings(at).map((b) => b.code);
+  out.push(
+    assert(
+      "GOV-09",
+      "متن کامل: هر سند گردش‌کار دارد، نامعتبرها در allBindings نیستند",
+      "Corpus completeness: every seed governed; invalid docs absent from allBindings",
+      `>=23 seeds, 3 statuses, no non-ACTIVE in bindings (got ${KB_SEED.length})`,
+      `seeds=${KB_SEED.length}; statuses=${[...statuses].join("/")}; ` +
+        `leaked=${["CBI-BLOCKED-COLLATERAL-OLD", "CBI-RATE-CAP-20-AMENDED", "CBI-PANDEMIC-RELIEF-2020", "CBI-FUTURE-REVIEW-2099"].filter((c) => bindingsNow.includes(c)).join(",") || "none"}`,
+      KB_SEED.length >= 23 &&
+        KB_DOCUMENTS.every((d) => regulatoryChunkMetaSchema.safeParse(d.governance).success) &&
+        statuses.has("ACTIVE") &&
+        statuses.has("SUPERSEDED") &&
+        statuses.has("AMENDED") &&
+        !bindingsNow.includes("CBI-BLOCKED-COLLATERAL-OLD") &&
+        !bindingsNow.includes("CBI-RATE-CAP-20-AMENDED") &&
+        !bindingsNow.includes("CBI-PANDEMIC-RELIEF-2020") &&
+        !bindingsNow.includes("CBI-FUTURE-REVIEW-2099"),
+    ),
+  );
+
+  return {
+    id: "TC-GOV",
+    titleFa: "آزمون حکمرانی — متادیتای زمانی، پیش‌فیلتر بازیابی، استخراج مقررات، بندهای سخت موتور",
+    titleEn: "Governance — temporal metadata, retrieval pre-filter, constraint extraction, engine hard bounds",
+    assertions: out,
+    passed: out.every((item) => item.passed),
+    durationMs: Date.now() - started,
+    summary: {
+      assertions: out.length,
+      seeds: KB_SEED.length,
+      citations: extracted.citations.length,
+      envelopeRate: extracted.max_loan_interest_rate,
+      envelopeFee: extracted.max_fee_rate,
+    },
+  };
+}
+
+/**
+ * Test case — advanced engine: deposit cannibalization math, Phase A/B/C
+ * cohort liquidity modelling and the deterministic inverse product solver.
+ */
+function runAdvancedEngineCase(): TestCaseResult {
+  const started = Date.now();
+  const out: Assertion[] = [];
+
+  const canBase = {
+    depositVolumeRial: 1e13,
+    loanToDepositMultiplier: 1.2,
+    sourceDepositCost: 0.02,
+    depositInterestRate: 0.15,
+    loanInterestRate: 0.23,
+    feeRate: 0.02,
+    statutoryReserve: 0.1,
+  };
+
+  // --- CAN-01: migration-matrix identities ---------------------------------
+  const can0 = computeCannibalization({ ...canBase, cannibalizationRate: 0 });
+  const can1 = computeCannibalization({ ...canBase, cannibalizationRate: 1 });
+  const canHalf = computeCannibalization({ ...canBase, cannibalizationRate: 0.5 });
+  const expectedMid =
+    can0.newMoneyCostOfFunds - 0.5 * (can0.newMoneyCostOfFunds - can0.sourceCostOfFunds);
+  out.push(
+    assert(
+      "CAN-01",
+      "ماتریس مهاجرت: α=0 فقط NNM، α=1 فقط مهاجرت، MCoF خطی در میانه",
+      "Migration matrix: α=0 pure NNM, α=1 pure migration, MCoF linear at midpoint",
+      "NNM+Migrated=D; MCoF(0)=cofNew; MCoF(1)=cofSrc; MCoF(0.5)=midpoint",
+      `nnm0=${can0.netNewMoneyRial}; mig1=${can1.migratedInternalFundsRial}; ` +
+        `mcof0=${can0.marginalCostOfFunds.toFixed(6)}; mcof1=${can1.marginalCostOfFunds.toFixed(6)}; mid=${canHalf.marginalCostOfFunds.toFixed(6)}`,
+      can0.netNewMoneyRial === 1e13 &&
+        can0.migratedInternalFundsRial === 0 &&
+        can1.migratedInternalFundsRial === 1e13 &&
+        can0.lostSpreadOnCannibalizedRial === 0 &&
+        can0.marginalCostOfFunds === can0.newMoneyCostOfFunds &&
+        Math.abs(can1.marginalCostOfFunds - can0.sourceCostOfFunds) < 1e-12 &&
+        Math.abs(canHalf.marginalCostOfFunds - expectedMid) < 1e-12 &&
+        Math.abs(can0.netNewMoneyRial + can0.migratedInternalFundsRial - 1e13) < 1e-3,
+    ),
+  );
+
+  // --- CAN-02: NII identity & risk adjustment ------------------------------
+  const canWithEl = computeCannibalization({
+    ...canBase,
+    cannibalizationRate: 0.4,
+    expectedLossRate: 0.03 * 0.45,
+  });
+  const niiIdentity =
+    canWithEl.grossInterestIncomeRial +
+    canWithEl.treasuryIncomeRial -
+    canWithEl.fundingCostRial;
+  out.push(
+    assert(
+      "CAN-02",
+      "NII پس‌ازمهاجرت = درآمد + خزانه − هزینه تأمین با MCoF؛ سپرده‌ای با ریسک تعدیل",
+      "Post-migration NII identity with MCoF funding cost and risk adjustment",
+      "|NII − identity| < 1e-3; riskAdjusted = NII − L·EL; lost spread > 0",
+      `nii=${canWithEl.netInterestIncomeRial.toFixed(3)}; ` +
+        `delta=${Math.abs(canWithEl.netInterestIncomeRial - niiIdentity).toFixed(6)}; ` +
+        `lost=${canWithEl.lostSpreadOnCannibalizedRial.toFixed(0)}`,
+      Math.abs(canWithEl.netInterestIncomeRial - niiIdentity) < 1e-3 &&
+        Math.abs(
+          canWithEl.riskAdjustedNiiRial -
+            (canWithEl.netInterestIncomeRial - canWithEl.loanBookRial * 0.03 * 0.45),
+        ) < 1e-3 &&
+        canWithEl.lostSpreadOnCannibalizedRial > 0 &&
+        canWithEl.marginalCostOfFunds < canWithEl.newMoneyCostOfFunds,
+    ),
+  );
+
+  // --- CAN-03: input guards ------------------------------------------------
+  const guardResults: string[] = [];
+  for (const bad of [
+    { ...canBase, cannibalizationRate: 1.5 },
+    { ...canBase, sourceDepositCost: NaN },
+    { ...canBase, statutoryReserve: 0.99, liquidityDeduction: 0.02 },
+  ]) {
+    let threw = false;
+    try {
+      computeCannibalization(bad as never);
+    } catch {
+      threw = true;
+    }
+    guardResults.push(threw ? "throw" : "accepted");
+  }
+  out.push(
+    assert(
+      "CAN-03",
+      "نگهبان‌های ورودی: α>1، NaN، و ذخیره+نقدینگی≥۱ همگی رد می‌شوند",
+      "Input guards: α>1, NaN and reserve+liquidity ≥ 1 are all rejected",
+      "throw / throw / throw",
+      guardResults.join(" / "),
+      guardResults.every((r) => r === "throw"),
+    ),
+  );
+
+  // --- COH-01: phase structure & amortisation ------------------------------
+  const cohortIn: CohortInput = {
+    depositVolumeRial: 1e13,
+    loanToDepositMultiplier: 1.2,
+    depositRetentionMonths: 4,
+    repaymentMonths: 12,
+    blockedDepositPct: 0.3,
+    unblockedRunoffRate: 0.05,
+    loanInterestRate: 0.23,
+    depositInterestRate: 0.12,
+    feeRate: 0.02,
+    statutoryReserve: 0.1,
+    pd: 0.03,
+    lgd: 0.45,
+  };
+  const cohort = projectCohortLiquidity(cohortIn);
+  const phasesOk =
+    cohort.months.length === 4 + 1 + 12 &&
+    cohort.months.slice(0, 4).every((m) => m.phase === "A" && m.loanBalanceRial === 0) &&
+    cohort.months[4].phase === "B" &&
+    cohort.months[4].loanBalanceRial === 1.2e13 &&
+    cohort.months.slice(5).every((m) => m.phase === "C") &&
+    cohort.finalLoanBalanceRial < 1;
+  out.push(
+    assert(
+      "COH-01",
+      "ساختار فازها: A تجمع، B اعطای وام (L=M·D)، C استهلاک تا صفر",
+      "Phase structure: A accumulation, B origination (L=M·D), C amortises to zero",
+      "17 months; A×4, B×1, C×12; final balance ≈ 0",
+      `months=${cohort.months.length}; phases=${cohort.months.map((m) => m.phase).join("")}; final=${cohort.finalLoanBalanceRial.toExponential(2)}`,
+      phasesOk,
+    ),
+  );
+
+  // --- COH-02: blocked release + geometric run-off -------------------------
+  const b5 = cohort.months[4];
+  const b6 = cohort.months[5];
+  const blockedNonIncreasing = cohort.months
+    .slice(4)
+    .every((m, i, arr) => i === 0 || m.blockedRial <= arr[i - 1].blockedRial + 1);
+  out.push(
+    assert(
+      "COH-02",
+      "مسدودی با استهلاک آزاد می‌شود؛ آزادشونده هندسی با β کاهش می‌یابد؛ جمع سپرده حفظ می‌شود",
+      "Blocked releases with amortisation; unblocked decays geometrically by β; deposits conserved",
+      "blocked(5)=3e12; blocked non-increasing; U(6)=U(5)·0.95; B+U=D",
+      `b5=${b5.blockedRial.toExponential(3)}; ratio=${(b6.unblockedRial / b5.unblockedRial).toFixed(6)}; ` +
+        `cons=${(b6.blockedRial + b6.unblockedRial - b6.depositsRial).toFixed(6)}`,
+      Math.abs(b5.blockedRial - 3e12) < 1 &&
+        blockedNonIncreasing &&
+        Math.abs(b6.unblockedRial / b5.unblockedRial - 0.95) < 1e-12 &&
+        Math.abs(b6.blockedRial + b6.unblockedRial - b6.depositsRial) < 1e-3,
+    ),
+  );
+
+  // --- COH-03: ledger identities -------------------------------------------
+  let ledgerOk = true;
+  for (const m of cohort.months) {
+    const recomputed =
+      m.newDepositInflowRial -
+      m.depositInterestOutflowRial +
+      m.treasuryInflowRial +
+      m.feeIncomeRial -
+      m.disbursementOutflowRial +
+      m.instalmentInflowRial -
+      m.runoffOutflowRial -
+      m.defaultLossRial -
+      m.wholesaleCostOutflowRial -
+      m.opexOutflowRial;
+    if (Math.abs(recomputed - m.netCashflowRial) > 1e-3 + 1e-12 * Math.abs(m.netCashflowRial)) {
+      ledgerOk = false;
+    }
+  }
+  const cumOk = cohort.months.every((m, i) =>
+    i === 0
+      ? Math.abs(m.cumulativeCashflowRial - m.netCashflowRial) < 1e-3
+      : Math.abs(
+          m.cumulativeCashflowRial -
+            (cohort.months[i - 1].cumulativeCashflowRial + m.netCashflowRial),
+        ) < 1e-3 + 1e-12 * Math.abs(m.cumulativeCashflowRial),
+  );
+  out.push(
+    assert(
+      "COH-03",
+      "دفتر نقدینگی: جمع اقلام هر ماه برابر خالص جریان؛ تجمعی بازپذیر",
+      "Ledger identity: components sum to net cash-flow; cumulative is consistent",
+      "all months exact within 1e-3 Rial",
+      `ledger=${ledgerOk}; cumulative=${cumOk}; worst=${cohort.worstMonthlyGapRial.toFixed(0)}`,
+      ledgerOk && cumOk,
+    ),
+  );
+
+  // --- COH-04: determinism + breakeven -------------------------------------
+  const cohortAgain = projectCohortLiquidity(cohortIn);
+  const profitable = projectCohortLiquidity({
+    ...cohortIn,
+    loanToDepositMultiplier: 0.5,
+    unblockedRunoffRate: 0.01,
+    depositInterestRate: 0.08,
+  });
+  out.push(
+    assert(
+      "COH-04",
+      "قطعیت مطلق پروژه‌کهولی و یافتن ماه سر به سر در ساختار سودآور",
+      "Fully deterministic cohort replay; profitable structure finds a breakeven month",
+      "identical JSON; breakeven not null",
+      `same=${JSON.stringify(cohort) === JSON.stringify(cohortAgain)}; be=${profitable.breakevenMonth}`,
+      JSON.stringify(cohort) === JSON.stringify(cohortAgain) &&
+        profitable.breakevenMonth !== null,
+    ),
+  );
+
+  // --- Solver shared fixture ----------------------------------------------
+  const solverBase: InverseSolverInput = {
+    targetBankIrrMin: 0.15,
+    targetCustomerIrrMin: 0.1,
+    maxLiquidityGapLimit: 4e12,
+    regulatoryConstraints: defaultRegulatoryConstraints(),
+    depositVolumeRial: 1e13,
+    cannibalizationRate: 0.3,
+    sourceDepositCost: 0.02,
+    unblockedRunoffRate: 0.02,
+    statutoryReserveBase: 0.1,
+    pd: 0.03,
+    lgd: 0.45,
+  };
+
+  // --- INV-01: solved vector inside bounds with integer structure -----------
+  const inv1 = solveInverseProduct(solverBase);
+  const s1 = inv1.solution;
+  out.push(
+    assert(
+      "INV-01",
+      "بردار حل: متغیرهای صحیح در بازه، نرخ/کارمزد در پوشت مقرراتی",
+      "Solution vector: integers in range, rates inside the regulatory envelope",
+      "T∈[1,12] int; N∈[12,60] int; M∈[0.5,3]; rL≤0.23; rDep≥0.10; fee≤0.04",
+      `T=${s1.depositRetentionMonths}; N=${s1.repaymentMonths}; M=${s1.loanToDepositMultiplier}; ` +
+        `rL=${s1.loanInterestRate.toFixed(4)}; rD=${s1.depositInterestRate}; fee=${s1.feeRate}`,
+      Number.isInteger(s1.depositRetentionMonths) &&
+        s1.depositRetentionMonths >= 1 &&
+        s1.depositRetentionMonths <= 12 &&
+        Number.isInteger(s1.repaymentMonths) &&
+        s1.repaymentMonths >= 12 &&
+        s1.repaymentMonths <= 60 &&
+        s1.loanToDepositMultiplier >= 0.5 &&
+        s1.loanToDepositMultiplier <= 3 &&
+        s1.loanInterestRate <= 0.23 + 1e-9 &&
+        s1.depositInterestRate >= 0.1 - 1e-12 &&
+        s1.feeRate <= 0.04 + 1e-9 &&
+        s1.blockedDepositPct >= 0 &&
+        s1.blockedDepositPct <= 1,
+    ),
+  );
+
+  // --- INV-02: all hard constraints satisfied on an achievable target -------
+  out.push(
+    assert(
+      "INV-02",
+      "هدف‌های دست‌یافتنی: IRR بانک، کف سود مشتری، سقف نرخ وام‌گیرنده، و شکاف نقدینگی همگی پاس",
+      "Achievable targets: bank IRR, customer floor, borrower cap and liquidity gap all pass",
+      "feasible; 0 violations; irr≥0.15; gap≥−4e12; borrower≤0.23",
+      `feasible=${inv1.feasible}; irr=${inv1.metrics.bankIrrAnnual.toFixed(4)}; ` +
+        `gap=${inv1.metrics.worstCumulativeGapRial.toFixed(0)}; bor=${inv1.metrics.borrowerNominalEquivalent.toFixed(4)}; ` +
+        `viol=${inv1.violations.length}`,
+      inv1.feasible &&
+        inv1.violations.length === 0 &&
+        inv1.metrics.bankIrrAnnual >= 0.15 - 1e-9 &&
+        inv1.metrics.worstCumulativeGapRial >= -4e12 &&
+        inv1.metrics.borrowerNominalEquivalent <= 0.23 + 1e-9 &&
+        inv1.metrics.customerDepositYield >= 0.1 - 1e-12 &&
+        inv1.metrics.riskAdjustedNiiRial > 0,
+    ),
+  );
+
+  // --- INV-03: unattainable target degrades gracefully ----------------------
+  const inv3 = solveInverseProduct({ ...solverBase, targetBankIrrMin: 0.6 });
+  out.push(
+    assert(
+      "INV-03",
+      "هدف غیرممکن: بدون سقوط، نزدیک‌ترین ساختار با گزارش نقض برگردانده می‌شود",
+      "Impossible target: no crash — closest structure returned with violation report",
+      "feasible=false; violations non-empty; all metrics finite",
+      `feasible=${inv3.feasible}; irr=${inv3.metrics.bankIrrAnnual.toFixed(4)}; ` +
+        `viol=${inv3.violations[0] ?? "none"}`,
+      !inv3.feasible &&
+        inv3.violations.length > 0 &&
+        inv3.violations.some((v) => v.includes("bank IRR")) &&
+        [
+          inv3.metrics.bankIrrAnnual,
+          inv3.metrics.riskAdjustedNiiRial,
+          inv3.metrics.worstCumulativeGapRial,
+          inv3.objective,
+        ].every(Number.isFinite) &&
+        inv3.metrics.bankIrrAnnual < 0.6,
+    ),
+  );
+
+  // --- INV-04: determinism + serverless budget ------------------------------
+  const inv4a = solveInverseProduct(solverBase);
+  const inv4b = solveInverseProduct(solverBase);
+  out.push(
+    assert(
+      "INV-04",
+      "قطعیت مطلق و بودجه زمانی سرورلس: تکرار یکسان و کمتر از ۵۰۰ میلی‌ثانیه",
+      "Absolute determinism and serverless budget: identical replay under 500 ms",
+      "identical solution+metrics; elapsedMs < 500; evaluations ≤ 7000",
+      `same=${JSON.stringify([inv4a.solution, inv4a.metrics, inv4a.objective]) ===
+        JSON.stringify([inv4b.solution, inv4b.metrics, inv4b.objective])}; ` +
+        `ms=${inv4a.elapsedMs}; evals=${inv4a.evaluations}`,
+      JSON.stringify([inv4a.solution, inv4a.metrics, inv4a.objective]) ===
+        JSON.stringify([inv4b.solution, inv4b.metrics, inv4b.objective]) &&
+        inv4a.elapsedMs < 500 &&
+        inv4a.evaluations <= 7000,
+    ),
+  );
+
+  // --- INV-05: forbidden blocked-deposit collateral -------------------------
+  const inv5 = solveInverseProduct({
+    ...solverBase,
+    targetBankIrrMin: 0.14,
+    regulatoryConstraints: {
+      ...defaultRegulatoryConstraints(),
+      allow_blocked_deposit_collateral: false,
+    },
+  });
+  out.push(
+    assert(
+      "INV-05",
+      "ممنوعیت وثیقه سپرده مسدودی: سهم مسدودی صفر و بدون نقض",
+      "Blocked-deposit collateral ban: solved blocked share is exactly zero",
+      "feasible; blockedDepositPct = 0",
+      `feasible=${inv5.feasible}; blocked=${inv5.solution.blockedDepositPct}; viol=${inv5.violations.length}`,
+      inv5.feasible && inv5.solution.blockedDepositPct === 0 && inv5.violations.length === 0,
+    ),
+  );
+
+  // --- INV-06: customer opportunity floor is binding ------------------------
+  const inv6 = solveInverseProduct({ ...solverBase, targetCustomerIrrMin: 0.13 });
+  out.push(
+    assert(
+      "INV-06",
+      "کف رقابت‌پذیری مشتری: نرخ سپرده هرگز زیر کف تخصیص داده نمی‌شود",
+      "Customer competitiveness floor: the deposit rate never solves below the floor",
+      "depositInterestRate ≥ 0.13",
+      `rDep=${inv6.solution.depositInterestRate}; feasible=${inv6.feasible}; viol=${inv6.violations[0] ?? "none"}`,
+      inv6.solution.depositInterestRate >= 0.13 - 1e-12,
+    ),
+  );
+
+  // --- INV-07: tight liquidity-gap limit is honoured ------------------------
+  const inv7 = solveInverseProduct({
+    ...solverBase,
+    targetBankIrrMin: 0.1,
+    maxLiquidityGapLimit: 1e12,
+  });
+  out.push(
+    assert(
+      "INV-07",
+      "محدودیت سخت شکاف نقدینگی: در حالت ممکن شکاف تجمعی داخل سقف می‌ماند",
+      "Tight liquidity-gap limit: feasible solutions keep the cumulative gap inside the cap",
+      "feasible ⇒ worstCumulativeGap ≥ −1e12",
+      `feasible=${inv7.feasible}; gap=${inv7.metrics.worstCumulativeGapRial.toFixed(0)}; ` +
+        `viol=${inv7.violations[0] ?? "none"}`,
+      inv7.feasible
+        ? inv7.metrics.worstCumulativeGapRial >= -1e12
+        : inv7.violations.length > 0,
+    ),
+  );
+
+  return {
+    id: "TC-ADV",
+    titleFa: "آزمون موتور پیشرفته — مهاجرت سپرده، مدل رفتاری کهولی، حل معکوس محصول",
+    titleEn: "Advanced engine — deposit migration, cohort behaviour, inverse product solve",
+    assertions: out,
+    passed: out.every((item) => item.passed),
+    durationMs: Date.now() - started,
+    summary: {
+      assertions: out.length,
+      solverFeasible: inv1.feasible ? 1 : 0,
+      solverIrr: Number(inv1.metrics.bankIrrAnnual.toFixed(4)),
+      solverMs: inv1.elapsedMs,
+      evaluations: inv1.evaluations,
+      breakevenMonth: profitable.breakevenMonth ?? -1,
+    },
+  };
+}
+
+/**
+ * Test case — neuro-symbolic closed loop & adversarial committee (Phase 4):
+ * inverse solver inside the graph, hidden-usury audit vs the effective cap,
+ * Base+3 stress matrix, structured CRITIQUE format, determinism and the
+ * ≤3-iteration cap.
+ */
+async function runClosedLoopCase(fast = false): Promise<TestCaseResult> {
+  const started = Date.now();
+  const prompt = fast
+    ? "طراحی محصول چندطرحی میانگین حساب برای جذب ۲۰ همت منبع با IRR حداقل ۲۶ درصد، حداکثر نسبت تسهیلات به سپرده ۸۵ درصد، حداقل نسبت پوشش نقدینگی ۱٫۰۵ و ریسک واژگونی منابع حداکثر ۶ درصد"
+    : "یک بسته بانکی ۴ طرحی پلکانی مبتنی بر میانگین حساب طراحی کن تا ۲۰ همت منبع جذب شود؛ هدف نرخ بازده داخلی بانک حداقل ۲۶٪، سقف نسبت خالص تسهیلات به سپرده ۸۵٪، کف نسبت پوشش نقدینگی ۱٫۰۵ و حداکثر ریسک واژگونی منابع ۶٪";
+  const options = {
+    runs: fast ? 220 : undefined,
+    candidates: fast ? 18 : 26,
+    withSensitivity: false as const,
+    seed: "closed-loop-2026",
+  };
+  const runA = await runPipeline({ prompt, options });
+  const runB = await runPipeline({ prompt, options });
+  const sa = runA.state;
+  const sb = runB.state;
+  const out: Assertion[] = [];
+  const cap = sa.regulatoryConstraints?.effective_rate_cap ?? 0.23;
+
+  // --- CL-01: inverse solution present, finite, cap-respecting -------------
+  const inv = sa.inverseSolution;
+  out.push(
+    assert(
+      "CL-01",
+      "حل معکوس داخل خط لوله: ساختار حل‌شده، IRRهای متناهی و نرخ مؤثر وام‌گیرنده زیر سقف",
+      "Inverse solve in-pipeline: solved structure, finite IRRs, borrower nominal ≤ cap",
+      "non-null; finite metrics; borrowerNominal ≤ effective cap; feasible ⇔ no violations",
+      inv
+        ? `feasible=${inv.feasible}; irr=${inv.metrics.bankIrrAnnual.toFixed(4)}; bor=${inv.metrics.borrowerNominalEquivalent.toFixed(4)}; cap=${cap}; ms=${inv.elapsedMs}`
+        : "null",
+      inv !== null &&
+        [
+          inv.metrics.bankIrrAnnual,
+          inv.metrics.borrowerNominalEquivalent,
+          inv.metrics.worstCumulativeGapRial,
+          inv.metrics.riskAdjustedNiiRial,
+        ].every(Number.isFinite) &&
+        inv.metrics.borrowerNominalEquivalent <= cap + 1e-9 &&
+        inv.feasible === (inv.violations.length === 0) &&
+        inv.elapsedMs < 500,
+    ),
+  );
+
+  // --- CL-02: stress matrix — base + three shocks with correct direction ---
+  const mx = sa.stressMatrix;
+  const byId = (id: string) => mx?.scenarios.find((s) => s.id === id);
+  const base = byId("BASE");
+  const runoff = byId("DEPOSIT_RUNOFF_20");
+  const npl = byId("NPL_SHOCK_3PP");
+  const cannib = byId("CANNIBALIZATION_15PP");
+  out.push(
+    assert(
+      "CL-02",
+      "نگهبان استرس: پایه و سه شوک با اثرات جهت‌دار (+۲۰٪ برداشت، +۳٪ NPL، +۱۵٪ مهاجرت)",
+      "Stress guardian: base plus three shocks with the correct directional effects",
+      "4 ordered scenarios; runoff end-deposits ≤ base; NPL net < base; cannibalization net < base",
+      mx
+        ? `ids=${mx.scenarios.map((s) => s.id).join(",")}; worst=${mx.worstScenarioId}; ` +
+            `endD runoff/base=${runoff?.depositBalanceEndRial.toFixed(0)}/${base?.depositBalanceEndRial.toFixed(0)}; ` +
+            `net npl/base=${npl?.netCashflowRial.toFixed(0)}/${base?.netCashflowRial.toFixed(0)}; ` +
+            `net cannib/base=${cannib?.netCashflowRial.toFixed(0)}/${base?.netCashflowRial.toFixed(0)}`
+        : "null",
+      mx !== null &&
+        mx.scenarios.length === 4 &&
+        mx.scenarios.map((s) => s.id).join(",") ===
+          "BASE,DEPOSIT_RUNOFF_20,NPL_SHOCK_3PP,CANNIBALIZATION_15PP" &&
+        base !== undefined &&
+        runoff !== undefined &&
+        npl !== undefined &&
+        cannib !== undefined &&
+        runoff.depositBalanceEndRial <= base.depositBalanceEndRial &&
+        npl.netCashflowRial < base.netCashflowRial &&
+        cannib.netCashflowRial < base.netCashflowRial &&
+        mx.scenarios.some((s) => s.id === mx.worstScenarioId),
+    ),
+  );
+
+  // --- CL-03: structured CRITIQUE format -----------------------------------
+  out.push(
+    assert(
+      "CL-03",
+      "حلقه نقد ساخت‌یافته: پیام دقیقاً با CRITIQUE: و Action required: ساختار می‌یابد",
+      "Structured critique loop: message carries the exact CRITIQUE: / Action required: skeleton",
+      'startsWith("CRITIQUE: "); includes("Action required: ")',
+      (sa.critique ?? "null").slice(0, 120),
+      typeof sa.critique === "string" &&
+        sa.critique.startsWith("CRITIQUE: ") &&
+        sa.critique.includes("Action required: "),
+    ),
+  );
+
+  // --- CL-04: committee events + iteration cap -----------------------------
+  const nodeNames = new Set(runA.events.map((e) => e.node));
+  out.push(
+    assert(
+      "CL-04",
+      "کمیته: گره‌های حل معکوس و نگهبان استرس در ردیاب‌اند و حلقه ≤۳ گام می‌ماند",
+      "Committee: inverse-solver and stress-guardian nodes traced; loop stays within the 3-step cap",
+      "events contain inverse_solver + stress_guardian; iterations ≤ 3",
+      `nodes=${[...nodeNames].filter((n) => n === "inverse_solver" || n === "stress_guardian").join("+")}; iterations=${sa.iterations.length}; status=${sa.status}`,
+      nodeNames.has("inverse_solver") &&
+        nodeNames.has("stress_guardian") &&
+        sa.iterations.length <= REGULATORY.maxCriticIterations &&
+        sa.status === "complete",
+    ),
+  );
+
+  // --- CL-05: absolute determinism of the committee outputs -----------------
+  // (elapsedMs is wall-clock telemetry, excluded from the determinism contract)
+  const fingerprint = (s: typeof sa) =>
+    JSON.stringify([
+      s.inverseSolution ? { ...s.inverseSolution, elapsedMs: 0 } : null,
+      s.stressMatrix,
+      s.critique,
+    ]);
+  out.push(
+    assert(
+      "CL-05",
+      "قطعیت مطلق: تکرار کمیته خروجی یکسان حل معکوس، ماتریس استرس و نقد را می‌دهد",
+      "Absolute determinism: a replayed committee yields identical solve, stress and critique outputs",
+      "JSON(inverse+stress+critique, elapsedMs excluded) identical across runs",
+      `same=${fingerprint(sa) === fingerprint(sb)}`,
+      fingerprint(sa) === fingerprint(sb),
+    ),
+  );
+
+  return {
+    id: "TC-CLOSED",
+    titleFa: "آزمون حلقه بسته عصبی-نمادین — حل معکوس، نگهبان استرس، ممیزی ربا پنهان و نقد ساخت‌یافته",
+    titleEn: "Neuro-symbolic closed loop — inverse solve, stress guardian, hidden-usury audit, structured critique",
+    assertions: out,
+    passed: out.every((item) => item.passed),
+    durationMs: Date.now() - started,
+    summary: {
+      assertions: out.length,
+      inverseFeasible: inv?.feasible ? 1 : 0,
+      inverseIrr: Number((inv?.metrics.bankIrrAnnual ?? 0).toFixed(4)),
+      borrowerNominal: Number((inv?.metrics.borrowerNominalEquivalent ?? 0).toFixed(4)),
+      stressScenarios: mx?.scenarios.length ?? 0,
+      iterations: sa.iterations.length,
+    },
+  };
+}
+
+/**
+ * Test case — auditable product dossier & serverless budget (Phase 5):
+ * schema-valid dossier, metric identities against the solve, the <500 ms
+ * serverless envelope (solver + cohort + dossier build), build determinism
+ * and audit-log consistency.
+ */
+async function runDossierCase(fast = false): Promise<TestCaseResult> {
+  const started = Date.now();
+  const prompt = fast
+    ? "طراحی محصول چندطرحی میانگین حساب برای جذب ۲۰ همت منبع با IRR حداقل ۲۶ درصد، حداکثر نسبت تسهیلات به سپرده ۸۵ درصد، حداقل نسبت پوشش نقدینگی ۱٫۰۵ و ریسک واژگونی منابع حداکثر ۶ درصد"
+    : "یک بسته بانکی ۴ طرحی پلکانی مبتنی بر میانگین حساب طراحی کن تا ۲۰ همت منبع جذب شود؛ هدف نرخ بازده داخلی بانک حداقل ۲۶٪، سقف نسبت خالص تسهیلات به سپرده ۸۵٪، کف نسبت پوشش نقدینگی ۱٫۰۵ و حداکثر ریسک واژگونی منابع ۶٪";
+  const { state } = await runPipeline({
+    prompt,
+    options: {
+      runs: fast ? 220 : undefined,
+      candidates: fast ? 18 : 26,
+      withSensitivity: false,
+      seed: "dossier-2026",
+    },
+  });
+  const out: Assertion[] = [];
+  const dossier = buildProductDossier(state);
+
+  // --- DOSSIER-01: strict schema + six complete sections --------------------
+  const parsed = dossier ? productDossierSchema.safeParse(dossier) : null;
+  out.push(
+    assert(
+      "DOSSIER-01",
+      "دوسیه کامل: شش بخش مشخصه، سودآوری، مهاجرت، استرس، انطباق و کمیته — با اسکیمای سخت‌گیرانه",
+      "Complete dossier: spec, profitability, cannibalization, stress, compliance, committee — strict schema",
+      "safeParse success; 4 stress scenarios; citations array; critique present",
+      dossier
+        ? `ok=${parsed?.success}; modes=${dossier.product.modeCount}; scenarios=${dossier.stressMatrix.scenarios.length}; citations=${dossier.compliance.envelope.citations.length}; critique=${dossier.committeeAuditLog.critique.slice(0, 24)}…`
+        : "null",
+      dossier !== null &&
+        parsed !== null &&
+        parsed.success &&
+        dossier.product.modeCount >= 1 &&
+        dossier.product.modes.length === dossier.product.modeCount &&
+        dossier.stressMatrix.scenarios.length === 4 &&
+        Array.isArray(dossier.compliance.envelope.citations) &&
+        dossier.committeeAuditLog.critique.startsWith("CRITIQUE: "),
+    ),
+  );
+
+  // --- DOSSIER-02: metric identities against the solve ----------------------
+  const metrics = state.inverseSolution?.metrics;
+  const cann = dossier?.cannibalization;
+  const dInput = state.inverseSolverInput;
+  out.push(
+    assert(
+      "DOSSIER-02",
+      "هویت شاخص‌ها: دوسیه عیناً از حل معکوس و ماتریس مهاجرت تغذیه می‌شود",
+      "Metric identities: dossier mirrors the inverse solve and migration matrix exactly",
+      "IRR/MCoF/NII/breakeven === solve; NNM+migrated = D",
+      dossier && metrics && cann && dInput
+        ? `irr=${dossier.almProfitability.bankIrrAnnual === metrics.bankIrrAnnual}; ` +
+            `mcof=${dossier.almProfitability.marginalCostOfFunds === metrics.marginalCostOfFunds}; ` +
+            `nii=${dossier.almProfitability.netNiiPostCannibalization === metrics.netInterestIncomeRial}; ` +
+            `be=${dossier.almProfitability.breakevenMonth === metrics.breakevenMonth}; ` +
+            `split=${Math.abs(cann.netNewMoneyRial + cann.migratedRial - dInput.depositVolumeRial)}`
+        : "null",
+      dossier !== null &&
+        metrics !== undefined &&
+        cann !== undefined &&
+        dInput !== null &&
+        dossier.almProfitability.bankIrrAnnual === metrics.bankIrrAnnual &&
+        dossier.almProfitability.customerEffectiveIrr === metrics.borrowerEffectiveAnnual &&
+        dossier.almProfitability.customerNominalIrr === metrics.borrowerNominalEquivalent &&
+        dossier.almProfitability.marginalCostOfFunds === metrics.marginalCostOfFunds &&
+        dossier.almProfitability.netNiiPostCannibalization === metrics.netInterestIncomeRial &&
+        dossier.almProfitability.riskAdjustedNiiRial === metrics.riskAdjustedNiiRial &&
+        dossier.almProfitability.breakevenMonth === metrics.breakevenMonth &&
+        dossier.almProfitability.worstCumulativeGapRial === metrics.worstCumulativeGapRial &&
+        Math.abs(cann.netNewMoneyRial + cann.migratedRial - dInput.depositVolumeRial) < 1e-3 &&
+        Math.abs(cann.netNewMoneyRial - (1 - cann.rate) * dInput.depositVolumeRial) < 1e-3,
+    ),
+  );
+
+  // --- DOSSIER-03: serverless budget — solver + cohort + dossier < 500 ms ----
+  let budgetMs = -1;
+  let budgetOk = false;
+  if (dInput) {
+    const t0 = Date.now();
+    const fresh = solveInverseProduct(dInput);
+    const cohortMsStart = Date.now();
+    projectCohortLiquidity({
+      depositVolumeRial: dInput.depositVolumeRial,
+      loanToDepositMultiplier: fresh.solution.loanToDepositMultiplier,
+      depositRetentionMonths: fresh.solution.depositRetentionMonths,
+      repaymentMonths: fresh.solution.repaymentMonths,
+      blockedDepositPct: fresh.solution.blockedDepositPct,
+      unblockedRunoffRate: dInput.unblockedRunoffRate,
+      loanInterestRate: fresh.solution.loanInterestRate,
+      depositInterestRate: fresh.solution.depositInterestRate,
+      feeRate: fresh.solution.feeRate,
+      statutoryReserve: dInput.statutoryReserveBase,
+      pd: dInput.pd,
+      lgd: dInput.lgd,
+    });
+    const cohortMs = Date.now() - cohortMsStart;
+    const dossierMsStart = Date.now();
+    buildProductDossier(state);
+    const dossierMs = Date.now() - dossierMsStart;
+    budgetMs = Date.now() - t0;
+    budgetOk = budgetMs < 500 && fresh.elapsedMs < 500 && cohortMs < 100 && dossierMs < 50;
+  }
+  out.push(
+    assert(
+      "DOSSIER-03",
+      "بودجه سرورلس: حل معکوس + پروژه‌کهولی + ساخت دوسیه در مجموع کمتر از ۵۰۰ میلی‌ثانیه",
+      "Serverless budget: inverse solve + cohort projection + dossier build under 500 ms combined",
+      "total < 500 ms (solver < 500, cohort < 100, dossier < 50)",
+      `total=${budgetMs} ms`,
+      budgetOk,
+    ),
+  );
+
+  // --- DOSSIER-04: deterministic build --------------------------------------
+  const again = buildProductDossier(state);
+  out.push(
+    assert(
+      "DOSSIER-04",
+      "ساخت قطعی دوسیه: تکرار بدون زمان‌سنجی/تصادفی بایت‌به‌بایت یکسان است",
+      "Deterministic dossier build: replay is byte-identical (no clocks, no RNG)",
+      "JSON identical across two builds",
+      `same=${JSON.stringify(dossier) === JSON.stringify(again)}`,
+      JSON.stringify(dossier) === JSON.stringify(again),
+    ),
+  );
+
+  // --- DOSSIER-05: audit-log consistency ------------------------------------
+  const log = dossier?.committeeAuditLog;
+  out.push(
+    assert(
+      "DOSSIER-05",
+      "سازگاری گزارش کمیته: وضعیت اعتبارسنجی، سقف گام‌ها و پرچم ربا پنهان با وضعیت واقعی یکی است",
+      "Audit-log consistency: validation status, iteration cap and usury flags match live state",
+      "status === state; iterations ≤ 3; flag ⇔ nominal > cap",
+      log && dossier
+        ? `status=${dossier.compliance.validationStatus}; iters=${log.iterations.length}; solverFlag=${dossier.compliance.hiddenUsury.solverFlagged}`
+        : "null",
+      log !== undefined &&
+        dossier !== null &&
+        dossier.compliance.validationStatus === state.validationStatus &&
+        log.iterations.length <= log.maxIterations &&
+        log.maxIterations === REGULATORY.maxCriticIterations &&
+        dossier.compliance.hiddenUsury.solverFlagged ===
+          (dossier.almProfitability.customerNominalIrr >
+            dossier.compliance.hiddenUsury.effectiveRateCap + 1e-9),
+    ),
+  );
+
+  return {
+    id: "TC-DOSSIER",
+    titleFa: "آزمون دوسیه محصول — اسکیمای سخت، هویت شاخص‌ها، بودجه سرورلس و گزارش کمیته",
+    titleEn: "Product dossier — strict schema, metric identities, serverless budget, committee log",
+    assertions: out,
+    passed: out.every((item) => item.passed),
+    durationMs: Date.now() - started,
+    summary: {
+      assertions: out.length,
+      schemaOk: dossier && parsed?.success ? 1 : 0,
+      budgetMs,
+      citations: dossier?.compliance.envelope.citations.length ?? 0,
+      usuryFlags:
+        (dossier?.compliance.hiddenUsury.solverFlagged ? 1 : 0) +
+        (dossier?.compliance.hiddenUsury.designFlagged ? 1 : 0),
+    },
+  };
+}
+
 export async function runVerificationSuite(fast = false): Promise<VerificationSuiteResult> {
   const started = Date.now();
   const cases: TestCaseResult[] = [runDeterminismCase(), runCorrectionCase()];
   cases.push(await runStateGraphCase());
   cases.push(runMarketIntelCase());
   cases.push(runSimorghCase());
+  cases.push(runEdgeCaseCase());
+  cases.push(runGovernanceCase());
+  cases.push(runAdvancedEngineCase());
+  cases.push(await runClosedLoopCase(fast));
+  cases.push(await runDossierCase(fast));
   cases.push(await runTestCase1(fast));
   cases.push(await runTestCase2(fast));
   const all = cases.flatMap((c) => c.assertions);

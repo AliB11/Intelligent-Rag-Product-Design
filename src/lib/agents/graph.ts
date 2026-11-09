@@ -1,20 +1,27 @@
 /**
  * app/agents/graph.py -> TypeScript twin
  * ---------------------------------------------------------------------------
- * LangGraph-style StateGraph with seven specialised nodes, conditional routing
- * and the critic self-correction loop (max 5 iterations). Events are streamed
- * to the client through Server-Sent Events by the API layer.
+ * LangGraph-style StateGraph with nine specialised nodes, conditional routing
+ * and the deterministic self-correction critique loop (Phase 4 cap: 3
+ * iterations). Committee: Node 1 designer → inverse solver → Node 3 stress
+ * guardian (base + 3 shocks) → ALM twin → Node 2 compliance/sharia auditor
+ * (hidden-usury flag) → Node 4 structured CRITIQUE loop → executive report.
+ * Events are streamed to the client through Server-Sent Events by the API
+ * layer.
  */
 
 import {
-  MAX_MONTE_CARLO_RUNS,
-  MAX_OPTIMIZER_CANDIDATES,
-  MAX_PROMPT_LENGTH,
   MC_RUNS,
   MC_SCREEN_RUNS,
-  MIN_OPTIMIZER_CANDIDATES,
   REGULATORY,
 } from "../domain/constants";
+import {
+  formatZodIssues,
+  pipelineOptionsSchema,
+  pipelinePromptSchema,
+} from "../validation/schemas";
+import { extractRegulatoryConstraints } from "../rag/regulatoryConstraintExtractor";
+import { describeRegulatoryConstraints } from "../domain/regulatory";
 import { parseIntent, type IntentOverrides } from "../domain/intentParser";
 import {
   applyDirectives,
@@ -28,6 +35,12 @@ import {
   sensitivitySweep,
 } from "../domain/optimizer";
 import { runAlmSimulationAsync } from "../domain/almSimulator";
+import {
+  buildStressMatrix,
+  computeBorrowerNominalRate,
+  solveInverseProduct,
+  type InverseSolverInput,
+} from "../domain/inverseSolver";
 import { seedFromString } from "../domain/financial";
 import {
   buildGuildEcosystem,
@@ -37,14 +50,13 @@ import {
 import { retrieveKnowledge } from "../rag/knowledgeBase";
 import { searchBenchmarks } from "../rag/benchmarks";
 import { analyzeMarket } from "../rag/marketIntel";
-import { resolveFacility } from "../rag/facilityResolver";
-import { generatePopulation, empiricalShares, scoreTiers, tierIndexOf } from "../simorgh/population";
+import { generatePopulation, empiricalShares, scoreTiers } from "../simorgh/population";
 import { portfolioUnderwriting } from "../simorgh/creditPolicy";
 import { computeSimorghMetrics } from "../simorgh/metrics";
 import { runStressSuite } from "../simorgh/stress";
 import { buildAdvisorReport } from "../simorgh/advisor";
 import { templatesForCategories } from "../simorgh/templates";
-import type { ProductSpec } from "../domain/types";
+import type { ModeSpec, ProductSpec } from "../domain/types";
 import {
   createInitialState,
   makeEmitter,
@@ -158,6 +170,23 @@ function regulatoryRagNode(state: AgentState, emit: Emit) {
   if (req.personaKey) boosts.push("product-rule", "compliance");
   const constraints = retrieveKnowledge(query, 8, boosts);
   state.constraints = constraints;
+
+  // Extract the executable constraint envelope from the pre-filtered ACTIVE
+  // chunks; it is passed directly into the financial-engine as hard bounds.
+  const envelope = extractRegulatoryConstraints(constraints);
+  state.regulatoryConstraints = envelope;
+  emit({
+    node: "regulatory_rag",
+    stage: "rag:constraints",
+    level: "ok",
+    titleFa: `اجرایی‌سازی مقررات: ${describeRegulatoryConstraints(envelope)}`,
+    titleEn: `Executable regulatory envelope: ${describeRegulatoryConstraints(envelope)}`,
+    detailFa: envelope.citations
+      .map((c) => `• ${c.doc_id} — ${c.clause}: ${c.summary}`)
+      .join("\n"),
+    detailEn: envelope.citations.map((c) => `${c.doc_id}: ${c.summary}`).join("\n"),
+    metrics: { citations: envelope.citations.length },
+  });
 
   emit({
     node: "regulatory_rag",
@@ -307,6 +336,7 @@ async function mathematicalSynthesizerNode(
       horizonMonths: req.horizonMonths,
       persona: state.persona,
       signal: options.signal,
+      regulatoryConstraints: state.regulatoryConstraints,
       forcedArchetypes:
         req.modeCount > 1 ? state.ecosystem?.recommendedModes.slice(0, req.modeCount) : undefined,
       gammaFloor: state.ecosystem ? state.ecosystem.gammaTarget : 0,
@@ -381,6 +411,97 @@ async function mathematicalSynthesizerNode(
           `${i + 1}) ${m.nameFa}: τ_d=${m.sleepMonths} | α=${m.loanMultiplier.toFixed(2)} | β=${(m.blockedRatio * 100).toFixed(0)}٪ | γ=${(m.closedLoopRetention * 100).toFixed(0)}٪ | ω=${m.waitingMonths} | r_l=${(m.loanRate * 100).toFixed(2)}٪`,
       )
       .join("\n"),
+  });
+}
+
+/** Deposit-volume-weighted average of a mode attribute. */
+function weightedModeValue(modes: ModeSpec[], pick: (m: ModeSpec) => number): number {
+  const total = modes.reduce((acc, m) => acc + m.depositVolumeRial, 0);
+  if (!(total > 0)) {
+    return modes.length ? modes.reduce((acc, m) => acc + pick(m), 0) / modes.length : 0;
+  }
+  return modes.reduce((acc, m) => acc + m.depositVolumeRial * pick(m), 0) / total;
+}
+
+/**
+ * Node 4b — deterministic inverse product solver. Runs after the designer
+ * and recalibrates with the critique loop: every round past the first decays
+ * the bank-IRR target and tightens the loan-multiplier ceiling by 25%
+ * (fully deterministic — no RNG), so an unattainable target walks down
+ * toward the feasible frontier inside the envelope.
+ */
+function inverseSolverNode(state: AgentState, emit: Emit) {
+  const req = state.request;
+  const env = state.regulatoryConstraints;
+  if (!req || !env) return;
+  const k = Math.max(1, state.iteration);
+  const decay = Math.pow(0.75, k - 1);
+  const targetBankIrrMin = Math.min(0.6, Math.max(0.05, req.targetIrr * decay));
+  const D = state.product?.targetDepositsRial ?? req.targetDepositsRial;
+  const modes = state.product?.modes ?? [];
+  const input: InverseSolverInput = {
+    targetBankIrrMin,
+    // Opportunity floor: a competitive 10% deposit yield (customer-side C2).
+    targetCustomerIrrMin: 0.1,
+    // Peak financing deficit may not exceed 40% of the deposit base.
+    maxLiquidityGapLimit: 0.4 * D,
+    regulatoryConstraints: env,
+    depositVolumeRial: D,
+    cannibalizationRate: 0.3,
+    sourceDepositCost: 0.02,
+    unblockedRunoffRate: 0.02,
+    statutoryReserveBase: modes.length
+      ? weightedModeValue(modes, (m) => m.statutoryReserve)
+      : 0.1,
+    pd: modes.length ? weightedModeValue(modes, (m) => m.pd) : 0.03,
+    lgd: modes.length ? weightedModeValue(modes, (m) => m.lgd) : 0.45,
+    bounds: {
+      loanToDepositMultiplier: [0.5, Math.max(0.5, 3 * decay)],
+    },
+  };
+  const solution = solveInverseProduct(input);
+  state.inverseSolverInput = input;
+  state.inverseSolution = solution;
+  emit({
+    node: "inverse_solver",
+    stage: "inverse:solve",
+    level: solution.feasible ? "ok" : "warn",
+    titleFa: solution.feasible
+      ? `حل معکوس: IRR بانک ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}٪ ≥ هدف ${(targetBankIrrMin * 100).toFixed(1)}٪ · T_wait=${solution.solution.depositRetentionMonths} · M=${solution.solution.loanToDepositMultiplier.toFixed(2)} · مسدودی ${(solution.solution.blockedDepositPct * 100).toFixed(0)}٪ · r_l=${(solution.solution.loanInterestRate * 100).toFixed(2)}٪ · کارمزد ${(solution.solution.feeRate * 100).toFixed(2)}٪ · N=${solution.solution.repaymentMonths}`
+      : `حل معکوس نزدیک‌ترین ساختار را با ${solution.violations.length} نقض برگرداند (IRR ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}٪ در برابر هدف ${(targetBankIrrMin * 100).toFixed(1)}٪)`,
+    titleEn: solution.feasible
+      ? `Inverse solve: bank IRR ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}% ≥ target ${(targetBankIrrMin * 100).toFixed(1)}%; T=${solution.solution.depositRetentionMonths}, M=${solution.solution.loanToDepositMultiplier.toFixed(2)}, blocked=${(solution.solution.blockedDepositPct * 100).toFixed(0)}%, rL=${(solution.solution.loanInterestRate * 100).toFixed(2)}%, fee=${(solution.solution.feeRate * 100).toFixed(2)}%, N=${solution.solution.repaymentMonths}`
+      : `Inverse solve returned the closest structure with ${solution.violations.length} violation(s) (IRR ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}% vs target ${(targetBankIrrMin * 100).toFixed(1)}%)`,
+    metrics: {
+      bankIrrAnnual: solution.metrics.bankIrrAnnual,
+      borrowerNominal: solution.metrics.borrowerNominalEquivalent,
+      feasible: solution.feasible ? 1 : 0,
+      evaluations: solution.evaluations,
+      elapsedMs: solution.elapsedMs,
+    },
+  });
+}
+
+/** Node 4c — ALM & risk guardian: Base + three deterministic shocks. */
+function stressGuardianNode(state: AgentState, emit: Emit) {
+  const input = state.inverseSolverInput;
+  const solution = state.inverseSolution?.solution;
+  if (!input || !solution) return;
+  const matrix = buildStressMatrix(input, solution, input.maxLiquidityGapLimit);
+  state.stressMatrix = matrix;
+  const worst = matrix.scenarios.find((s) => s.id === matrix.worstScenarioId);
+  emit({
+    node: "stress_guardian",
+    stage: "stress:matrix",
+    level: matrix.allRespectGapLimit ? "ok" : "warn",
+    titleFa: `نگهبان ALM — پایه و سه شوک (+۲۰٪ برداشت سپرده، +۳٪ NPL، +۱۵٪ مهاجرت): بدترین سناریو «${worst?.labelFa ?? "—"}» با شکاف تجمعی ${(((worst?.worstCumulativeGapRial ?? 0) / 1e12)).toFixed(2)} تریلیون ریال · سر-به-سر ماه ${worst?.breakevenMonth ?? "—"} · ${matrix.allRespectGapLimit ? "همه سناریوها داخل سقف" : "نقض سقف شکاف"}`,
+    titleEn: `ALM guardian — base + three shocks (+20% deposit run-off, +3pp NPL, +15pp migration): worst "${matrix.worstScenarioId}" cumulative gap ${(((worst?.worstCumulativeGapRial ?? 0) / 1e12)).toFixed(2)}T Rial; breakeven month ${worst?.breakevenMonth ?? "none"}; ${matrix.allRespectGapLimit ? "all scenarios within limit" : "gap limit breached"}`,
+    metrics: {
+      scenarios: matrix.scenarios.length,
+      worstScenario: matrix.worstScenarioId,
+      worstCumulativeGapRial: worst?.worstCumulativeGapRial ?? 0,
+      allRespectGapLimit: matrix.allRespectGapLimit ? 1 : 0,
+    },
   });
 }
 
@@ -554,8 +675,139 @@ function criticAuditorNode(state: AgentState, emit: Emit, options: PipelineOptio
   const alm = state.alm;
   if (!req || !product || !alm) return;
   const findings = feasibilityCheck(product, alm.metrics, req);
+
+  // ---- Phase 4 committee layers ------------------------------------------
+  const rateCap =
+    state.regulatoryConstraints?.effective_rate_cap ?? REGULATORY.morabahaMaxRate;
+
+  // Node 2 — compliance & sharia auditor: hidden-usury flag. The solver's
+  // borrower nominal-equivalent IRR (fee deduction + compensating-balance
+  // lock-up) must stay ≤ the effective rate cap; a breach is a hard blocker.
+  if (state.inverseSolution) {
+    const sol = state.inverseSolution;
+    const nominal = sol.metrics.borrowerNominalEquivalent;
+    if (nominal > rateCap + 1e-9) {
+      findings.push({
+        id: "hidden-usury-effective-irr",
+        severity: "blocker",
+        metric: "IRR_effective_borrower",
+        observed: nominal,
+        limit: rateCap,
+        messageFa: `نرخ مؤثر وام‌گیرنده ${(nominal * 100).toFixed(2)}٪ (با احتساب هزینه پنهان مسدودی و کارمزد) از سقف نرخ مؤثر ${(rateCap * 100).toFixed(2)}٪ عبور کرده است — ربا پنهان.`,
+        messageEn: `Borrower effective IRR ${(nominal * 100).toFixed(2)}% (incl. hidden blocked-deposit and fee cost) exceeds the effective rate cap ${(rateCap * 100).toFixed(2)}% — hidden usury.`,
+        directive: {
+          field: "blockedRatio",
+          action: "decrease",
+          magnitude: 0.1,
+          rationaleFa:
+            "کاهش سهم سپرده مسدودی و کارمزد تا نرخ مؤثر وام‌گیرنده زیر سقف نرخ مؤثر قرار گیرد.",
+        },
+      });
+    } else if (!sol.feasible) {
+      // Solver could not reach the (possibly recalibrated) target — warning,
+      // reported through the structured critique; the next round decays it.
+      const target = state.inverseSolverInput?.targetBankIrrMin ?? req.targetIrr;
+      findings.push({
+        id: "inverse-target-shortfall",
+        severity: "warning",
+        metric: "inverse_solver.bank_irr",
+        observed: sol.metrics.bankIrrAnnual,
+        limit: target,
+        messageFa: `حل‌کننده معکوس به هدف IRR بانک ${(target * 100).toFixed(1)}٪ دست نیافت (نزدیک‌ترین ساختار ${(sol.metrics.bankIrrAnnual * 100).toFixed(2)}٪).`,
+        messageEn: `Inverse solver did not reach the ${(target * 100).toFixed(1)}% bank IRR target (closest structure ${(sol.metrics.bankIrrAnnual * 100).toFixed(2)}%).`,
+        directive: {
+          field: "*",
+          action: "decrease",
+          magnitude: 0.25,
+          rationaleFa:
+            "کاهش پلکانی هدف IRR بانک (۲۵٪ در هر گام) و سقف ضریب تسهیلات تا ساختاری درون پوسته مقرراتی ممکن شود.",
+        },
+      });
+    }
+  }
+
+  // Node 2 — design-level hidden-usury audit: volume-weighted borrower
+  // nominal-equivalent of the SYNTHESIZED modes against the effective cap.
+  if (product.modes.length > 0) {
+    const totalD = product.modes.reduce((acc, m) => acc + m.depositVolumeRial, 0) || 1;
+    const weighted = (pick: (m: ModeSpec) => number): number =>
+      product.modes.reduce((acc, m) => acc + m.depositVolumeRial * pick(m), 0) / totalD;
+    const designNominal = computeBorrowerNominalRate({
+      loanBookRial: product.totalLoanBookRial,
+      feeRate: weighted((m) => m.feeIncomeRate),
+      blockedAmountRial: weighted((m) => m.blockedRatio) * product.targetDepositsRial,
+      repaymentMonths: Math.max(12, Math.round(weighted((m) => m.tenorMonths))),
+      loanInterestRate: weighted((m) => m.loanRate),
+    });
+    if (designNominal > rateCap + 1e-9) {
+      findings.push({
+        id: "hidden-usury-design",
+        severity: "warning",
+        metric: "design_IRR_effective_borrower",
+        observed: designNominal,
+        limit: rateCap,
+        messageFa: `نرخ مؤثر طراحی‌شده طرح‌ها ${(designNominal * 100).toFixed(2)}٪ از سقف نرخ مؤثر ${(rateCap * 100).toFixed(2)}٪ فراتر است؛ پارامترهای حل‌شده معکوس (دارای سقف) مبنای عرضه‌اند.`,
+        messageEn: `Design-level borrower effective IRR ${(designNominal * 100).toFixed(2)}% exceeds the ${(rateCap * 100).toFixed(2)}% cap; the capped inverse-solved parameters take precedence for offering.`,
+        directive: {
+          field: "blockedRatio",
+          action: "decrease",
+          magnitude: 0.05,
+          rationaleFa:
+            "کاهش نسبت مسدودی و کارمزد طراحی تا نرخ مؤثر وام‌گیرنده در طراحی نیز زیر سقف بماند.",
+        },
+      });
+    }
+  }
+
+  // Node 3 — stress guardian findings: any shocked scenario whose worst
+  // cumulative gap exceeds the limit is surfaced to the critique loop.
+  if (state.stressMatrix && !state.stressMatrix.allRespectGapLimit) {
+    const breached = state.stressMatrix.scenarios.filter((s) => s.breachedGapLimit);
+    const worstBreach = breached.reduce((a, b) =>
+      b.worstCumulativeGapRial < a.worstCumulativeGapRial ? b : a,
+    );
+    findings.push({
+      id: "stress-gap-breach",
+      severity: "warning",
+      metric: `stress_${worstBreach.id}_worst_cumulative_gap`,
+      observed: worstBreach.worstCumulativeGapRial,
+      limit: -state.stressMatrix.gapLimitRial,
+      messageFa: `سناریوی استرس «${worstBreach.labelFa}» شکاف تجمعی ${((worstBreach.worstCumulativeGapRial / 1e12).toFixed(2))} تریلیون ریال را ثبت کرده که از سقف ${((state.stressMatrix.gapLimitRial / 1e12).toFixed(2))} تریلیون فراتر می‌رود.`,
+      messageEn: `Stress scenario "${worstBreach.id}" posts a worst cumulative gap of ${(worstBreach.worstCumulativeGapRial / 1e12).toFixed(2)}T Rial beyond the ${(state.stressMatrix.gapLimitRial / 1e12).toFixed(2)}T limit.`,
+      directive: {
+        field: "loanMultiplier",
+        action: "decrease",
+        magnitude: 0.1,
+        rationaleFa:
+          "کاهش ضریب تسهیلات و پلکانی‌سازی دوره خواب سپرده تا شکاف سناریوهای استرس داخل سقف بماند.",
+      },
+    });
+  }
+
   state.findings = findings;
   const blockers = findings.filter((f) => f.severity === "blocker");
+
+  // Node 4 — structured self-correction critique (deterministic format).
+  const actionFa: Record<string, string> = {
+    increase: "افزایش",
+    decrease: "کاهش",
+    stagger: "پلکانی‌سازی",
+    hold: "حفظ",
+  };
+  const topFinding = blockers[0] ?? findings.find((f) => f.severity === "warning") ?? null;
+  state.critique = topFinding
+    ? `CRITIQUE: ${topFinding.messageEn} Action required: ${topFinding.directive.action} on ${String(topFinding.directive.field)} by ${topFinding.directive.magnitude.toFixed(3)} — ${topFinding.directive.rationaleFa}`
+    : "CRITIQUE: All hard constraints, stress scenarios and regulatory caps are satisfied. Action required: none.";
+  emit({
+    node: "critic_auditor",
+    stage: "critic:critique",
+    level: blockers.length ? "warn" : topFinding ? "info" : "ok",
+    titleFa: topFinding
+      ? `انتقاد: ${topFinding.messageFa} اقدام لازم: ${actionFa[topFinding.directive.action] ?? topFinding.directive.action} پارامتر «${String(topFinding.directive.field)}» با بزرگی ${topFinding.directive.magnitude.toFixed(3)}.`
+      : "انتقاد: همه قیدهای سخت، سناریوهای استرس و سقف‌های مقرراتی پاس شدند؛ اقدام لازم: بدون اقدام.",
+    titleEn: state.critique,
+    metrics: { findings: findings.length, blockers: blockers.length },
+  });
   const iterationRecord = {
     iteration: state.iteration,
     score: objectiveScore(alm.metrics, req).score,
@@ -575,7 +827,7 @@ function criticAuditorNode(state: AgentState, emit: Emit, options: PipelineOptio
   // Simorgh advisor: merge critic + regulation + stress + metrics insights
   if (state.simorgh) {
     try {
-      state.simorgh.advisor = buildAdvisorReport(product, req, alm, findings, {
+      state.simorgh.advisor = buildAdvisorReport(product, alm, findings, {
         runs: state.simorgh.stress.runs.map((r) => ({
           scenario: { id: r.id as import("../simorgh/stress").ScenarioId, labelFa: r.labelFa, factors: { outflow: 1, adoption: 1, delta: 1, rate: 1 }, z: 0 },
           irrBankAnnual: r.irrBankAnnual,
@@ -714,6 +966,8 @@ export function buildPipelineGraph(options: PipelineOptions): StateGraph {
     .addNode("regulatory_rag", regulatoryRagNode)
     .addNode("guild_persona", guildPersonaNode)
     .addNode("mathematical_synthesizer", (s, e) => mathematicalSynthesizerNode(s, e, options))
+    .addNode("inverse_solver", (s, e) => inverseSolverNode(s, e))
+    .addNode("stress_guardian", (s, e) => stressGuardianNode(s, e))
     .addNode("alm_stress_tester", (s, e) => almStressTesterNode(s, e, options))
     .addNode("critic_auditor", (s, e) => criticAuditorNode(s, e, options))
     .addNode("executive_report_generator", (s, e) => executiveReportNode(s, e, options));
@@ -724,7 +978,9 @@ export function buildPipelineGraph(options: PipelineOptions): StateGraph {
     (s) => (s.request?.personaKey ? "guild_persona" : "mathematical_synthesizer"),
   );
   graph.addConditionalEdge("guild_persona", () => "mathematical_synthesizer");
-  graph.addConditionalEdge("mathematical_synthesizer", () => "alm_stress_tester");
+  graph.addConditionalEdge("mathematical_synthesizer", () => "inverse_solver");
+  graph.addConditionalEdge("inverse_solver", () => "stress_guardian");
+  graph.addConditionalEdge("stress_guardian", () => "alm_stress_tester");
   graph.addConditionalEdge("alm_stress_tester", () => "critic_auditor");
   graph.addConditionalEdge("critic_auditor", (s) => {
     const blockers = s.findings.filter((f) => f.severity === "blocker").length;
@@ -744,42 +1000,16 @@ export interface RunPipelineInput {
 }
 
 function validatePipelineInput(prompt: string, options: PipelineOptions): void {
-  if (typeof prompt !== "string" || !prompt.trim()) {
-    throw new TypeError("A non-empty strategic prompt is required");
+  // Zod-backed boundary: the engine re-validates even when the API route
+  // already has (defence in depth). Prompt failures stay TypeErrors and
+  // option failures stay RangeErrors, preserving the historical contract.
+  const promptResult = pipelinePromptSchema.safeParse(prompt);
+  if (!promptResult.success) {
+    throw new TypeError(formatZodIssues(promptResult.error));
   }
-  if (prompt.length > MAX_PROMPT_LENGTH) {
-    throw new RangeError(`Prompt exceeds the ${MAX_PROMPT_LENGTH}-character limit`);
-  }
-  const runs = options.runs ?? MC_RUNS;
-  if (!Number.isSafeInteger(runs) || runs < 1 || runs > MAX_MONTE_CARLO_RUNS) {
-    throw new RangeError(`Requested Monte Carlo runs must be an integer between 1 and ${MAX_MONTE_CARLO_RUNS}; received ${runs}`);
-  }
-  const candidates = options.candidates ?? 26;
-  if (!Number.isSafeInteger(candidates) || candidates < MIN_OPTIMIZER_CANDIDATES || candidates > MAX_OPTIMIZER_CANDIDATES) {
-    throw new RangeError(`Candidate count must be an integer between ${MIN_OPTIMIZER_CANDIDATES} and ${MAX_OPTIMIZER_CANDIDATES}; received ${candidates}`);
-  }
-  const iterations = options.maxIterations ?? REGULATORY.maxCriticIterations;
-  if (!Number.isSafeInteger(iterations) || iterations < 1 || iterations > REGULATORY.maxCriticIterations) {
-    throw new RangeError(`Critic iterations must be an integer between 1 and ${REGULATORY.maxCriticIterations}; received ${iterations}`);
-  }
-  if (options.seed !== undefined && (typeof options.seed !== "string" || options.seed.length > 128)) {
-    throw new RangeError("Seed must be a string of at most 128 characters");
-  }
-  const overrideRanges: Record<keyof IntentOverrides, readonly [number, number]> = {
-    targetDepositsHemmat: [0.01, 1_000],
-    targetIrr: [0.01, 1],
-    ldrCeiling: [0.4, 0.95],
-    lcrFloor: [1, 2],
-    maxOverturningShock: [0.01, 0.25],
-  };
-  for (const [key, value] of Object.entries(options.intentOverrides ?? {})) {
-    const range = overrideRanges[key as keyof IntentOverrides];
-    if (!range || typeof value !== "number" || !Number.isFinite(value) || value < range[0] || value > range[1]) {
-      throw new RangeError(`Invalid intent override ${key}: ${String(value)}`);
-    }
-  }
-  if (options.withSensitivity !== undefined && typeof options.withSensitivity !== "boolean") {
-    throw new TypeError("withSensitivity must be a boolean");
+  const optionsResult = pipelineOptionsSchema.safeParse(options);
+  if (!optionsResult.success) {
+    throw new RangeError(`Invalid pipeline options: ${formatZodIssues(optionsResult.error)}`);
   }
 }
 

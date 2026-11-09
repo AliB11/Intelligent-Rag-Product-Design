@@ -1,4 +1,5 @@
 import { getRegulations, setRegulations, resetRegulations } from "@/lib/simorgh/regulations";
+import { formatZodIssues, regulationsPatchSchema } from "@/lib/validation/schemas";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,10 +13,6 @@ export async function GET() {
   return Response.json({ regulations: getRegulations() });
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 export async function PUT(request: Request) {
   let payload: unknown;
   try {
@@ -23,18 +20,11 @@ export async function PUT(request: Request) {
   } catch {
     return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
   }
-  if (!isRecord(payload)) return Response.json({ error: "body must be an object" }, { status: 400 });
-  const patch: Record<string, number> = {};
-  const numericKeys = ["loanRateCap", "qardFeeCap", "absoluteCap", "gamCap", "ldrCeiling", "lcrFloor", "dtiCap", "microLoanCap", "inflation"] as const;
-  for (const key of numericKeys) {
-    const value = payload[key];
-    if (value === undefined) continue;
-    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-      return Response.json({ error: `${key} must be a non-negative number` }, { status: 400 });
-    }
-    patch[key] = value;
+  const parsed = regulationsPatchSchema.safeParse(payload);
+  if (!parsed.success) {
+    return Response.json({ error: formatZodIssues(parsed.error) }, { status: 400 });
   }
-  return Response.json({ regulations: setRegulations(patch) });
+  return Response.json({ regulations: setRegulations(parsed.data) });
 }
 
 export async function DELETE() {
