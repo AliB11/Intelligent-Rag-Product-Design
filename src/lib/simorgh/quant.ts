@@ -8,7 +8,7 @@
  * Deterministic, LLM-free, fully unit-testable.
  */
 
-import { clamp, createRng, pmt, sampleNormal, type Rng } from "../domain/financial";
+import { clamp, createRng, pmt, sampleNormal, solveIrr, type Rng } from "../domain/financial";
 
 // ---------- Normal distribution ----------
 export function normCdf(x: number): number {
@@ -124,27 +124,13 @@ export function effectiveAprPct(schedule: ScheduleRow[], upfrontFeePct = 0): num
   return clamp((Math.pow(1 + monthlyIrr, 12) - 1) * 100, -50, 999);
 }
 
-/** Bracketed IRR for a short cash-flow vector (monthly periods). */
+/** Bracketed IRR for a short cash-flow vector (monthly periods).
+ *  Delegates to the hardened Newton/Brent/bisection solver in
+ *  `domain/financial` so both IRR entry points share one certified
+ *  implementation (1e-6 tolerance, no NaN from numerical breakdown). */
 export function irrOfFlows(flows: number[]): number {
-  const npv = (rate: number) => flows.reduce((acc, cf, i) => acc + cf / Math.pow(1 + rate, i), 0);
-  let lo = -0.5;
-  let hi = 2;
-  let fLo = npv(lo);
-  let fHi = npv(hi);
-  if (!Number.isFinite(fLo) || !Number.isFinite(fHi) || Math.sign(fLo) === Math.sign(fHi)) return NaN;
-  for (let i = 0; i < 100; i += 1) {
-    const mid = (lo + hi) / 2;
-    const v = npv(mid);
-    if (Math.abs(v) < 1e-10) return mid;
-    if (Math.sign(v) === Math.sign(fLo)) {
-      lo = mid;
-      fLo = v;
-    } else {
-      hi = mid;
-      fHi = v;
-    }
-  }
-  return (lo + hi) / 2;
+  const solved = solveIrr(flows, 0.02);
+  return solved.converged ? solved.rate : NaN;
 }
 
 /** Convenience: deterministic normal sample via this repo's PRNG. */

@@ -84,8 +84,8 @@ export const REGULATORY = {
   ldrWarning: 0.8,
   /** Maximum installment-to-income for the target persona. */
   installmentToIncomeCeiling: 0.4,
-  /** Maximum self-correction iterations of the critic loop. */
-  maxCriticIterations: 5,
+  /** Maximum deterministic self-correction iterations of the critique loop (Phase 4 cap: 3). */
+  maxCriticIterations: 3,
 } as const;
 
 /** Conservative default rate caps used by both the optimizer and compliance draft. */

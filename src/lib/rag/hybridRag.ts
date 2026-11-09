@@ -268,10 +268,24 @@ export class HybridRagIndex<T> {
       topK?: number;
       boostFn?: (item: T) => number;
       minScore?: number;
+      /**
+       * Governance PRE-filter. When present it runs BEFORE any BM25 or dense
+       * scoring: excluded records are never scored, never enter the RRF rank
+       * lists, and cannot surface regardless of textual relevance. This is how
+       * superseded / amended / expired regulatory chunks are kept out of the
+       * ranking (status !== "ACTIVE" is filtered before fusion).
+       */
+      filterFn?: (item: T) => boolean;
     } = {},
   ): HybridSearchHit<T>[] {
     const topK = Math.max(1, Math.min(100, options.topK ?? 12));
     if (!this.records.length) return [];
+
+    // --- Pre-filter (governance) — happens before scoring -------------------
+    const candidates = options.filterFn
+      ? this.records.filter((rec) => options.filterFn!(rec.item))
+      : this.records;
+    if (!candidates.length) return [];
 
     const qTokens = Array.from(new Set(tokenizeRich(query, true)));
     if (!qTokens.length) {
@@ -281,7 +295,7 @@ export class HybridRagIndex<T> {
     const qDense = embedHybrid256(query, true);
     const N = this.records.length;
 
-    const rawScores = this.records.map((rec, index) => {
+    const rawScores = candidates.map((rec, index) => {
       let bm25 = 0;
       const matchedTerms: string[] = [];
       for (const qt of qTokens) {
@@ -299,11 +313,12 @@ export class HybridRagIndex<T> {
       return { index, rec, bm25, dense, matchedTerms };
     });
 
-    // Compute BM25 and Dense ranks for Reciprocal Rank Fusion (RRF)
+    // Compute BM25 and Dense ranks for Reciprocal Rank Fusion (RRF) —
+    // ranks are assigned within the pre-filtered candidate set only.
     const byBm25 = [...rawScores].sort((a, b) => b.bm25 - a.bm25);
     const byDense = [...rawScores].sort((a, b) => b.dense - a.dense);
-    const bm25Rank = new Array<number>(N);
-    const denseRank = new Array<number>(N);
+    const bm25Rank = new Array<number>(candidates.length);
+    const denseRank = new Array<number>(candidates.length);
     byBm25.forEach((entry, r) => { bm25Rank[entry.index] = r + 1; });
     byDense.forEach((entry, r) => { denseRank[entry.index] = r + 1; });
 

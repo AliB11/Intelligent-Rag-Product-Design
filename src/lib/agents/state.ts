@@ -16,15 +16,22 @@ import type {
   ProductSpec,
   RegulatoryConstraint,
 } from "../domain/types";
+import type { RegulatoryConstraints } from "../domain/regulatory";
 import type { OptimizerIteration } from "../domain/optimizer";
+import type {
+  InverseSolverInput,
+  InverseSolverResult,
+  StressTestMatrix,
+} from "../domain/inverseSolver";
 import type { MarketPriors } from "../rag/marketIntel";
-import type { MarketProduct } from "../rag/marketIntel";
 
 export type NodeName =
   | "intent_analyzer"
   | "regulatory_rag"
   | "guild_persona"
   | "mathematical_synthesizer"
+  | "inverse_solver"
+  | "stress_guardian"
   | "alm_stress_tester"
   | "critic_auditor"
   | "executive_report_generator";
@@ -155,6 +162,16 @@ export interface AgentState {
   request: ProductGenerationRequest | null;
   warnings: string[];
   constraints: RegulatoryConstraint[];
+  /** Executable constraint envelope extracted from the retrieved ACTIVE chunks. */
+  regulatoryConstraints: RegulatoryConstraints | null;
+  /** Phase 4 — deterministic inverse product solve output. */
+  inverseSolution: InverseSolverResult | null;
+  /** Input the inverse node solved with (consumed by the stress guardian). */
+  inverseSolverInput: InverseSolverInput | null;
+  /** Phase 4 — Base + shock stress matrix from the ALM guardian. */
+  stressMatrix: StressTestMatrix | null;
+  /** Phase 4 — latest structured self-correction critique (CRITIQUE: …). */
+  critique: string | null;
   marketIntel: MarketIntel | null;
   persona: PersonaSpec | null;
   ecosystem: GuildEcosystem | null;
@@ -195,6 +212,11 @@ export function createInitialState(prompt: string): AgentState {
     request: null,
     warnings: [],
     constraints: [],
+    regulatoryConstraints: null,
+    inverseSolution: null,
+    inverseSolverInput: null,
+    stressMatrix: null,
+    critique: null,
     marketIntel: null,
     persona: null,
     ecosystem: null,
@@ -297,6 +319,8 @@ export const NODE_LABEL_FA: Record<NodeName, string> = {
   regulatory_rag: "RAG مقررات بانک مرکزی",
   guild_persona: "پرسونا و زنجیره ارزش صنفی",
   mathematical_synthesizer: "سنتزکننده ریاضی MILP/MINLP",
+  inverse_solver: "حل‌کننده معکوس محصول (قید به قید)",
+  stress_guardian: "نگهبان ALM — پایه و سه شوک استرس",
   alm_stress_tester: "دوقلوی دیجیتال ALM (مونت‌کارلو)",
   critic_auditor: "ممیز و منتقد خوداصلاح",
   executive_report_generator: "تولید گزارش مدیریتی",

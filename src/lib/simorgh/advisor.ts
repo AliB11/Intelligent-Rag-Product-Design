@@ -6,7 +6,7 @@
  * Persian insights — the "what should the product designer do next" panel.
  */
 
-import type { CriticFinding, ProductSpec, ProductGenerationRequest } from "../domain/types";
+import type { CriticFinding, ProductSpec } from "../domain/types";
 import type { AlmResult } from "../domain/types";
 import type { StressSuiteResult } from "./stress";
 import { checkModeCompliance, getRegulations, type ComplianceItem } from "./regulations";
@@ -30,7 +30,6 @@ export interface AdvisorReport {
 
 export function buildAdvisorReport(
   product: ProductSpec,
-  request: ProductGenerationRequest,
   alm: AlmResult,
   findings: CriticFinding[],
   stress: StressSuiteResult | null,

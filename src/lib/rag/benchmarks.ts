@@ -20,6 +20,11 @@ import type {
   ModeArchetype,
   ProviderCategory,
 } from "../domain/types";
+import {
+  parseOrThrow,
+  retrievalLimitSchema,
+  retrievalQuerySchema,
+} from "../validation/schemas";
 import { HybridRagIndex } from "./hybridRag";
 
 export type MarketSourceType = "bank" | "fund" | "fintech" | "regulatory" | "press";
@@ -1611,7 +1616,10 @@ export const MARKET_INDEX = new HybridRagIndex<MarketProduct>(MARKET_PRODUCTS.ma
 })));
 
 export function searchBenchmarks(query: string, limit = 12): BenchmarkScheme[] {
-  if (!query.trim()) return BENCHMARK_SCHEMES.slice(0, limit);
+  // Zod boundary: reject malformed retrieval inputs up front.
+  parseOrThrow(retrievalQuerySchema, query, TypeError);
+  parseOrThrow(retrievalLimitSchema, limit, RangeError);
+  if (!query.trim()) return BENCHMARK_SCHEMES.slice(0, Math.floor(limit));
   const byCode = new Map(BENCHMARK_SCHEMES.map((item) => [item.code, item]));
   return MARKET_INDEX.search(query, { topK: limit })
     .map((hit) => byCode.get(hit.id))

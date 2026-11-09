@@ -37,6 +37,13 @@ import {
 import { clamp, createRng, pmt, sampleDirichlet, seedFromString, type Rng } from "./financial";
 import { costOfFunds, expectedLossOf } from "./costOfFunds";
 import {
+  applyReserveFloor,
+  clampBlockedRatioToConstraints,
+  clampFeeRateToConstraints,
+  clampLoanRateToConstraints,
+  type RegulatoryConstraints,
+} from "./regulatory";
+import {
   bankProductNpv,
   installmentAffordability,
   loanEntitlement,
@@ -317,6 +324,8 @@ export interface SolveOptions {
   gammaFloor?: number;
   /** Market-research priors: median structural parameters of the closest real products. */
   priors?: MarketPriors | null;
+  /** Executable regulatory envelope enforced as hard bounds during synthesis. */
+  regulatoryConstraints?: RegulatoryConstraints | null;
   signal?: AbortSignal;
   onProgress?: (event: OptimizerProgress) => void;
 }
@@ -425,11 +434,17 @@ export function buildMode(
   index: number,
   gammaFloor = 0,
   blockRelease: ModeSpec["blockRelease"] = blueprint.blockRelease,
+  constraints: RegulatoryConstraints | null = null,
 ): ModeSpec {
   const depositVolumeRial = Math.max(0, weight) * targetDepositsRial;
-  const statutoryReserve = params.rrExact !== undefined
+  let statutoryReserve = params.rrExact !== undefined
     ? clamp(params.rrExact, 0, 0.5)
     : lerp(blueprint.statutoryReserve, params.rr ?? 0.5);
+  // Hard boundary: the executable envelope's reserve floor (applied before
+  // cost-of-funds so every derived figure prices the floored reserve).
+  if (constraints) {
+    statutoryReserve = applyReserveFloor(statutoryReserve, constraints);
+  }
   const depositRate = params.rdExact !== undefined
     ? clamp(params.rdExact, 0, 0.5)
     : lerp(blueprint.depositRate, params.rd ?? 0.5);
@@ -464,7 +479,7 @@ export function buildMode(
   let loanMultiplier = params.alphaExact !== undefined
     ? clamp(params.alphaExact, 0, 3)
     : lerp(blueprint.loanMultiplier, params.alpha ?? 0.5);
-  const blockedRatio = params.betaExact !== undefined
+  let blockedRatio = params.betaExact !== undefined
     ? clamp(params.betaExact, 0, 0.65)
     : lerp(blueprint.blockedRatio, params.beta ?? 0.4);
   const rawGamma = params.gammaExact !== undefined
@@ -474,7 +489,7 @@ export function buildMode(
   const withdrawalFractionMean = params.deltaExact !== undefined
     ? clamp(params.deltaExact, 0.01, 0.95)
     : lerp(blueprint.withdrawalFraction, params.delta ?? 0.5);
-  const feeIncomeRate = contract === "qarz-hasaneh"
+  let feeIncomeRate = contract === "qarz-hasaneh"
     ? 0
     : params.feeExact !== undefined
       ? clamp(params.feeExact, 0, 0.1)
@@ -519,6 +534,14 @@ export function buildMode(
       const floorRate = 0.05;
       loanRate = clamp(floorRate + (loanRate - floorRate) * (1 - 0.85 * patience), 0, rateCeiling);
     }
+  }
+
+  // Hard boundaries from the executable regulatory envelope — applied after
+  // every sampling/price-ladder adjustment so no path can bypass them.
+  if (constraints) {
+    loanRate = clampLoanRateToConstraints(loanRate, constraints);
+    blockedRatio = clampBlockedRatioToConstraints(blockedRatio, constraints);
+    feeIncomeRate = clampFeeRateToConstraints(feeIncomeRate, constraints);
   }
 
   const avgDepositPerCustomerRial = blueprint.avgDepositPerCustomerToman * TOMAN_RIAL;
@@ -636,7 +659,6 @@ export function assembleProduct(
   titleFa: string,
   titleEn: string,
 ): ProductSpec {
-  const totalDeposits = modes.reduce((a, m) => a + m.depositVolumeRial, 0) || 1;
   const totalLoans = modes.reduce((a, m) => a + m.loanBookRial, 0);
   return {
     code,
@@ -1272,6 +1294,7 @@ export function buildCandidate(
   persona: PersonaSpec | null,
   gammaFloor: number,
   priors?: MarketPriors | null,
+  constraints: RegulatoryConstraints | null = null,
 ): ProductSpec {
   const shares = randomUnitVector(rng, archetypes.length);
   // Contracts are drawn first (with the market hint) so the weight allocation
@@ -1338,6 +1361,8 @@ export function buildCandidate(
       persona,
       i,
       gammaFloor,
+      undefined,
+      constraints,
     );
   });
   return assembleProduct(
@@ -1448,6 +1473,7 @@ export async function optimizeProduct(
       persona,
       gammaFloor,
       priors,
+      options.regulatoryConstraints ?? null,
     );
     const metrics = evaluateProduct(candidate, seedValue + c, horizon, riskLimits);
     const { score } = objectiveScore(metrics, request);

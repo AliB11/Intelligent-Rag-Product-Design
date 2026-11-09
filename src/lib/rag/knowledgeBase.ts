@@ -6,7 +6,13 @@
  * mirrored into PostgreSQL (`kb_documents`) so retrieval is pgvector-shaped.
  */
 
-import type { RegulatoryConstraint } from "../domain/types";
+import type { RegulatoryChunkMeta, RegulatoryConstraint } from "../domain/types";
+import {
+  parseOrThrow,
+  retrievalLimitSchema,
+  retrievalQuerySchema,
+} from "../validation/schemas";
+import { activeDocFilter, isChunkActiveAt, regulatoryChunkMetaSchema } from "./governance";
 import { HybridRagIndex } from "./hybridRag";
 
 export const EMBEDDING_DIM = 128;
@@ -21,6 +27,8 @@ export interface KbDocumentSeed {
   bodyEn: string;
   citation: string;
   constraints: RegulatoryConstraint["binding"];
+  /** Temporal & regulatory governance metadata (Zod-validated at index build). */
+  governance: RegulatoryChunkMeta;
 }
 
 export function tokenise(text: string): string[] {
@@ -72,7 +80,7 @@ export function cosine(a: number[], b: number[]): number {
   return normA > 0 && normB > 0 ? dot / Math.sqrt(normA * normB) : 0;
 }
 
-export const KB_SEED: KbDocumentSeed[] = [
+const KB_SEED_BASE: Omit<KbDocumentSeed, "governance">[] = [
   {
     code: "CBI-QH-COMMISSION-04",
     category: "cbi-directive",
@@ -359,8 +367,244 @@ export const KB_SEED: KbDocumentSeed[] = [
       { field: "blockedRatio", op: "<=", value: 0.35 },
     ],
   },
-
+  // -------------------------------------------------------------------------
+  // Governance demonstration corpus: one ACTIVE collateral directive plus four
+  // documents that MUST be pre-filtered out of retrieval (superseded,
+  // amended, expired and not-yet-effective). Their caps are deliberately
+  // detectable if leaked: 0.20/0.15 rate caps, 0.02 fee cap and a collateral
+  // prohibition would each visibly distort the executable envelope.
+  // -------------------------------------------------------------------------
+  {
+    code: "CBI-BLOCKED-DEPOSIT-COLLATERAL",
+    category: "product-rule",
+    authority: "بانک مرکزی — معاونت بازار",
+    titleFa: "سپرده مسدودی به‌عنوان وثیقه تضمین تسهیلات",
+    titleEn: "Blocked deposits as loan collateral under the approved framework",
+    bodyFa:
+      "سپرده‌های بلندمدت مسدودشده می‌توانند تا سقف ۷۰ درصد مبلغ سپرده به‌عنوان وثیقه تسهیلات قرض‌الحسنه و مرابحه نزد همان بانک پذیرفته شوند؛ آزادسازی وثیقه صرفاً بر پایه جدول اقساط انجام می‌گیرد. سود سپرده مسدودی در دوره مسدودی پرداخت می‌شود و مسدودی وثیقه‌ای نباید از سهم مجاز مسدودی طرح‌های میانگین حساب فراتر رود.",
+    bodyEn:
+      "Long-term blocked deposits may be accepted as collateral for Qarz-ol-Hasanah and Morabaha loans up to 70% of the deposit balance at the same bank; collateral release follows the instalment schedule only. Profit on blocked deposits is paid during the blocking period and collateral blocking may not exceed the permitted blocking share of average-balance schemes.",
+    citation: "دستورالعمل وثیقه‌گذاری سپرده مسدودی",
+    constraints: [{ field: "blockedRatio", op: "<=", value: 0.7 }],
+  },
+  {
+    code: "CBI-BLOCKED-COLLATERAL-OLD",
+    category: "product-rule",
+    authority: "بانک مرکزی — معاونت بازار",
+    titleFa: "ممنوعیت پیشین وثیقه‌گذاری با سپرده مسدودی",
+    titleEn: "Former prohibition on blocked-deposit collateralisation",
+    bodyFa:
+      "پیش از بازنگری، وثیقه‌گذاری تسهیلات بر پایه سپرده مسدودی در شبکه بانکی ممنوع بود و بازپرداخت صرفاً از محل ضامن یا سایر دارایی‌ها تضمین می‌شد. این بخشنامه پس از تصویب چارچوب جدید لغو و باطل اعلام شد.",
+    bodyEn:
+      "Before the revision, collateralising loans with blocked deposits was prohibited across the banking network and repayment had to be guaranteed by a guarantor or other assets only. This circular was revoked after the new framework was approved.",
+    citation: "بخشنامه لغو‌شده ممنوعیت سپرده مسدودی",
+    constraints: [{ field: "blockedRatio", op: "==", value: 0 }],
+  },
+  {
+    code: "CBI-RATE-CAP-20-AMENDED",
+    category: "cbi-directive",
+    authority: "شورای پول و اعتبار",
+    titleFa: "سقف نرخ ۲۰ درصد پیش از بازنگری مصوب",
+    titleEn: "Pre-revision 20% profit-rate ceiling (amended)",
+    bodyFa:
+      "در بازه زمانی مصوب، سقف نرخ سود تسهیلات مبتنی بر عقود مبادله‌ای ۲۰ درصد در سال بود که پس از بازنگری شورای پول و اعتبار جای خود را به سقف جدید داد و این مصوبه در وضعیت بازنگری‌شده قرار گرفت.",
+    bodyEn:
+      "For its effective period the profit-rate ceiling on exchange-contract facilities was 20% per annum; after Money and Credit Council revision it was replaced by the new ceiling and this provision now sits in an amended state.",
+    citation: "مصوبه بازنشانی‌شده سقف نرخ ۲۰ درصد",
+    constraints: [{ field: "loanRate", op: "<=", value: 0.2 }],
+  },
+  {
+    code: "CBI-PANDEMIC-RELIEF-2020",
+    category: "product-rule",
+    authority: "شبکه بانکی — بسته حمایتی",
+    titleFa: "بسته حمایتی دوران کرونا — کارمزد ویژه ۲ درصد",
+    titleEn: "Pandemic relief package — special 2% commission",
+    bodyFa:
+      "در دوره حمایت ویژه، کارمزد تسهیلات حمایتی کرونا حداکثر ۲ درصد در سال تعیین شد. این مهلت پس از اتمام دوره حمایت منقضی شد و دیگر قابل استناد نیست.",
+    bodyEn:
+      "During the special support period the commission on pandemic relief facilities was capped at 2% per annum. The relief window has expired and the provision is no longer citable.",
+    citation: "بسته حمایتی کرونا (منقضی‌شده)",
+    constraints: [{ field: "loanRate", op: "<=", value: 0.02 }],
+  },
+  {
+    code: "CBI-FUTURE-REVIEW-2099",
+    category: "cbi-directive",
+    authority: "شورای پول و اعتبار",
+    titleFa: "طرح بازنگری آتی سقف نرخ ۱۵ درصد",
+    titleEn: "Future rate-cap review proposal at 15%",
+    bodyFa:
+      "طرح پیشنهادی بازنگری سقف نرخ سود به ۱۵ درصد صرفاً از تاریخ تصویب آتی قابل اجرا خواهد بود و تا آن زمان نافذ نیست.",
+    bodyEn:
+      "The proposed revision lowering the profit-rate ceiling to 15% becomes enforceable only from its future approval date and is not in force until then.",
+    citation: "طرح پیشنهادی بازنگری نرخ (آینده)",
+    constraints: [{ field: "loanRate", op: "<=", value: 0.15 }],
+  },
 ];
+
+/**
+ * Governance metadata per seed document. Every entry is Zod-validated when
+ * the corpus is built, so an invalid date/status/contract type fails fast at
+ * module load instead of silently disabling the pre-filter.
+ */
+const SEED_GOVERNANCE: Record<string, RegulatoryChunkMeta> = {
+  "CBI-QH-COMMISSION-04": {
+    effective_date: "2021-03-21T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "QARD_AL_HASAN",
+    regulatory_caps: { maxFeeRate: 0.04 },
+  },
+  "CBI-MORABAHA-RATE-23": {
+    effective_date: "2023-05-22T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "MURABAHA",
+    regulatory_caps: { maxLoanInterestRate: 0.23, effectiveRateCap: 0.23 },
+  },
+  "CBI-STATUTORY-RESERVE": {
+    effective_date: "2021-01-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+    regulatory_caps: { minReserveRatio: 0.1 },
+  },
+  "CBI-LDR-LCR-SOLVENCY": {
+    effective_date: "2022-01-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  },
+  "CBI-OVERTURNING-RISK": {
+    effective_date: "2021-06-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  },
+  "CBI-TAMIN-YAR-CAP": {
+    effective_date: "2022-02-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "MURABAHA",
+  },
+  "CBI-GAM-CERTIFICATE": {
+    effective_date: "2021-09-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  },
+  "ISLAMIC-KHARID-DEYN": {
+    effective_date: "2020-11-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  },
+  "ISLAMIC-JOALAH": {
+    effective_date: "2020-11-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "JOALAH",
+  },
+  "CBI-SAMAT-CLEARANCE": {
+    effective_date: "2021-04-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  },
+  "CBI-CUSTOMER-PROTECTION-9": {
+    effective_date: "2021-06-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  },
+  "CBI-AFFORDABILITY-40": {
+    effective_date: "2022-01-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  },
+  "CBI-AVERAGE-BALANCE-TRANSPARENCY": {
+    effective_date: "2022-03-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  },
+  "CBI-RATE-CEILING-287": {
+    effective_date: "2023-05-22T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "SPECIAL_DEPOSIT",
+    regulatory_caps: { maxLoanInterestRate: 0.287, effectiveRateCap: 0.287 },
+  },
+  "CBI-POS-MERCHANT-GRADING": {
+    effective_date: "2022-05-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  },
+  "CBI-HEALTHCARE-BNPL": {
+    effective_date: "2023-01-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  },
+  "CBI-FREIGHT-BOL": {
+    effective_date: "2022-08-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+  },
+  "CBI-MULTIMODE-FUND-RATIOS": {
+    effective_date: "2023-02-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+    regulatory_caps: { allowBlockedDepositCollateral: true },
+  },
+  "CBI-BLOCKED-DEPOSIT-COLLATERAL": {
+    effective_date: "2023-01-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "SPECIAL_DEPOSIT",
+    regulatory_caps: { allowBlockedDepositCollateral: true },
+  },
+  "CBI-BLOCKED-COLLATERAL-OLD": {
+    effective_date: "2018-01-01T00:00:00.000Z",
+    expiration_date: "2023-01-01T00:00:00.000Z",
+    status: "SUPERSEDED",
+    sharia_contract_type: "SPECIAL_DEPOSIT",
+    regulatory_caps: { allowBlockedDepositCollateral: false },
+  },
+  "CBI-RATE-CAP-20-AMENDED": {
+    effective_date: "2020-04-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "AMENDED",
+    sharia_contract_type: "MURABAHA",
+    regulatory_caps: { maxLoanInterestRate: 0.2, effectiveRateCap: 0.2 },
+  },
+  "CBI-PANDEMIC-RELIEF-2020": {
+    effective_date: "2020-04-19T00:00:00.000Z",
+    expiration_date: "2021-12-21T00:00:00.000Z",
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+    regulatory_caps: { maxFeeRate: 0.02 },
+  },
+  "CBI-FUTURE-REVIEW-2099": {
+    effective_date: "2099-01-01T00:00:00.000Z",
+    expiration_date: null,
+    status: "ACTIVE",
+    sharia_contract_type: "GENERAL",
+    regulatory_caps: { maxLoanInterestRate: 0.15, effectiveRateCap: 0.15 },
+  },
+};
+
+export const KB_SEED: KbDocumentSeed[] = KB_SEED_BASE.map((doc) => {
+  const meta = SEED_GOVERNANCE[doc.code];
+  if (!meta) {
+    throw new Error(`KB seed "${doc.code}" is missing governance metadata`);
+  }
+  // Zod boundary: malformed governance fails fast at corpus build.
+  return { ...doc, governance: regulatoryChunkMetaSchema.parse(meta) };
+});
 
 export interface KbVectorDocument extends KbDocumentSeed {
   id: string;
@@ -389,24 +633,44 @@ const KB_HYBRID_INDEX = new HybridRagIndex<KbVectorDocument>(
   })),
 );
 
-/** Hybrid BM25+ + 256D Subword Dense + RRF retrieval over the regulatory KB. */
+/**
+ * Hybrid BM25+ + 256D Subword Dense + RRF retrieval over the regulatory KB.
+ *
+ * Governance PRE-filter: only chunks that are `status === "ACTIVE"` and whose
+ * effective/expiration window contains `at` are admitted to the candidate set
+ * — the filter runs BEFORE BM25 and dense scoring, so superseded / amended /
+ * expired / future directives can never be ranked or retrieved.
+ */
 export function retrieveKnowledge(
   query: string,
   topK = 6,
   boostCategories: string[] = [],
+  at: Date = new Date(),
 ): RegulatoryConstraint[] {
+  // Zod boundary: malformed retrieval inputs are rejected at the RAG
+  // entrance instead of silently producing garbage rankings.
+  parseOrThrow(retrievalQuerySchema, query, TypeError);
+  parseOrThrow(retrievalLimitSchema, topK, RangeError);
+  if (!Array.isArray(boostCategories) || boostCategories.some((c) => typeof c !== "string")) {
+    throw new TypeError("boostCategories must be an array of strings");
+  }
+  if (!(at instanceof Date) || !Number.isFinite(at.getTime())) {
+    throw new RangeError("at must be a valid Date");
+  }
   const limit = Math.max(1, Math.min(20, Math.floor(topK)));
+  const preFilter = activeDocFilter<KbVectorDocument>(at);
   const hits = KB_HYBRID_INDEX.search(query, {
     topK: limit,
     minScore: 0.04,
     boostFn: (doc) => (boostCategories.includes(doc.category) ? 0.08 : 0),
+    filterFn: preFilter,
   });
 
   // Fallback to classic cosine+lexical if query had only stop words
   if (!hits.length) {
     const queryEmbedding = embed(query);
     const queryTokens = new Set(tokenise(query));
-    return KB_DOCUMENTS.map((doc) => {
+    return KB_DOCUMENTS.filter(preFilter).map((doc) => {
       const semantic = Math.max(0, cosine(queryEmbedding, doc.embedding));
       const overlap = doc.tokens.reduce((count, token) => count + Number(queryTokens.has(token)), 0);
       const lexical = queryTokens.size && doc.tokens.length
@@ -430,6 +694,7 @@ export function retrieveKnowledge(
         citation: doc.citation,
         relevance,
         binding: doc.constraints,
+        governance: doc.governance,
       }));
   }
 
@@ -445,12 +710,13 @@ export function retrieveKnowledge(
     citation: doc.citation,
     relevance: Number(score.toFixed(4)),
     binding: doc.constraints,
+    governance: doc.governance,
   }));
 }
 
-/** All hard regulatory bindings currently in force (used by the synthesiser). */
-export function allBindings(): { code: string; binding: RegulatoryConstraint["binding"][number] }[] {
-  return KB_DOCUMENTS.flatMap((doc) =>
+/** All hard regulatory bindings currently in force (ACTIVE + in-window). */
+export function allBindings(at: Date = new Date()): { code: string; binding: RegulatoryConstraint["binding"][number] }[] {
+  return KB_DOCUMENTS.filter((doc) => isChunkActiveAt(doc.governance, at)).flatMap((doc) =>
     doc.constraints.map((binding) => ({ code: doc.code, binding })),
   );
 }

@@ -246,6 +246,45 @@ export interface ProductGenerationRequest {
   parsedTokens: { raw: string; kind: string; value: number | string }[];
 }
 
+/**
+ * Temporal & regulatory governance metadata attached to every knowledge
+ * chunk. Retrieval enforces `status === "ACTIVE"` plus the effective /
+ * expiration window BEFORE any BM25 + dense RRF scoring happens.
+ */
+export type DocumentStatus = "ACTIVE" | "SUPERSEDED" | "AMENDED";
+
+export type ShariaContractType =
+  | "QARD_AL_HASAN"
+  | "MURABAHA"
+  | "MUDARABAH"
+  | "JOALAH"
+  | "SPECIAL_DEPOSIT"
+  | "GENERAL";
+
+/** Structured caps a chunk contributes to the executable constraint envelope. */
+export interface RegulatoryCaps {
+  /** General lending / profit-rate ceiling (annual fraction). */
+  maxLoanInterestRate?: number;
+  /** Commission & service-fee ceiling (annual fraction). */
+  maxFeeRate?: number;
+  /** Statutory reserve floor (fraction of deposits). */
+  minReserveRatio?: number;
+  /** All-in effective rate ceiling incl. fees, blocking and sleep drag. */
+  effectiveRateCap?: number;
+  /** Whether blocked deposits may collateralise loans. */
+  allowBlockedDepositCollateral?: boolean;
+}
+
+export interface RegulatoryChunkMeta {
+  /** ISO timestamp from which the chunk is in force (inclusive). */
+  effective_date: string;
+  /** ISO timestamp after which the chunk lapses (exclusive); null = open-ended. */
+  expiration_date?: string | null;
+  status: DocumentStatus;
+  sharia_contract_type: ShariaContractType;
+  regulatory_caps?: RegulatoryCaps;
+}
+
 export interface RegulatoryConstraint {
   id: string;
   code: string;
@@ -262,6 +301,8 @@ export interface RegulatoryConstraint {
     op: "<=" | ">=" | "==" | "in";
     value: number | string | string[];
   }[];
+  /** Temporal/governance metadata; present on KB-sourced chunks. */
+  governance?: RegulatoryChunkMeta;
 }
 
 export interface AlmMonthRow {

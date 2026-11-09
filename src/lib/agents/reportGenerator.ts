@@ -16,7 +16,7 @@ import {
 import { ARCHETYPE_LABEL_FA, CONTRACT_LABEL_FA } from "../domain/guildValueChain";
 import { effectiveRiskLimits } from "../domain/optimizer";
 import { searchBenchmarks } from "../rag/benchmarks";
-import type { AlmResult, BenchmarkScheme, ModeSpec, ProductSpec, RegulatoryConstraint } from "../domain/types";
+import type { BenchmarkScheme, ModeSpec } from "../domain/types";
 import type { AccountingEntry, AgentState, ComplianceDraftItem, MarketIntel } from "./state";
 
 /** One-line Persian summary of a synthesized mode vs its market prior median. */
