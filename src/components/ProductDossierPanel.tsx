@@ -56,6 +56,7 @@ export default function ProductDossierPanel({ dossier }: { dossier: ProductDossi
     stressMatrix,
     compliance: c,
     committeeAuditLog: log,
+    decisionDiagnostics: diag,
   } = dossier;
   const s = optimalSpec.solution;
   const passed = c.validationStatus === "constraints_passed";
@@ -63,6 +64,15 @@ export default function ProductDossierPanel({ dossier }: { dossier: ProductDossi
   const splitTotal = Math.max(1e-9, cann.netNewMoneyRial + cann.migratedRial);
   const nnmPct = (100 * cann.netNewMoneyRial) / splitTotal;
   const migPct = 100 - nnmPct;
+  const confTone = diag.decisionConfidence >= 0.85 ? "teal" : diag.decisionConfidence >= 0.6 ? "gold" : "rose";
+  const bindingLabel: Record<string, string> = {
+    bank_irr_target: "کف IRR بانک",
+    borrower_rate_cap: "سقف نرخ مؤثر وام‌گیرنده",
+    liquidity_gap_limit: "سقف شکاف نقدینگی",
+    customer_floor: "کف رقابت سپرده",
+    loan_rate_ceiling: "سقف نرخ تسهیلات",
+    fee_ceiling: "سقف کارمزد",
+  };
 
   return (
     <div className="flex flex-col gap-3">
@@ -73,6 +83,9 @@ export default function ProductDossierPanel({ dossier }: { dossier: ProductDossi
         icon={<IconShield className="h-4 w-4" />}
         actions={
           <div className="flex flex-wrap items-center gap-2">
+            <Badge tone={confTone}>
+              {`اطمینان تصمیم ${fmtPct(diag.decisionConfidence, 0)}`}
+            </Badge>
             <Badge tone={passed ? "teal" : "rose"}>
               {passed ? "نشان انطباق: قیود پاس" : "نشان انطباق: غیرقابل‌تأیید"}
             </Badge>
@@ -130,6 +143,23 @@ export default function ProductDossierPanel({ dossier }: { dossier: ProductDossi
               label="ماه سر به سر / بدترین شکاف تجمعی"
               value={`${m.breakevenMonth ?? "—"} / ${fmtCompact(m.worstCumulativeGapRial)}`}
             />
+            <Row
+              label="هدف IRR درخواستی ← مرز ممکن تأییدشده"
+              value={`${fmtPct(diag.requestedTargetIrr, 1)} ← ${fmtPct(diag.finalTargetIrr, 2)}`}
+            />
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] text-mist">بندهای الزام‌آور:</span>
+              {diag.binding.length ? (
+                diag.binding.map((b) => (
+                  <Badge key={b} tone="gold">
+                    {bindingLabel[b] ?? b}
+                  </Badge>
+                ))
+              ) : (
+                <Badge tone="teal">هیچ قیدی در مرز نیست — فضای مانور باز</Badge>
+              )}
+              {diag.recalibrated ? <Badge tone="violet">بازتنظیم بازخوردی مرزی</Badge> : null}
+            </div>
             {optimalSpec.violations.length > 0 ? (
               <p className="mt-2 rounded-lg bg-rose/10 px-3 py-2 text-[11px] leading-5 text-rose">
                 نقض‌ها: {optimalSpec.violations.join(" · ")}
