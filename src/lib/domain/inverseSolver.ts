@@ -890,3 +890,107 @@ export function buildStressMatrix(
     gapLimitRial,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Adaptive decision core — feedback shooting onto the feasible frontier
+// ---------------------------------------------------------------------------
+
+export interface InverseFrontierRound {
+  targetIrr: number;
+  bankIrrAnnual: number;
+  feasible: boolean;
+  violationCount: number;
+}
+
+export interface InverseFrontier {
+  /** Target requested by the intent (never mutated). */
+  requestedTargetIrr: number;
+  /** Target of the round whose result is returned. */
+  finalTargetIrr: number;
+  /** True when a probe round lowered the target and that round is returned. */
+  recalibrated: boolean;
+  /** Best result: feasible at the highest reached target, else the honest round-0 solve. */
+  result: InverseSolverResult;
+  /** Deterministic audit trail of every round (round 0 first). */
+  trace: InverseFrontierRound[];
+  /** Wall-clock budget of the whole frontier search (all rounds). */
+  elapsedMs: number;
+}
+
+/**
+ * Adaptive inverse solve — closed-loop feedback shooting (fully deterministic):
+ *
+ *   round 0   solve at the REQUESTED target.
+ *   feedback  if (and only if) the bank-IRR constraint is among the
+ *             violations, jump the target to the bank IRR the solver
+ *             actually ACHIEVED (the observed frontier — a structure with
+ *             IRR = c proves target c is attainable) and re-solve to verify.
+ *             Repeat for at most `maxFeedbackRounds` probes; each probe is a
+ *             verified feasibility test, never a blind decimation like the
+ *             old fixed 25% decay.
+ *   selection the returned result is the FEASIBLE round with the highest
+ *             target; if no round is feasible the honest round-0 result is
+ *             returned (violations reported at the requested target), so an
+ *             unfixable problem (gap/usury levers, degenerate bounds) is
+ *             never papered over by lowering the goalposts.
+ *
+ * Typical cost: 2 solves (~150 ms), worst case 1 + maxFeedbackRounds.
+ */
+export function solveInverseFrontier(
+  raw: InverseSolverInput,
+  opts: { maxFeedbackRounds?: number } = {},
+): InverseFrontier {
+  const started = Date.now();
+  const maxFeedback = Math.max(0, Math.min(3, opts.maxFeedbackRounds ?? 2));
+  const requested = raw.targetBankIrrMin;
+  const trace: InverseFrontierRound[] = [];
+  const results: InverseSolverResult[] = [];
+
+  const runRound = (target: number): InverseSolverResult => {
+    const result = solveInverseProduct({ ...raw, targetBankIrrMin: target });
+    trace.push({
+      targetIrr: target,
+      bankIrrAnnual: result.metrics.bankIrrAnnual,
+      feasible: result.feasible,
+      violationCount: result.violations.length,
+    });
+    results.push(result);
+    return result;
+  };
+
+  let current = runRound(requested);
+  let currentTarget = requested;
+
+  for (let probe = 0; probe < maxFeedback && !current.feasible; probe += 1) {
+    const achieved = current.metrics.bankIrrAnnual;
+    // Only the bank-IRR lever justifies a target move: if IRR met the goal
+    // (or is non-finite) the binding problem is elsewhere — stop honestly.
+    const irrIsTheLever =
+      Number.isFinite(achieved) &&
+      achieved < currentTarget - 1e-9 &&
+      current.violations.some((v) => v.startsWith("bank IRR"));
+    if (!irrIsTheLever) break;
+    const nextTarget = Math.max(0.05, Math.min(currentTarget, achieved));
+    if (currentTarget - nextTarget < 1e-9) break;
+    currentTarget = nextTarget;
+    current = runRound(currentTarget);
+  }
+
+  // Selection: highest-target feasible round, else the honest round-0 result.
+  let chosenIndex = 0;
+  for (let i = 1; i < results.length; i += 1) {
+    if (results[i].feasible && !results[chosenIndex].feasible) chosenIndex = i;
+    else if (results[i].feasible && results[chosenIndex].feasible) {
+      if (trace[i].targetIrr > trace[chosenIndex].targetIrr) chosenIndex = i;
+    }
+  }
+  const chosen = results[chosenIndex];
+  return {
+    requestedTargetIrr: requested,
+    finalTargetIrr: trace[chosenIndex].targetIrr,
+    recalibrated: chosenIndex > 0,
+    result: chosen,
+    trace,
+    elapsedMs: Date.now() - started,
+  };
+}

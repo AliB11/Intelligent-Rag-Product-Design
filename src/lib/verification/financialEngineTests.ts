@@ -80,7 +80,11 @@ import {
 import { extractRegulatoryConstraints } from "../rag/regulatoryConstraintExtractor";
 import { computeCannibalization } from "../domain/cannibalization";
 import { projectCohortLiquidity, type CohortInput } from "../domain/cohortModel";
-import { solveInverseProduct, type InverseSolverInput } from "../domain/inverseSolver";
+import {
+  solveInverseFrontier,
+  solveInverseProduct,
+  type InverseSolverInput,
+} from "../domain/inverseSolver";
 import { buildProductDossier, productDossierSchema } from "../dossier/productDossier";
 import { isChunkActiveAt, regulatoryChunkMetaSchema } from "../rag/governance";
 import { allBindings, KB_DOCUMENTS, KB_SEED, retrieveKnowledge } from "../rag/knowledgeBase";
@@ -3027,6 +3031,191 @@ async function runDossierCase(fast = false): Promise<TestCaseResult> {
   };
 }
 
+/**
+ * Test case — adaptive decision core (feedback shooting onto the feasible
+ * frontier, binding-constraint diagnostics, decision confidence):
+ * DEC-01..05 unit-level frontier behaviour; DEC-06 pipeline integration.
+ */
+async function runDecisionCoreCase(fast = false): Promise<TestCaseResult> {
+  const started = Date.now();
+  const out: Assertion[] = [];
+  const decBase: InverseSolverInput = {
+    targetBankIrrMin: 0.15,
+    targetCustomerIrrMin: 0.1,
+    maxLiquidityGapLimit: 4e12,
+    regulatoryConstraints: defaultRegulatoryConstraints(),
+    depositVolumeRial: 1e13,
+    cannibalizationRate: 0.3,
+    sourceDepositCost: 0.02,
+    unblockedRunoffRate: 0.02,
+    statutoryReserveBase: 0.1,
+    pd: 0.03,
+    lgd: 0.45,
+  };
+
+  // --- DEC-01: feedback shooting lands ON the observed frontier ------------
+  const a = solveInverseFrontier({ ...decBase, targetBankIrrMin: 0.18 });
+  const aDecreasing = a.trace.every((r, i) => i === 0 || r.targetIrr <= a.trace[i - 1].targetIrr);
+  out.push(
+    assert(
+      "DEC-01",
+      "تیراندازی بازخوردی: هدف غیرممکن ۱۸٪ در دو آزمون روی مرز مشاهده‌شده می‌نشیند و تأیید می‌شود",
+      "Feedback shooting: unattainable 18% target lands on the observed frontier in two verified rounds",
+      "recalibrated; feasible; final ≈ achieved IRR; targets non-increasing; ≤ 4 rounds",
+      `req=${a.requestedTargetIrr}; fin=${a.finalTargetIrr.toFixed(5)}; feas=${a.result.feasible}; rounds=${a.trace.length}; trace=${a.trace.map((t) => `${t.targetIrr.toFixed(4)}:${t.feasible ? "ok" : "no"}`).join(",")}`,
+      a.recalibrated &&
+        a.result.feasible &&
+        a.result.violations.length === 0 &&
+        a.finalTargetIrr < 0.18 &&
+        a.finalTargetIrr >= a.result.metrics.bankIrrAnnual - 1e-9 &&
+        aDecreasing &&
+        a.trace.length >= 2 &&
+        a.trace.length <= 4,
+    ),
+  );
+
+  // --- DEC-02: absurd target resolves to the frontier, honestly ------------
+  const b = solveInverseFrontier({ ...decBase, targetBankIrrMin: 0.6 });
+  out.push(
+    assert(
+      "DEC-02",
+      "هدف غیرعقلانی ۶۰٪: مرز ممکن با شفافیت بازتنظیم می‌شود، نه پنهان",
+      "Absurd 60% target: the attainable frontier is recalibrated transparently, never hidden",
+      "recalibrated; feasible; 0.10 ≤ final ≤ 0.25; trace ≤ 4",
+      `fin=${b.finalTargetIrr.toFixed(4)}; feas=${b.result.feasible}; rounds=${b.trace.length}`,
+      b.recalibrated &&
+        b.result.feasible &&
+        b.finalTargetIrr >= 0.1 &&
+        b.finalTargetIrr <= 0.25 &&
+        b.trace.length <= 4,
+    ),
+  );
+
+  // --- DEC-03: attainable target → no recalibration, single round ----------
+  const c = solveInverseFrontier({ ...decBase, targetBankIrrMin: 0.12 });
+  out.push(
+    assert(
+      "DEC-03",
+      "هدف دست‌یافتنی دست‌نخورده می‌ماند: بدون بازتنظیم و تنها با یک آزمون",
+      "Attainable target stays untouched: no recalibration, single round",
+      "recalibrated=false; trace length 1; feasible",
+      `feas=${c.result.feasible}; rounds=${c.trace.length}; irr=${c.result.metrics.bankIrrAnnual.toFixed(4)}`,
+      !c.recalibrated &&
+        c.trace.length === 1 &&
+        c.result.feasible &&
+        c.result.metrics.bankIrrAnnual >= 0.12 - 1e-9,
+    ),
+  );
+
+  // --- DEC-04: non-fixable structure → honest single-round failure ----------
+  const d = solveInverseFrontier({
+    ...decBase,
+    targetBankIrrMin: 0.01,
+    maxLiquidityGapLimit: 1,
+    bounds: { loanToDepositMultiplier: [3, 3] },
+  });
+  out.push(
+    assert(
+      "DEC-04",
+      "اهرم غیرقابل‌رفع: بدون حلقه بی‌نهایت و بدون پنهان‌کاری — یک آزمون و گزارش صادقانه نقض",
+      "Unfixable lever: no infinite loop, no cover-up — one round and an honest violation report",
+      "recalibrated=false; trace length 1; infeasible; gap violation reported",
+      `rounds=${d.trace.length}; feas=${d.result.feasible}; viol=${d.result.violations.join(" | ").slice(0, 80)}`,
+      !d.recalibrated &&
+        d.trace.length === 1 &&
+        !d.result.feasible &&
+        d.result.violations.some((v) => v.includes("liquidity gap")),
+    ),
+  );
+
+  // --- DEC-05: determinism + serverless budget of the frontier -------------
+  const fp = (f: typeof a) =>
+    JSON.stringify({ ...f, result: { ...f.result, elapsedMs: 0 }, elapsedMs: 0 });
+  const e = solveInverseFrontier({ ...decBase, targetBankIrrMin: 0.27 });
+  out.push(
+    assert(
+      "DEC-05",
+      "قطعیت و بودجه: تکرار یکسان و جستجوی مرزی در مجموع کمتر از ۴۰۰ میلی‌ثانیه",
+      "Determinism and budget: identical replay, whole frontier search under 400 ms",
+      "fingerprint equal; elapsedMs < 400; rounds ≤ 4",
+      `same=${fp(e) === fp(solveInverseFrontier({ ...decBase, targetBankIrrMin: 0.27 }))}; ms=${e.elapsedMs}; rounds=${e.trace.length}`,
+      fp(e) === fp(solveInverseFrontier({ ...decBase, targetBankIrrMin: 0.27 })) &&
+        e.elapsedMs < 400 &&
+        e.trace.length <= 4,
+    ),
+  );
+
+  // --- DEC-06: pipeline integration — diagnostics, binding, confidence ------
+  const prompt = fast
+    ? "طراحی محصول چندطرحی میانگین حساب برای جذب ۲۰ همت منبع با IRR حداقل ۲۶ درصد، حداکثر نسبت تسهیلات به سپرده ۸۵ درصد، حداقل نسبت پوشش نقدینگی ۱٫۰۵ و ریسک واژگونی منابع حداکثر ۶ درصد"
+    : "یک بسته بانکی ۴ طرحی پلکانی مبتنی بر میانگین حساب طراحی کن تا ۲۰ همت منبع جذب شود؛ هدف نرخ بازده داخلی بانک حداقل ۲۶٪";
+  const { state } = await runPipeline({
+    prompt,
+    options: { runs: fast ? 220 : undefined, candidates: fast ? 18 : 26, withSensitivity: false, seed: "decision-core-2026" },
+  });
+  const frontier = state.inverseFrontier;
+  const dossier = buildProductDossier(state);
+  const diag = dossier?.decisionDiagnostics;
+  const metrics = state.inverseSolution?.metrics;
+  const envelope = state.regulatoryConstraints;
+  const slackChecks =
+    diag && metrics && envelope
+      ? diag.slacks.bankIrr === metrics.bankIrrAnnual - diag.finalTargetIrr &&
+        diag.slacks.borrowerRateCap === envelope.effective_rate_cap - metrics.borrowerNominalEquivalent &&
+        diag.slacks.liquidityGap === metrics.worstCumulativeGapRial + state.inverseSolverInput!.maxLiquidityGapLimit &&
+        diag.slacks.customerFloor === metrics.customerDepositYield - state.inverseSolverInput!.targetCustomerIrrMin
+      : false;
+  const expectedConf =
+    diag && metrics && envelope
+      ? 0.5 * (state.inverseSolution!.feasible ? 1 : Math.max(0, Math.min(1, metrics.bankIrrAnnual / Math.max(diag.finalTargetIrr, 0.01)))) +
+        0.25 * Math.max(0, Math.min(1, 1 - state.stressMatrix!.scenarios.filter((x) => x.breachedGapLimit).length / 4)) +
+        0.25 * Math.min(1, envelope.citations.length / 3)
+      : -1;
+  out.push(
+    assert(
+      "DEC-06",
+      "یکپارچگی خط لوله: مرز در state، تشخیص بندهای الزام‌آور، شاخص اطمینان و هشدار بازتنظیم در منتقد",
+      "Pipeline integration: frontier in state, binding-constraint slacks, confidence index, recalibration warning",
+      "frontier+diagnostics present; slack identities exact; binding includes cap levers; confidence = formula; critic warns",
+      frontier && diag
+        ? `req=${diag.requestedTargetIrr}; fin=${diag.finalTargetIrr.toFixed(4)}; rec=${diag.recalibrated}; binding=[${diag.binding.join(",")}]; conf=${diag.decisionConfidence.toFixed(4)}; warn=${state.findings.some((f) => f.id === "inverse-frontier-recalibrated")}; ms=${frontier.elapsedMs}`
+        : "null",
+      frontier !== null &&
+        diag !== undefined &&
+        dossier !== null &&
+        productDossierSchema.safeParse(dossier).success &&
+        diag.recalibrated === frontier.recalibrated &&
+        diag.requestedTargetIrr === frontier.requestedTargetIrr &&
+        diag.finalTargetIrr === frontier.finalTargetIrr &&
+        diag.frontierRounds === frontier.trace.length &&
+        slackChecks &&
+        diag.binding.includes("borrower_rate_cap") &&
+        diag.decisionConfidence >= 0 &&
+        diag.decisionConfidence <= 1 &&
+        Math.abs(diag.decisionConfidence - expectedConf) < 1e-12 &&
+        state.findings.some((f) => f.id === "inverse-frontier-recalibrated") &&
+        frontier.elapsedMs < 400,
+    ),
+  );
+
+  return {
+    id: "TC-DECIDE",
+    titleFa: "آزمون هسته تصمیم تطبیقی — تیراندازی بازخوردی، بندهای الزام‌آور و شاخص اطمینان",
+    titleEn: "Adaptive decision core — feedback shooting, binding constraints, confidence index",
+    assertions: out,
+    passed: out.every((item) => item.passed),
+    durationMs: Date.now() - started,
+    summary: {
+      assertions: out.length,
+      frontierRounds: frontier?.trace.length ?? -1,
+      recalibrated: diag?.recalibrated ? 1 : 0,
+      finalTarget: Number((diag?.finalTargetIrr ?? 0).toFixed(4)),
+      confidence: Number((diag?.decisionConfidence ?? 0).toFixed(4)),
+      bindingCount: diag?.binding.length ?? 0,
+    },
+  };
+}
+
 export async function runVerificationSuite(fast = false): Promise<VerificationSuiteResult> {
   const started = Date.now();
   const cases: TestCaseResult[] = [runDeterminismCase(), runCorrectionCase()];
@@ -3038,6 +3227,7 @@ export async function runVerificationSuite(fast = false): Promise<VerificationSu
   cases.push(runAdvancedEngineCase());
   cases.push(await runClosedLoopCase(fast));
   cases.push(await runDossierCase(fast));
+  cases.push(await runDecisionCoreCase(fast));
   cases.push(await runTestCase1(fast));
   cases.push(await runTestCase2(fast));
   const all = cases.flatMap((c) => c.assertions);

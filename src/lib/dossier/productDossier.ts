@@ -24,7 +24,11 @@
 
 import { z } from "zod";
 import type { AgentState } from "../agents/state";
-import { applyReserveFloor, constraintCitationSchema } from "../domain/regulatory";
+import {
+  applyReserveFloor,
+  clampLoanRateToConstraints,
+  constraintCitationSchema,
+} from "../domain/regulatory";
 import { computeCannibalization } from "../domain/cannibalization";
 
 const decisionVectorSchema = z
@@ -182,6 +186,45 @@ export const productDossierSchema = z
         traceEventCount: z.number().int().min(0),
       })
       .strict(),
+    decisionDiagnostics: z
+      .object({
+        requestedTargetIrr: z.number(),
+        finalTargetIrr: z.number(),
+        recalibrated: z.boolean(),
+        frontierRounds: z.number().int().min(1),
+        frontierTrace: z
+          .array(
+            z
+              .object({
+                targetIrr: z.number(),
+                bankIrrAnnual: z.number(),
+                feasible: z.boolean(),
+                violationCount: z.number().int().min(0),
+              })
+              .strict(),
+          )
+          .min(1),
+        slacks: z
+          .object({
+            bankIrr: z.number(),
+            borrowerRateCap: z.number(),
+            liquidityGap: z.number(),
+            customerFloor: z.number(),
+          })
+          .strict(),
+        binding: z.array(
+          z.enum([
+            "bank_irr_target",
+            "borrower_rate_cap",
+            "liquidity_gap_limit",
+            "customer_floor",
+            "loan_rate_ceiling",
+            "fee_ceiling",
+          ]),
+        ),
+        decisionConfidence: z.number().min(0).max(1),
+      })
+      .strict(),
   })
   .strict();
 
@@ -222,6 +265,45 @@ export function buildProductDossier(state: AgentState): ProductDossier | null {
     expectedLossRate: input.pd * input.lgd,
     treasuryRate: input.treasuryRate,
   });
+
+  // ---- Decision diagnostics: frontier + binding-constraint slacks ---------
+  const frontier = state.inverseFrontier;
+  const requestedTargetIrr = frontier?.requestedTargetIrr ?? input.targetBankIrrMin;
+  const finalTargetIrr = frontier?.finalTargetIrr ?? input.targetBankIrrMin;
+  const rateCeiling = clampLoanRateToConstraints(1, envelope);
+  const slacks = {
+    bankIrr: solution.metrics.bankIrrAnnual - finalTargetIrr,
+    borrowerRateCap: envelope.effective_rate_cap - solution.metrics.borrowerNominalEquivalent,
+    liquidityGap: solution.metrics.worstCumulativeGapRial + input.maxLiquidityGapLimit,
+    customerFloor: solution.metrics.customerDepositYield - input.targetCustomerIrrMin,
+  };
+  const binding: (
+    | "bank_irr_target"
+    | "borrower_rate_cap"
+    | "liquidity_gap_limit"
+    | "customer_floor"
+    | "loan_rate_ceiling"
+    | "fee_ceiling"
+  )[] = [];
+  if (slacks.bankIrr <= 1e-6) binding.push("bank_irr_target");
+  if (slacks.borrowerRateCap <= 1e-6) binding.push("borrower_rate_cap");
+  if (slacks.liquidityGap <= 1) binding.push("liquidity_gap_limit");
+  if (slacks.customerFloor <= 1e-12) binding.push("customer_floor");
+  if (solution.solution.loanInterestRate >= rateCeiling - 1e-9) binding.push("loan_rate_ceiling");
+  if (solution.solution.feeRate >= envelope.max_fee_rate - 1e-9) binding.push("fee_ceiling");
+
+  // Transparent decision-confidence heuristic (deterministic, documented):
+  //   0.50 × target attainment (1 when feasible, else IRR/target ratio)
+  //   0.25 × stress intactness (share of shock scenarios within the gap cap)
+  //   0.25 × grounding coverage (citations, saturating at 3)
+  const attainment = solution.feasible
+    ? 1
+    : Math.max(0, Math.min(1, solution.metrics.bankIrrAnnual / Math.max(finalTargetIrr, 0.01)));
+  const breachedCount = matrix.scenarios.filter((sc) => sc.breachedGapLimit).length;
+  const stressIntact = Math.max(0, Math.min(1, 1 - breachedCount / 4));
+  const groundingCoverage = Math.min(1, envelope.citations.length / 3);
+  const decisionConfidence = 0.5 * attainment + 0.25 * stressIntact + 0.25 * groundingCoverage;
+
   const committeeNodes = Array.from(
     new Set(
       state.trace
@@ -316,6 +398,23 @@ export function buildProductDossier(state: AgentState): ProductDossier | null {
       })),
       committeeNodes,
       traceEventCount: state.trace.length,
+    },
+    decisionDiagnostics: {
+      requestedTargetIrr,
+      finalTargetIrr,
+      recalibrated: requestedTargetIrr > finalTargetIrr + 1e-12,
+      frontierRounds: Math.max(1, frontier?.trace.length ?? 1),
+      frontierTrace: (frontier?.trace ?? [
+        {
+          targetIrr: requestedTargetIrr,
+          bankIrrAnnual: solution.metrics.bankIrrAnnual,
+          feasible: solution.feasible,
+          violationCount: solution.violations.length,
+        },
+      ]).map((r) => ({ ...r })),
+      slacks,
+      binding,
+      decisionConfidence,
     },
   };
 

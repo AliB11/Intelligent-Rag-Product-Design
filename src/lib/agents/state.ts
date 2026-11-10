@@ -19,6 +19,7 @@ import type {
 import type { RegulatoryConstraints } from "../domain/regulatory";
 import type { OptimizerIteration } from "../domain/optimizer";
 import type {
+  InverseFrontier,
   InverseSolverInput,
   InverseSolverResult,
   StressTestMatrix,
@@ -166,6 +167,8 @@ export interface AgentState {
   regulatoryConstraints: RegulatoryConstraints | null;
   /** Phase 4 — deterministic inverse product solve output. */
   inverseSolution: InverseSolverResult | null;
+  /** Adaptive decision core — feedback-shooting audit trail onto the frontier. */
+  inverseFrontier: InverseFrontier | null;
   /** Input the inverse node solved with (consumed by the stress guardian). */
   inverseSolverInput: InverseSolverInput | null;
   /** Phase 4 — Base + shock stress matrix from the ALM guardian. */
@@ -214,6 +217,7 @@ export function createInitialState(prompt: string): AgentState {
     constraints: [],
     regulatoryConstraints: null,
     inverseSolution: null,
+    inverseFrontier: null,
     inverseSolverInput: null,
     stressMatrix: null,
     critique: null,

@@ -38,7 +38,7 @@ import { runAlmSimulationAsync } from "../domain/almSimulator";
 import {
   buildStressMatrix,
   computeBorrowerNominalRate,
-  solveInverseProduct,
+  solveInverseFrontier,
   type InverseSolverInput,
 } from "../domain/inverseSolver";
 import { seedFromString } from "../domain/financial";
@@ -424,19 +424,21 @@ function weightedModeValue(modes: ModeSpec[], pick: (m: ModeSpec) => number): nu
 }
 
 /**
- * Node 4b — deterministic inverse product solver. Runs after the designer
- * and recalibrates with the critique loop: every round past the first decays
- * the bank-IRR target and tightens the loan-multiplier ceiling by 25%
- * (fully deterministic — no RNG), so an unattainable target walks down
- * toward the feasible frontier inside the envelope.
+ * Node 4b — adaptive inverse product solver (closed-loop decision core).
+ * Round 0 always honours the REQUESTED target; if the bank-IRR constraint is
+ * what blocks feasibility, `solveInverseFrontier` shoots the target onto the
+ * observed frontier (the achieved IRR) and re-solves to VERIFY feasibility —
+ * feedback-driven instead of the old blind 25% decay. Structural pressure
+ * still tightens with critique-loop iterations (loan-multiplier ceiling ×0.85
+ * per round). Fully deterministic — no RNG.
  */
 function inverseSolverNode(state: AgentState, emit: Emit) {
   const req = state.request;
   const env = state.regulatoryConstraints;
   if (!req || !env) return;
   const k = Math.max(1, state.iteration);
-  const decay = Math.pow(0.75, k - 1);
-  const targetBankIrrMin = Math.min(0.6, Math.max(0.05, req.targetIrr * decay));
+  const decay = Math.pow(0.85, k - 1);
+  const targetBankIrrMin = Math.min(0.6, Math.max(0.05, req.targetIrr));
   const D = state.product?.targetDepositsRial ?? req.targetDepositsRial;
   const modes = state.product?.modes ?? [];
   const input: InverseSolverInput = {
@@ -459,25 +461,36 @@ function inverseSolverNode(state: AgentState, emit: Emit) {
       loanToDepositMultiplier: [0.5, Math.max(0.5, 3 * decay)],
     },
   };
-  const solution = solveInverseProduct(input);
+  const frontier = solveInverseFrontier(input);
+  const solution = frontier.result;
   state.inverseSolverInput = input;
+  state.inverseFrontier = frontier;
   state.inverseSolution = solution;
+  const recalibNote = frontier.recalibrated
+    ? ` · مرزی‌سازی: هدف ${(frontier.requestedTargetIrr * 100).toFixed(1)}٪ ← ${(frontier.finalTargetIrr * 100).toFixed(2)}٪ در ${frontier.trace.length} آزمون`
+    : "";
+  const recalibEn = frontier.recalibrated
+    ? `; frontier recalibration: target ${(frontier.requestedTargetIrr * 100).toFixed(1)}% → ${(frontier.finalTargetIrr * 100).toFixed(2)}% over ${frontier.trace.length} rounds`
+    : "";
   emit({
     node: "inverse_solver",
-    stage: "inverse:solve",
+    stage: frontier.recalibrated ? "inverse:frontier" : "inverse:solve",
     level: solution.feasible ? "ok" : "warn",
     titleFa: solution.feasible
-      ? `حل معکوس: IRR بانک ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}٪ ≥ هدف ${(targetBankIrrMin * 100).toFixed(1)}٪ · T_wait=${solution.solution.depositRetentionMonths} · M=${solution.solution.loanToDepositMultiplier.toFixed(2)} · مسدودی ${(solution.solution.blockedDepositPct * 100).toFixed(0)}٪ · r_l=${(solution.solution.loanInterestRate * 100).toFixed(2)}٪ · کارمزد ${(solution.solution.feeRate * 100).toFixed(2)}٪ · N=${solution.solution.repaymentMonths}`
-      : `حل معکوس نزدیک‌ترین ساختار را با ${solution.violations.length} نقض برگرداند (IRR ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}٪ در برابر هدف ${(targetBankIrrMin * 100).toFixed(1)}٪)`,
+      ? `حل معکوس: IRR بانک ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}٪ ≥ هدف ${(frontier.finalTargetIrr * 100).toFixed(1)}٪${recalibNote} · T_wait=${solution.solution.depositRetentionMonths} · M=${solution.solution.loanToDepositMultiplier.toFixed(2)} · مسدودی ${(solution.solution.blockedDepositPct * 100).toFixed(0)}٪ · r_l=${(solution.solution.loanInterestRate * 100).toFixed(2)}٪ · کارمزد ${(solution.solution.feeRate * 100).toFixed(2)}٪ · N=${solution.solution.repaymentMonths}`
+      : `حل معکوس نزدیک‌ترین ساختار را با ${solution.violations.length} نقض برگرداند (IRR ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}٪ در برابر هدف درخواستی ${(frontier.requestedTargetIrr * 100).toFixed(1)}٪)`,
     titleEn: solution.feasible
-      ? `Inverse solve: bank IRR ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}% ≥ target ${(targetBankIrrMin * 100).toFixed(1)}%; T=${solution.solution.depositRetentionMonths}, M=${solution.solution.loanToDepositMultiplier.toFixed(2)}, blocked=${(solution.solution.blockedDepositPct * 100).toFixed(0)}%, rL=${(solution.solution.loanInterestRate * 100).toFixed(2)}%, fee=${(solution.solution.feeRate * 100).toFixed(2)}%, N=${solution.solution.repaymentMonths}`
-      : `Inverse solve returned the closest structure with ${solution.violations.length} violation(s) (IRR ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}% vs target ${(targetBankIrrMin * 100).toFixed(1)}%)`,
+      ? `Inverse solve: bank IRR ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}% ≥ target ${(frontier.finalTargetIrr * 100).toFixed(1)}%${recalibEn}; T=${solution.solution.depositRetentionMonths}, M=${solution.solution.loanToDepositMultiplier.toFixed(2)}, blocked=${(solution.solution.blockedDepositPct * 100).toFixed(0)}%, rL=${(solution.solution.loanInterestRate * 100).toFixed(2)}%, fee=${(solution.solution.feeRate * 100).toFixed(2)}%, N=${solution.solution.repaymentMonths}`
+      : `Inverse solve returned the closest structure with ${solution.violations.length} violation(s) (IRR ${(solution.metrics.bankIrrAnnual * 100).toFixed(2)}% vs requested ${(frontier.requestedTargetIrr * 100).toFixed(1)}%)`,
     metrics: {
       bankIrrAnnual: solution.metrics.bankIrrAnnual,
       borrowerNominal: solution.metrics.borrowerNominalEquivalent,
       feasible: solution.feasible ? 1 : 0,
+      requestedTarget: frontier.requestedTargetIrr,
+      finalTarget: frontier.finalTargetIrr,
+      frontierRounds: frontier.trace.length,
       evaluations: solution.evaluations,
-      elapsedMs: solution.elapsedMs,
+      elapsedMs: frontier.elapsedMs,
     },
   });
 }
@@ -703,24 +716,49 @@ function criticAuditorNode(state: AgentState, emit: Emit, options: PipelineOptio
             "کاهش سهم سپرده مسدودی و کارمزد تا نرخ مؤثر وام‌گیرنده زیر سقف نرخ مؤثر قرار گیرد.",
         },
       });
+    } else if (state.inverseFrontier?.recalibrated && sol.feasible) {
+      // Adaptive decision core: the requested target was unattainable but
+      // feedback shooting verified a feasible structure ON the observed
+      // frontier — disclosed as a warning with the exact recalibration gap.
+      const frontier = state.inverseFrontier;
+      const gap = Math.max(0, frontier.requestedTargetIrr - frontier.finalTargetIrr);
+      findings.push({
+        id: "inverse-frontier-recalibrated",
+        severity: "warning",
+        metric: "inverse_solver.feasible_frontier",
+        observed: frontier.finalTargetIrr,
+        limit: frontier.requestedTargetIrr,
+        messageFa: `هدف درخواستی IRR بانک ${(frontier.requestedTargetIrr * 100).toFixed(1)}٪ در پوسته مقرراتی ناممکن بود؛ حل‌کننده با تیراندازی بازخوردی (${frontier.trace.length} آزمون) ساختار ممکن روی مرز ${(frontier.finalTargetIrr * 100).toFixed(2)}٪ را تأیید کرد.`,
+        messageEn: `Requested bank IRR target ${(frontier.requestedTargetIrr * 100).toFixed(1)}% is unattainable inside the envelope; feedback shooting (${frontier.trace.length} rounds) verified a feasible structure on the ${(frontier.finalTargetIrr * 100).toFixed(2)}% frontier.`,
+        directive: {
+          field: "*",
+          action: "hold",
+          magnitude: frontier.requestedTargetIrr > 0 ? gap / frontier.requestedTargetIrr : 0,
+          rationaleFa:
+            "نگه داشتن هدف روی مرز دست‌یافتهٔ تأییدشده؛ کاهش بیشتر سودآوری را قربانی می‌کند و افزایش آن ناممکن است.",
+        },
+      });
     } else if (!sol.feasible) {
-      // Solver could not reach the (possibly recalibrated) target — warning,
-      // reported through the structured critique; the next round decays it.
-      const target = state.inverseSolverInput?.targetBankIrrMin ?? req.targetIrr;
+      // Even after feedback rounds the structure stays infeasible (the
+      // binding lever is not the bank-IRR target) — honest shortfall report
+      // whose directive magnitude is proportional to the measured gap.
+      const frontier = state.inverseFrontier;
+      const target = frontier?.requestedTargetIrr ?? req.targetIrr;
+      const shortfall = Math.max(0, target - sol.metrics.bankIrrAnnual);
       findings.push({
         id: "inverse-target-shortfall",
         severity: "warning",
         metric: "inverse_solver.bank_irr",
         observed: sol.metrics.bankIrrAnnual,
         limit: target,
-        messageFa: `حل‌کننده معکوس به هدف IRR بانک ${(target * 100).toFixed(1)}٪ دست نیافت (نزدیک‌ترین ساختار ${(sol.metrics.bankIrrAnnual * 100).toFixed(2)}٪).`,
-        messageEn: `Inverse solver did not reach the ${(target * 100).toFixed(1)}% bank IRR target (closest structure ${(sol.metrics.bankIrrAnnual * 100).toFixed(2)}%).`,
+        messageFa: `حل‌کننده معکوس پس از ${frontier?.trace.length ?? 1} آزمون به هدف IRR بانک ${(target * 100).toFixed(1)}٪ دست نیافت (نزدیک‌ترین ساختار ${(sol.metrics.bankIrrAnnual * 100).toFixed(2)}٪)؛ اهرم محدودکننده خارج از هدف است.`,
+        messageEn: `Inverse solver did not reach the ${(target * 100).toFixed(1)}% bank IRR target after ${frontier?.trace.length ?? 1} round(s) (closest structure ${(sol.metrics.bankIrrAnnual * 100).toFixed(2)}%); the binding lever is not the target.`,
         directive: {
           field: "*",
           action: "decrease",
-          magnitude: 0.25,
+          magnitude: Math.min(0.5, Math.max(0.05, shortfall / Math.max(target, 0.01))),
           rationaleFa:
-            "کاهش پلکانی هدف IRR بانک (۲۵٪ در هر گام) و سقف ضریب تسهیلات تا ساختاری درون پوسته مقرراتی ممکن شود.",
+            "کاهش متناسب با کسری اندازه‌گیری‌شده هدف و بازنگری ساختاری (ضریب تسهیلات، ماندگاری)؛ شدت دستور از شکاف واقعی گرفته می‌شود، نه مقدار ثابت.",
         },
       });
     }
@@ -777,9 +815,20 @@ function criticAuditorNode(state: AgentState, emit: Emit, options: PipelineOptio
       directive: {
         field: "loanMultiplier",
         action: "decrease",
-        magnitude: 0.1,
+        // Proportional controller: severity scales with the measured breach
+        // ratio instead of a fixed step (clamped to a sane action range).
+        magnitude: Math.min(
+          0.3,
+          Math.max(
+            0.05,
+            0.05 +
+              0.25 *
+                (Math.max(0, -state.stressMatrix.gapLimitRial - worstBreach.worstCumulativeGapRial) /
+                  Math.max(1, state.stressMatrix.gapLimitRial)),
+          ),
+        ),
         rationaleFa:
-          "کاهش ضریب تسهیلات و پلکانی‌سازی دوره خواب سپرده تا شکاف سناریوهای استرس داخل سقف بماند.",
+          "کاهش متناسب با میزان نقضِ اندازه‌گیری‌شده ضریب تسهیلات و پلکانی‌سازی دوره خواب سپرده تا شکاف سناریوهای استرس داخل سقف بماند.",
       },
     });
   }
